@@ -1,0 +1,4 @@
+setTimeout(() => {
+    showCoinflipResult(flip, userWon);
+  }, 1000);
+}

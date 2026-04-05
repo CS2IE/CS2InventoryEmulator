@@ -1,0 +1,106 @@
+const userSide = flip.userSide;
+const botSide = userSide === "heads" ? "tails" : "heads";
+
+entry.innerHTML = `
+  <div class="cf-side-info">
+    <img src="${flip.userAvatar}" class="cf-side-avatar">
+    <div class="cf-side-name">${escapeHtml(flip.userName)}</div>
+    <div class="cf-side-coin ${userSide}">${userSide[0].toUpperCase()}</div>
+  </div>
+  
+  <div class="cf-items-box">
+    ${flip.userItems.map(it => `<img src="${it.img || getDisplayImage(it)}" style="width: 40px; height: 30px; object-fit: contain;" title="${it.name}">`).join('')}
+  </div>
+  
+  <div class="cf-vs-badge">VS</div>
+  
+  <div class="cf-items-box">
+    ${flip.botItems.map(it => `<img src="${it.img || getDisplayImage(it)}" style="width: 40px; height: 30px; object-fit: contain;" title="${it.name}">`).join('')}
+  </div>
+  
+  <div class="cf-side-info">
+    <img src="${flip.botAvatar}" class="cf-side-avatar">
+    <div class="cf-side-name">${flip.botName}</div>
+    <div class="cf-side-coin ${botSide}">${botSide[0].toUpperCase()}</div>
+  </div>
+  
+  <div style="min-width: 140px; text-align: right;">
+    <div style="font-size: 11px; color: #94a3b8; text-transform: uppercase;">Value</div>
+    <div style="font-size: 20px; font-weight: 900; color: #a4d007;">${formatPrice(flip.totalValue)}</div>
+    <button class="steam-btn highlight" style="margin-top: 10px; font-size: 12px; width: 100%;" onclick="watchCoinflip('${flip.id}')">WATCH</button>
+  </div>
+`;
+lobby.appendChild(entry);
+
+const userSide = flip.userSide;
+const botSide = userSide === "heads" ? "tails" : "heads";
+
+entry.innerHTML = `
+  <div class="cf-side-info">
+    <img src="${flip.userAvatar}" class="cf-side-avatar">
+    <div class="cf-side-name">${escapeHtml(flip.userName)}</div>
+    <div class="cf-side-coin ${userSide}">${userSide[0].toUpperCase()}</div>
+    <div style="font-size: 12px; font-weight: 900; color: #a4d007;">${formatPrice(flip.userValue)}</div>
+  </div>
+  
+  <div class="cf-items-box user-items"></div>
+  
+  <div class="cf-vs-area" style="display: flex; flex-direction: column; align-items: center; gap: 8px; min-width: 60px;">
+    <div class="cf-vs-badge">VS</div>
+    <div class="cf-in-card-coin" style="width: 40px; height: 40px; border-radius: 50%; background: #1e293b; border: 2px solid #334155; display: flex; align-items: center; justify-content: center; font-weight: 900; font-size: 18px; color: #fff;">?</div>
+  </div>
+  
+  <div class="cf-items-box bot-items"></div>
+  
+  <div class="cf-side-info">
+    <img src="${flip.botAvatar}" class="cf-side-avatar">
+    <div class="cf-side-name">${flip.botName}</div>
+    <div class="cf-side-coin ${botSide}">${botSide[0].toUpperCase()}</div>
+    <div style="font-size: 12px; font-weight: 900; color: #a4d007;">${formatPrice(flip.botValue)}</div>
+  </div>
+  
+  <div style="min-width: 140px; text-align: right;">
+    <div style="font-size: 11px; color: #94a3b8; text-transform: uppercase;">Total Pot</div>
+    <div style="font-size: 20px; font-weight: 900; color: #a4d007;">${formatPrice(flip.totalValue)}</div>
+    <button class="steam-btn highlight cf-watch-btn" style="margin-top: 10px; font-size: 12px; width: 100%;">WATCH</button>
+  </div>
+`;
+
+// Populate item boxes with clickable inspect icons
+const userBox = entry.querySelector(".user-items");
+const botBox = entry.querySelector(".bot-items");
+
+flip.userItems.forEach(it => {
+  const img = document.createElement("img");
+  img.src = it.img || getDisplayImage(it);
+  img.style.width = "40px";
+  img.style.height = "30px";
+  img.style.objectFit = "contain";
+  img.style.cursor = "pointer";
+  img.title = it.name;
+  img.onclick = () => showInspect(it);
+  userBox.appendChild(img);
+});
+
+flip.botItems.forEach(it => {
+  const img = document.createElement("img");
+  img.src = it.img || getDisplayImage(it);
+  img.style.width = "40px";
+  img.style.height = "30px";
+  img.style.objectFit = "contain";
+  img.style.cursor = "pointer";
+  img.title = it.name;
+  img.onclick = () => showInspect(it);
+  botBox.appendChild(img);
+});
+
+const watchBtn = entry.querySelector(".cf-watch-btn");
+watchBtn.onclick = () => {
+  if (flip.isWatching) return;
+  flip.isWatching = true;
+  watchBtn.disabled = true;
+  watchBtn.textContent = "WATCHING...";
+  runInCardCoinflip(flip, entry);
+};
+
+lobby.appendChild(entry);
