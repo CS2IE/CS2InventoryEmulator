@@ -1,9 +1,0 @@
-// If there are no participants yet, this starts the round.
-// If there are already participants (e.g. bots joined some other way), just push.
-if (jackpotPotParticipants.length === 0) {
-  jackpotPotParticipants = [userParticipant];
-  startJackpotRound();
-} else {
-  jackpotPotParticipants.push(userParticipant);
-  updatePotUI();
-}
