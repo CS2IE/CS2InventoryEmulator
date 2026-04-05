@@ -1,0 +1,14 @@
+let lastTick = 0;
+const tickInterval = setInterval(() => {
+  const transform = new WebKitCSSMatrix(window.getComputedStyle(track).transform);
+  const currentIdx = Math.floor(Math.abs(transform.m41) / SLOT_WIDTH);
+  if (currentIdx > lastTick) {
+    playCaseScrollSound();
+    lastTick = currentIdx;
+  }
+}, 50);
+
+setTimeout(() => {
+  clearInterval(tickInterval);
+  showCoinflipResult(flip, userWon);
+}, 6200);

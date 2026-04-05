@@ -1,0 +1,9 @@
+if (isAgentSlot) return t.includes("agent") || n.includes("agent");
+if (isKnifeSlot) return t.includes("knife") || n.includes("★");
+if (isGlovesSlot) return t.includes("gloves") || n.includes("gloves");
+if (isMusicSlot) return n.includes("music kit");
+if (isCharmSlot) return n.includes("charm") || n.includes("keychain");
+if (isPinSlot) return n.includes("pin") || n.includes("collectible");
+
+// Weapon slots
+return n.includes(typeFilter.toLowerCase());

@@ -1,0 +1,200 @@
+if (isCont) {
+  const isCapsuleLocal = n.includes('capsule') || n.includes('sticker');
+  const requiredKeys = getRequiredKeysForCase(item.name);
+  const hasKey = requiredKeys.length === 0 || countItemsInAccount(account, (it) => {
+    const itName = it.name.toLowerCase().split(' (')[0].trim();
+    return requiredKeys.some(rk => rk.toLowerCase().trim() === itName);
+  }) > 0;
+
+  // New dedicated Get Key context action element (if present in DOM)
+  const ctxGetKeyBtn = document.getElementById("ctxGetKey");
+
+  if (hasKey || requiredKeys.length === 0) {
+    // If user has a key or none is required, show normal Open action
+    if (ctxGetKeyBtn) ctxGetKeyBtn.classList.add("hidden");
+    btnOpen.textContent = isCapsuleLocal ? "Open Capsule" : "Open Container";
+    btnOpen.style.color = "";
+    btnOpen.onclick = () => {
+      menu.classList.add("hidden");
+      showCaseConfirmForCaseName(item.name);
+    };
+  } else {
+    // If user has no key, surface a prominent "Get Key..." action in the context menu
+    btnOpen.classList.remove("hidden");
+    btnOpen.textContent = isCapsuleLocal ? "Open Capsule" : "Open Container";
+    btnOpen.style.color = ""; // keep Open available but also show Get Key separately
+
+    if (ctxGetKeyBtn) {
+      ctxGetKeyBtn.classList.remove("hidden");
+      // Make the Get Key button visually prominent
+      ctxGetKeyBtn.style.fontSize = "20px";
+      ctxGetKeyBtn.style.fontWeight = "800";
+      ctxGetKeyBtn.style.color = "#66c0f4";
+      ctxGetKeyBtn.onclick = () => {
+        menu.classList.add("hidden");
+        const keyName = requiredKeys[0];
+        const keyData = MARKET_KEYS.find(k => k.name === keyName) || allSkins.find(s => s.name === keyName);
+        if (keyData) {
+          // Show wear/quantity picker for the key so user can choose and purchase directly from the context menu
+          promptWearSelection(keyData, keyData.price || 2.50, (wear, qty, finalPrice, isCustom) => {
+            addItemToAccount({
+              name: keyData.name,
+              img: keyData.image || keyData.img,
+              price: finalPrice,
+              rarity: "Base Grade",
+              qty: qty,
+              isCustomPrice: isCustom,
+              source: "Purchased"
+            });
+            // After purchase, show the case confirmation so the user can immediately use the newly bought key
+            setTimeout(() => showCaseConfirmForCaseName(item.name), 600);
+          });
+        } else {
+          alert(`Key "${keyName}" not found in database.`);
+        }
+      };
+    } else {
+      // If DOM button missing, fall back to transforming the Open button into Get Key behavior (defensive)
+      btnOpen.textContent = "Get Key...";
+      btnOpen.style.color = "#66c0f4"; // Highlight blue
+      btnOpen.onclick = () => {
+        menu.classList.add("hidden");
+        const keyName = requiredKeys[0];
+        const keyData = MARKET_KEYS.find(k => k.name === keyName) || allSkins.find(s => s.name === keyName);
+        if (keyData) {
+          promptWearSelection(keyData, keyData.price || 2.50, (wear, qty, finalPrice, isCustom) => {
+            addItemToAccount({
+              name: keyData.name,
+              img: keyData.image || keyData.img,
+              price: finalPrice,
+              rarity: "Base Grade",
+              qty: qty,
+              isCustomPrice: isCustom,
+              source: "Purchased"
+            });
+            setTimeout(() => showCaseConfirmForCaseName(item.name), 600);
+          });
+        } else {
+          alert(`Key "${keyName}" not found in database.`);
+        }
+      };
+    }
+  }
+}
+
+  if (reqKeys.length > 0 && !hasKeyInMain) {
+    btnGetKey.classList.remove("hidden");
+    btnGetKey.textContent = "Get Key";
+    btnGetKey.onclick = () => {
+      menu.classList.add("hidden");
+      const kName = reqKeys[0];
+      const kData = MARKET_KEYS.find(k => k.name === kName) || allSkins.find(s => s.name === kName);
+      if (kData) {
+        promptWearSelection(kData, kData.price || 2.50, (wear, qty, finalPrice, isCustom) => {
+          addItemToAccount({ name: kData.name, img: kData.image || kData.img, price: finalPrice, rarity: "Base Grade", qty, isCustomPrice: isCustom, source: "Purchased" });
+          // User requested: do not show Unlock Container popup after "Get Key" purchase
+        });
+      }
+    };
+  }
+} else if (isKey) {
+  const baseKeyName = (item.name || "").split(' (')[0].trim();
+  const mappedCases = KEY_CASE_MAP[baseKeyName] || [];
+  // Check for mapped cases ONLY in top-level items
+  const hasCaseInMain = mappedCases.length === 0 ? false : account.items.some(it => {
+    const itName = (it.name || "").toLowerCase().split(' (')[0].trim();
+    return mappedCases.some(mc => mc.toLowerCase().trim() === itName);
+  });
+  
+  if (mappedCases.length > 0 && !hasCaseInMain) {
+    btnGetCase.classList.remove("hidden");
+    btnGetCase.textContent = "Get Case";
+    btnGetCase.onclick = () => {
+      menu.classList.add("hidden");
+      const cName = mappedCases[0];
+      const cData = allSkins.find(s => s.name === cName) || MARKET_KEYS.find(k => k.name === cName);
+      if (cData) {
+        promptWearSelection(cData, cData.price || 5.0, (wear, qty, finalPrice, isCustom) => {
+          addItemToAccount({ name: cData.name, img: cData.image || cData.img, price: finalPrice, rarity: "Base Grade", qty, isCustomPrice: isCustom, source: "Purchased" });
+        });
+      }
+    };
+  }
+}
+
+if (isCont) {
+  const isCapsuleLocal = n.includes('capsule') || n.includes('sticker');
+  const requiredKeys = getRequiredKeysForCase(item.name);
+  // Logic Fix: Only count keys in main inventory
+  const hasKey = requiredKeys.length === 0 || account.items.some(it => {
+    const itName = it.name.toLowerCase().split(' (')[0].trim();
+    return requiredKeys.some(rk => rk.toLowerCase().trim() === itName);
+  });
+
+  const ctxGetKeyBtn = document.getElementById("ctxGetKey");
+
+  if (hasKey || requiredKeys.length === 0) {
+    if (ctxGetKeyBtn) ctxGetKeyBtn.classList.add("hidden");
+    btnOpen.textContent = isCapsuleLocal ? "Open Capsule" : "Open Container";
+    btnOpen.style.color = "";
+    btnOpen.onclick = () => {
+      menu.classList.add("hidden");
+      showCaseConfirmForCaseName(item.name);
+    };
+  } else {
+    btnOpen.classList.remove("hidden");
+    btnOpen.textContent = isCapsuleLocal ? "Open Capsule" : "Open Container";
+    btnOpen.style.color = ""; 
+
+    if (ctxGetKeyBtn) {
+      ctxGetKeyBtn.classList.remove("hidden");
+      ctxGetKeyBtn.style.fontSize = "20px";
+      ctxGetKeyBtn.style.fontWeight = "800";
+      ctxGetKeyBtn.style.color = "#66c0f4";
+      ctxGetKeyBtn.onclick = () => {
+        menu.classList.add("hidden");
+        const keyName = requiredKeys[0];
+        const keyData = MARKET_KEYS.find(k => k.name === keyName) || allSkins.find(s => s.name === keyName);
+        if (keyData) {
+          promptWearSelection(keyData, keyData.price || 2.50, (wear, qty, finalPrice, isCustom) => {
+            addItemToAccount({
+              name: keyData.name,
+              img: keyData.image || keyData.img,
+              price: finalPrice,
+              rarity: "Base Grade",
+              qty: qty,
+              isCustomPrice: isCustom,
+              source: "Purchased"
+            });
+            // Do not show the container confirmation automatically after key purchase
+          });
+        } else {
+          alert(`Key "${keyName}" not found in database.`);
+        }
+      };
+    } else {
+      btnOpen.textContent = "Get Key...";
+      btnOpen.style.color = "#66c0f4";
+      btnOpen.onclick = () => {
+        menu.classList.add("hidden");
+        const keyName = requiredKeys[0];
+        const keyData = MARKET_KEYS.find(k => k.name === keyName) || allSkins.find(s => s.name === keyName);
+        if (keyData) {
+          promptWearSelection(keyData, keyData.price || 2.50, (wear, qty, finalPrice, isCustom) => {
+            addItemToAccount({
+              name: keyData.name,
+              img: keyData.image || keyData.img,
+              price: finalPrice,
+              rarity: "Base Grade",
+              qty: qty,
+              isCustomPrice: isCustom,
+              source: "Purchased"
+            });
+          });
+        } else {
+          alert(`Key "${keyName}" not found in database.`);
+        }
+      };
+    }
+  }
+}
