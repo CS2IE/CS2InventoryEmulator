@@ -43,7 +43,7 @@
           <div class="profile-text-row">
             <span class="profile-label">Logged in as:</span>
             <span id="headerUsername" class="profile-username" title="Switch account">User</span>
-            <img id="headerUserPfp" src="https://i.imgur.com/zFydkgL.png" alt="Profile" class="profile-pfp">
+            <img id="headerUserPfp" src="https://images.websim.com/avatar/user" alt="Profile" class="profile-pfp">
           </div>
         </div>
       </div>
@@ -91,7 +91,6 @@
           <option value="equipped">Equipped</option>
           <option value="recent" selected>Newest</option>
           <option value="quality">Quality</option>
-          <option value="name">Alphabetical</option>
           <option value="type">Type</option>
           <option value="collection">Collection</option>
         </select>
@@ -285,7 +284,7 @@
 
   <!-- Wear Selection Modal -->
   <div id="wearModal" class="modal-overlay hidden" style="z-index: 3500;">
-    <div class="user-snippet-modal" style="max-width: 400px; height: auto; min-height: auto;">
+    <div class="user-snippet-modal wear-modal-container">
       <h2 id="wearModalTitle" style="margin-bottom: 5px; font-size: 20px;">Select Wear & Quantity</h2>
       <div id="wearItemHeader" style="margin-bottom: 15px; background: rgba(0,0,0,0.2); padding: 10px; border-radius: 8px;">
         <img id="wearItemImg" src="" style="height: 80px; object-fit: contain; margin-bottom: 5px;">
@@ -372,6 +371,7 @@
             <img id="purchaseResultImage" src="" alt="">
             <div id="purchaseGloss" class="gloss-overlay"></div>
           </div>
+          <div id="purchaseResultStickers" class="inspect-stickers-tray"></div>
         </div>
         <button id="nextPurchaseItem" class="new-item-nav">❯</button>
       </div>
@@ -468,7 +468,7 @@
   </div>
 
   <!-- Case Inspection / Confirmation Modal -->
-  <div id="caseConfirmModal" class="modal-overlay hidden" style="z-index: 910;">
+  <div id="caseConfirmModal" class="modal-overlay hidden" style="z-index: 4500;">
     <div class="user-snippet-modal">
       <!-- Header -->
       <div class="case-confirm-header">
@@ -512,7 +512,7 @@
   </div>
 
   <!-- Case Opening Result Modal -->
-  <div id="caseOpeningModal" class="modal-overlay hidden" style="z-index: 300; background: transparent;">
+  <div id="caseOpeningModal" class="modal-overlay hidden" style="z-index: 40000; background: transparent;">
     <div id="caseOpeningBg" class="case-opening-bg-blur"></div>
     <div class="case-opening-fullscreen" style="width: 100vw; height: 100vh; max-width: none; padding: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; position: relative; overflow: hidden;">
       <h1 id="caseOpeningTitle" style="font-size: 32px; font-weight: 900; letter-spacing: 2px; text-transform: uppercase; margin: 0; text-shadow: 0 0 20px rgba(255,255,255,0.2); position: absolute; top: 40px; left: 50%; transform: translateX(-50%); z-index: 160;">Opening Container</h1>
@@ -529,7 +529,7 @@
         <!-- Final Reward revealed here -->
       </div>
       
-      <div id="caseOpeningActions" style="display: flex; flex-direction: row; opacity: 0; pointer-events: none; transition: opacity 0.5s; width: 100%; max-width: none; z-index: 1000; align-items: center; justify-content: center; padding: 20px; position: fixed; bottom: 0px; left: 0; right: 0;">
+      <div id="caseOpeningActions" class="unboxing-actions-bar">
         <!-- Attributes and buttons injected via revealNow -->
       </div>
     </div>
@@ -560,7 +560,7 @@
       <!-- Center Section: 3D Image -->
       <div id="inspectContent" class="inspect-content-area">
         <div id="inspectMainArea" class="inspect-main-area" style="width:100%; height:100%; display:flex; flex-direction:column;">
-          <div id="inspect3dWrapper" class="inspect-3d-wrapper" style="flex:1; display:flex; align-items:center; justify-content:center; perspective:1200px;">
+          <div id="inspect3dWrapper" class="inspect-3d-wrapper" style="flex:1; display:flex; align-items:center; justify-content:center; perspective:1200px; z-index: 1;">
             <img id="inspectImage" src="" class="inspect-face" draggable="false">
           </div>
           <div id="inspectFloatBar" class="float-bar-container" style="width: 400px; max-width: 80%; margin: 10px auto; pointer-events: none;">
@@ -623,8 +623,8 @@
   <!-- Selection Action Bar (Reworked Storage System) -->
   <div id="selectionActionBar" class="selection-action-bar hidden">
       <div class="selection-info">
-        <span id="selectionCount">0 items selected</span>
-        <span id="selectionValue" class="price-related" style="color: #a4d007; font-weight: 800; margin-left: 10px;">$0.00</span>
+        <div id="selectionCount" style="color: #94a3b8; font-size: 14px; font-weight: 800; text-transform: uppercase;">0 items selected</div>
+        <div id="selectionValue" class="price-related" style="color: #a4d007; font-weight: 900; font-size: 18px;">$0.00</div>
       </div>
       <div class="selection-buttons">
         <button id="moveAllSelectionBtn" class="steam-btn grey hidden">Select All Visible</button>
@@ -1401,6 +1401,18 @@
           <label for="newGoldToggle">Use New Gold Icon</label>
           <input id="newGoldToggle" type="checkbox" />
         </div>
+        <div class="settings-row">
+          <label for="showEditSellContextToggle">Show Edit/Sell in Context Menu</label>
+          <input id="showEditSellContextToggle" type="checkbox" />
+        </div>
+        <div class="settings-row">
+          <label for="showViewContextToggle">Show View in Context Menu</label>
+          <input id="showViewContextToggle" type="checkbox" />
+        </div>
+        <div class="settings-row">
+          <label for="hideMockMetaToggle">Hide Price/Qty on Selection Cards</label>
+          <input id="hideMockMetaToggle" type="checkbox" />
+        </div>
       </div>
 
       <div class="settings-section-header">Gameplay & Logic</div>
@@ -1516,6 +1528,7 @@
           <div class="bg-option"><input type="radio" name="bgChoice" id="bg_vertigo" value="vertigo"> <label for="bg_vertigo">Vertigo</label></div>
           <div class="bg-option"><input type="radio" name="bgChoice" id="bg_apollo" value="apollo"> <label for="bg_apollo">Apollo</label></div>
           <div class="bg-option"><input type="radio" name="bgChoice" id="bg_mutiny" value="mutiny"> <label for="bg_mutiny">Mutiny</label></div>
+          <div class="bg-option"><input type="radio" name="bgChoice" id="bg_ancient" value="ancient"> <label for="bg_ancient">Ancient</label></div>
         </div>
       </div>
 
@@ -1669,7 +1682,7 @@
   <!-- Add Item Modal Rebuilt from User Snippet -->
   <div id="searchSheet" class="modal-overlay hidden" style="z-index: 800;">
     <div class="user-snippet-modal" style="padding: 0; overflow: hidden;">
-      <button id="closeSearchBtn" class="close-snippet-modal">✕</button>
+      <button id="closeSearchBtn" class="close-snippet-modal" style="z-index: 1000;">✕</button>
       
       <div class="search-modal-main-layout" style="height: 100%; margin-top: 0;">
         <div id="searchSidebar" class="search-sidebar">
@@ -1679,22 +1692,30 @@
           <!-- Categories injected by JS -->
         </div>
 
-        <div class="search-content-area" style="padding: 25px;">
-          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 20px; padding-right: 40px;">
-            <div class="search-controls" style="flex:1;">
-              <input id="search" placeholder="Search skins, cases, stickers..." onkeydown="if(event.key===' '){ event.stopPropagation(); }" style="width:100%; max-width: 400px; height: 44px; background: #0f172a; border: 1px solid #334155;">
-              <button id="searchBtn" class="steam-btn highlight">SEARCH</button>
-            </div>
-            <div style="display:flex; gap:8px;">
-               <button id="randomBtn" class="steam-btn" style="background: #3b82f6; font-size: 11px;">RANDOM</button>
-               <button id="randomSBtn" class="steam-btn" style="background: #1f6feb; font-size: 11px;">RANDOM S</button>
-               <button id="addWalletFromSearchBtn" class="steam-btn highlight" style="background:#1f6feb; color:#fff; font-size: 11px;">ADD FUNDS</button>
-            </div>
+        <div class="search-content-area" style="padding: 25px; position: relative;">
+          <div class="search-controls-top" style="display:flex; align-items:center; gap:12px; margin-bottom:20px; position:relative; z-index: 1;">
+              <div style="position:relative; width: 240px; display:flex; gap:5px; align-items:center;">
+                <input id="search" placeholder="Search skins..." onkeydown="if(event.key===' '){ event.stopPropagation(); }" style="width: 100% !important; max-width: none; height: 44px; background: #0f172a; border: 1px solid #334155; padding-right: 50px;">
+                <button id="searchBtn" class="steam-btn highlight" style="position: absolute; right: 0; top: 0; padding: 0; width:44px; height:44px; display: flex; align-items: center; justify-content: center; background:#2a333f; border:1px solid #444; border-top-left-radius: 0; border-bottom-left-radius: 0;">
+                  <svg viewBox="0 0 24 24" width="20" height="20" stroke="#fff" stroke-width="3" fill="none" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>
+                </button>
+              </div>
           </div>
 
-          <div id="searchStatus" style="margin-bottom: 10px; color: #94a3b8; font-size: 12px; text-transform: uppercase; letter-spacing: 1px;">Ready</div>
+          <div id="searchStatus" style="margin-bottom: 10px; color: #94a3b8; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; font-weight: 800;">Ready</div>
           
           <div id="results" style="background: rgba(0,0,0,0.2); border-radius: 12px; border: 1px solid rgba(255,255,255,0.03);"></div>
+
+          <!-- Market Footer Controls -->
+          <div class="market-controls-footer" style="display:flex; justify-content:space-between; align-items:center; margin-top:20px; padding-top:15px; border-top:1px solid rgba(255,255,255,0.05);">
+            <div style="display:flex; gap:10px;">
+               <button id="randomBtn" class="steam-btn grey" style="font-size: 11px;">RANDOM WEAPON</button>
+               <button id="randomSBtn" class="steam-btn grey" style="font-size: 11px;">RANDOM STICKERS</button>
+            </div>
+            <div style="display:flex; gap:10px; align-items:center;">
+               <button id="addWalletFromSearchBtn" class="steam-btn highlight" style="background:#1f6feb; color:#fff; font-size: 11px; padding: 10px 20px;">ADD WALLET FUNDS</button>
+            </div>
+          </div>
         </div>
       </div>
 
