@@ -1,5 +1,3 @@
-// Advanced CS2 Inventory Manager - Steam UI Replica
-
 const STORAGE_KEY = "cs2_inventory_accounts_v4"; 
 const STORAGE_BACKUP_KEY = `${STORAGE_KEY}_backup`;
 const STORAGE_CHUNK_KEY = `${STORAGE_KEY}_chunked`;
