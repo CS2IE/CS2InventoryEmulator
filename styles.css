@@ -30,7 +30,12 @@
   --rarity-pink: #d32ce6;
   --rarity-red: #eb4b4b;
   --rarity-gold: #e4ae39;
-  --rarity-grey: #b0c3d9;
+  --rarity-grey: #96b1df;
+}
+
+.new-item-modal {
+  background: transparent !important;
+  border: none;
 }
 
 * { box-sizing: border-box; }
@@ -1163,12 +1168,9 @@ body:not(.pagination-disabled) .steam-grid.paged-mode .inv-item {
   text-shadow: 0 1px 2px rgba(0,0,0,0.8);
 }
 
-.inv-extra-nametag {
-  color: #eb4b4b; 
-  font-weight: 800;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+.inv-extra-nametag, .nametag-label, .inspect-nametag-label, .trade-items-grid .trade-item-nametag {
+  color: #eb4b4b !important; 
+  font-weight: 900;
 }
 
 .nametag-red {
@@ -1569,19 +1571,23 @@ option {
   overflow-y: auto;
   padding: 15px;
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
-  gap: 12px;
+  grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); /* Normalized column width */
+  gap: 14px; /* Balanced spacing */
   background: #0f172a;
+  align-content: start;
 }
 
 /* Make inventory item boxes inside trade grids smaller with centered metadata */
 .trade-items-grid .storage-item-mini {
-  aspect-ratio: 4 / 6; 
-  padding: 4px;
+  aspect-ratio: 1.46 / 1; /* Match inventory item aspect ratio exactly */
+  min-height: 90px;
+  padding: 10px;
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 2px;
+  justify-content: center;
+  gap: 0;
+  box-sizing: border-box;
 }
 
 .trade-items-grid .inv-sticker-mini {
@@ -1632,8 +1638,8 @@ option {
 /* Ensure the Trade Up inventory container always shows as a scrollable grid area */
 #tradeUpInventory {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
-  gap: 12px;
+  grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+  gap: 14px;
   padding: 12px;
   overflow-y: auto;
   /* make the contract inventory span much further down the modal while keeping overall layout stable */
@@ -1644,15 +1650,27 @@ option {
 
 .trade-up-slots-grid {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
-  gap: 8px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 25px;
   align-content: start;
+  flex: 2.5; 
+}
+
+.trade-up-slot-card {
+  width: 210px !important;
+  height: 210px !important;
+}
+
+#tradeUpSlots .trade-up-slot-card {
+  max-width: none !important;
 }
 
 .trade-up-slot-card {
   position: relative;
   width: 100%;
-  aspect-ratio: 1 / 1.2;
+  aspect-ratio: 1.2 / 1;
+  max-width: 90px; /* Reduced from 120px */
+  margin: 0 auto;
   border-radius: 4px;
   border: 1px solid rgba(255,255,255,0.08);
   background: rgba(255,255,255,0.03);
@@ -1684,16 +1702,16 @@ option {
   display: flex;
   flex-direction: column;
   align-items: center;
-  justify-content: flex-start;
-  gap: 8px;
-  padding: 14px 12px 12px;
+  justify-content: center;
+  gap: 8px; 
+  padding: 12px;
   height: 100%;
 }
 
 .trade-up-slot-card img {
   width: 100%;
-  max-width: 60px;
-  height: 45px;
+  max-width: 110px; 
+  height: 80px;
   object-fit: contain;
   filter: drop-shadow(0 4px 6px rgba(0,0,0,0.45));
 }
@@ -1702,8 +1720,8 @@ option {
   width: 100%;
   min-height: 24px;
   color: #fff;
-  font-size: 9px;
-  font-weight: 800;
+  font-size: 10px;
+  font-weight: 900;
   line-height: 1.1;
   text-align: center;
   overflow: hidden;
@@ -1711,8 +1729,8 @@ option {
 
 .trade-up-slot-price {
   color: #a4d007;
-  font-size: 11px;
-  font-weight: 800;
+  font-size: 14px;
+  font-weight: 900;
 }
 
 .trade-up-slot-stickers {
@@ -1954,15 +1972,19 @@ option {
 .modal-overlay {
   position: fixed;
   inset: 0;
-  background: rgba(0, 0, 0, 0.95); /* Solid default background for almost all popups */
+  background: rgba(0, 0, 0, 0.05); /* Slight tint for depth, mainly blur */
   z-index: 100;
   display: flex;
   align-items: center;
   justify-content: center;
   overflow-y: auto;
   padding: 20px;
-  backdrop-filter: blur(6px); /* Reduced blur */
-  -webkit-backdrop-filter: blur(6px);
+  backdrop-filter: blur(24px); /* Higher blur as requested */
+  -webkit-backdrop-filter: blur(24px);
+}
+
+#caseOpeningModal:not(.hidden) {
+  z-index: 40000 !important;
 }
 
 /* Ensure the main "Open Case" action button keeps a long, consistent width and appearance.
@@ -2027,14 +2049,14 @@ option {
 }
 
 #purchaseResultModal.modal-overlay {
-  background: rgba(255,255,255,0.02) !important;
+  background: transparent !important;
   z-index: 800 !important; /* placed under other popups so it doesn't block them */
   pointer-events: auto !important;
   align-items: center;
   overflow-y: auto;
   padding: 24px 0;
-  backdrop-filter: blur(18px) !important;
-  -webkit-backdrop-filter: blur(18px) !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
 }
 
 /* Hide the Inspect button inside the NEW ITEM popup (removed from UI) */
@@ -2064,7 +2086,6 @@ option {
 .user-snippet-modal {
   background: #0f172a;
   color: white;
-  font-family: Arial, sans-serif;
   text-align: center;
   padding: 40px;
   width: 100%;
@@ -2076,6 +2097,56 @@ option {
   box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
   display: flex;
   flex-direction: column;
+}
+
+.wear-modal-container {
+  max-width: 520px !important;
+  height: auto !important;
+  min-height: auto !important;
+  padding: 20px !important;
+  border: 1px solid #334155;
+  overflow-y: auto;
+  max-height: 94vh; /* FIT ALL ON POPUP */
+}
+
+.wear-option-btn {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 18px 24px;
+  background: linear-gradient(180deg, rgba(255,255,255,0.05), rgba(255,255,255,0.01));
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 4px; /* CS2 sharp/tech feel */
+  color: #fff;
+  font-weight: 900;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: all 0.15s cubic-bezier(0.16, 1, 0.3, 1);
+  margin-top: 10px;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+}
+
+.wear-option-btn:hover {
+  background: rgba(102, 192, 244, 0.2);
+  border-color: #66c0f4;
+  transform: scale(1.02);
+  box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+}
+
+.wear-option-btn .price-tag {
+  color: #a4d007;
+  font-size: 18px;
+}
+
+.wear-option-btn:hover {
+  background: rgba(102, 192, 244, 0.15);
+  border-color: #66c0f4;
+  transform: translateX(4px);
+}
+
+.wear-option-btn .price-tag {
+  color: #a4d007;
 }
 
 /* Jackpot Modal - Fullscreen Rework */
@@ -2145,6 +2216,15 @@ option {
   justify-content: center;
   gap: 10px;
   flex-wrap: wrap;
+  position: relative;
+}
+
+#searchBtn {
+  position: relative !important;
+  right: auto !important;
+  top: auto !important;
+  transform: none !important;
+  margin-left: -44px;
 }
 
 .user-snippet-modal input, 
@@ -2539,9 +2619,9 @@ option {
 }
 
 #caseOpeningModal:not(.hidden) {
-  backdrop-filter: none;
-  -webkit-backdrop-filter: none;
-  background: rgba(11, 15, 26, 0.9) !important;
+  backdrop-filter: blur(25px) brightness(0.4);
+  -webkit-backdrop-filter: blur(25px) brightness(0.4);
+  background: transparent !important;
 }
 
 .spinner-track-line {
@@ -2700,9 +2780,20 @@ option {
   pointer-events: none;
 }
 
+/* Market UI Footer */
+.market-footer {
+  display: flex;
+  gap: 15px;
+  padding: 15px 25px;
+  background: rgba(0,0,0,0.4);
+  border-top: 1px solid #334155;
+  align-items: center;
+  margin-top: auto;
+}
+
 /* Redesigned NEW ITEM Modal Styles */
 .new-item-modal {
-  background: #0b0f1a;
+  background: rgba(11, 15, 26, 1.0) !important;
   width: 780px;
   max-width: 98vw;
   min-height: 620px;
@@ -2715,12 +2806,13 @@ option {
   flex-direction: column;
   padding: 40px 50px;
   border-radius: 4px;
-  box-shadow: 0 50px 120px rgba(0,0,0,0.95);
+  box-shadow: none;
   font-family: "StratumNo2", "Arial Black", sans-serif;
   color: white;
   text-align: left;
   user-select: none;
   -webkit-user-select: none;
+  border: 1px solid rgba(255,255,255,0.1);
 }
 
 .new-item-accent {
@@ -3260,20 +3352,42 @@ option {
 .inspect-box-layout {
   max-width: 1100px !important;
   width: 95vw !important;
-  height: 92vh !important;
+  height: 94vh !important;
   user-select: none;
   -webkit-user-select: none;
-  background: radial-gradient(circle at center, rgba(30, 41, 59, 0.2) 0%, transparent 80%) !important;
+  background: transparent !important; /* No dark background */
   border: none !important;
   box-shadow: none !important;
   cursor: grab;
   position: relative;
   overflow: hidden;
-  user-select: none;
   display: flex;
   flex-direction: column !important;
-  padding: 0 !important;
-  border-radius: 20px;
+  padding: 40px 50px !important;
+  border-radius: 4px;
+}
+
+.inspect-header-area {
+  margin-top: -20px;
+}
+
+.inspect-main-name {
+  font-size: 56px !important;
+  line-height: 1;
+}
+
+.inspect-actions-footer {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 15px 30px;
+  background: transparent !important;
+  border-top: none !important;
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  z-index: 1000;
 }
 
 #inspectModal.modal-overlay {
@@ -3290,11 +3404,11 @@ option {
 }
 
 .inspect-nametag-label {
-  color: #f87171;
-  font-size: 22px;
-  font-weight: 900;
+  color: #fff !important;
+  font-size: 16px !important;
+  font-weight: 400 !important;
   margin-bottom: 8px;
-  text-shadow: 0 4px 8px rgba(0,0,0,0.8);
+  text-shadow: 0 2px 4px rgba(0,0,0,0.8);
 }
 
 .inspect-main-name {
@@ -3468,7 +3582,7 @@ option {
   display: flex;
   flex-direction: column;
   align-items: center;
-  z-index: 60;
+  z-index: 1000;
   pointer-events: none;
 }
 
@@ -3504,16 +3618,29 @@ option {
 }
 
 .case-opening-bg-blur {
-  position: absolute;
-  inset: 0;
-  background-size: 60%;
-  background-position: center;
-  background-repeat: no-repeat;
-  /* Reduced blur intensity as requested */
-  filter: blur(2px) brightness(0.88) saturate(0.95);
-  opacity: 0.42;
-  z-index: -1;
+  display: none !important; /* NO CASE BACKGROUND ON UNLOCKED POPUP */
+}
+
+.unboxing-actions-bar {
+  display: flex;
+  flex-direction: row;
+  opacity: 0;
   pointer-events: none;
+  transition: opacity 0.5s;
+  width: 500px;
+  max-width: 90vw;
+  margin-bottom: 80px;
+  z-index: 1000;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 20px;
+  border-top: 1px solid rgba(255, 255, 255, 0.4); /* LINE ABOVE */
+  background: transparent !important; /* CLEAR */
+  position: fixed;
+  bottom: 0px;
+  left: 50%;
+  transform: translateX(-50%);
+  border-radius: 8px;
 }
 
 /* Spinner track layout tweaks: increase gap between track items for more breathing room */
@@ -3644,10 +3771,24 @@ option {
   box-shadow: none !important;
 }
 
-#caseConfirmModal.modal-overlay, #inspectModal.modal-overlay {
+#caseConfirmModal.modal-overlay {
   background: transparent !important;
   backdrop-filter: blur(12px) !important;
   -webkit-backdrop-filter: blur(12px) !important;
+}
+
+#inspectModal.modal-overlay {
+  background: transparent !important;
+  backdrop-filter: blur(30px) !important; /* No dark color, just blur */
+  -webkit-backdrop-filter: blur(30px) !important;
+  z-index: 2147483647 !important;
+  background-image: none !important;
+}
+
+#inspectModal .user-snippet-modal,
+#caseOpeningModal #caseOpeningResult,
+#caseOpeningModal .unlocked-3d-container {
+  background-color: transparent !important;
 }
 
 .case-confirm-header {
@@ -3845,9 +3986,40 @@ option {
   position: relative;
   display: inline-flex;
   gap: 8px;
-  cursor: default; /* use default cursor instead of question-mark */
-  padding: 0;
+  cursor: default;
+  padding: 10px;
   transition: transform 0.2s;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 4px;
+}
+
+.info-icon-wrapper:hover {
+  background: rgba(255,255,255,0.1);
+  border-color: rgba(255,255,255,0.2);
+}
+
+.info-icon-wrapper .info-share-btn {
+  opacity: 1 !important;
+  transition: background 0.2s;
+  background: transparent;
+  border: 1px solid transparent;
+  padding: 4px;
+  border-radius: 4px;
+  cursor: pointer !important; /* Force pointer */
+  pointer-events: auto !important;
+}
+
+.info-share-btn:hover {
+  background: rgba(255,255,255,0.1) !important;
+  border-color: rgba(255,255,255,0.2) !important;
+  transform: scale(1.1);
+}
+
+.info-icon-wrapper {
+  background: rgba(255,255,255,0.05);
+  border-color: rgba(255,255,255,0.1);
+  border-radius: 4px;
 }
 
 /* Inspect modal: anchor the info icon moved to the left side for the inspect popup */
@@ -4345,6 +4517,7 @@ option {
   z-index: -20;
   display: none;
   pointer-events: none;
+  filter: blur(4px) brightness(0.9); /* Added blur to mp4 backgrounds as requested */
 }
 
 /* Force case/container grid cards to be rectangular single-cell items (avoid spanning/stretching) */
@@ -4536,31 +4709,13 @@ body.cs2-bg-active, body.cs2-bg-active #app {
 /* Inspect modal sticker tray placement fix:
    Ensure sticker icons appear below the 3D image area and above the float bar,
    centered, interactive, and non-overlapping with image or float UI. */
-#inspectStickers {
+#inspectStickers, #unlockedStickers, #purchaseResultStickers {
   position: absolute;
   left: 50%;
-  bottom: 360px; /* Moved UP to overlap item image further */
+  bottom: 165px; 
   transform: translateX(-50%);
   display: flex;
-  gap: 65px;
-  justify-content: center;
-  align-items: center;
-  flex-wrap: nowrap;
-  padding: 10px;
-  z-index: 9000;
-  pointer-events: auto;
-  width: auto;
-  max-width: 95%;
-  overflow: visible;
-}
-
-#unlockedStickers {
-  position: absolute;
-  left: 50%;
-  bottom: 120px; /* Moved DOWN to prevent overlapping central image area */
-  transform: translateX(-50%);
-  display: flex;
-  gap: 65px;
+  gap: 45px; 
   justify-content: center;
   align-items: center;
   flex-wrap: nowrap;
@@ -5153,7 +5308,7 @@ select, .steam-select {
 
 .loadout-slot {
   width: 100%;
-  aspect-ratio: 1.1/1; /* More square and larger */
+  aspect-ratio: 1.1/1; 
   background: rgba(0,0,0,0.5);
   border: 1px solid rgba(255,255,255,0.15);
   border-radius: 6px;
@@ -5165,6 +5320,8 @@ select, .steam-select {
   cursor: pointer;
   transition: all 0.2s;
   overflow: hidden;
+  height: 260px !important; /* Made boxes bigger as requested */
+  width: 260px !important;
 }
 
 .loadout-slot:hover {
@@ -5177,10 +5334,10 @@ select, .steam-select {
 }
 
 .loadout-slot img {
-  width: 70%;
-  height: 70%;
+  width: 85%;
+  height: 85%;
   object-fit: contain;
-  filter: drop-shadow(0 4px 8px rgba(0,0,0,0.5));
+  filter: drop-shadow(0 4px 12px rgba(0,0,0,0.6));
   margin-top: -10px;
 }
 
@@ -5191,20 +5348,12 @@ select, .steam-select {
 }
 
 .loadout-slot-label {
-  font-size: 12px;
-  color: #fff;
-  text-transform: none;
-  margin-top: 4px;
-  font-weight: 800;
-  text-align: center;
-  width: 100%;
-  line-height: 1.2;
-  padding: 0 6px;
-  text-shadow: 0 2px 4px rgba(0,0,0,0.8);
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
+  display: none; /* Only show on hover via label-hover */
+}
+
+.loadout-slot-label-hover {
+  z-index: 10;
+  pointer-events: none;
 }
 
 .loadout-operator-wrap {
