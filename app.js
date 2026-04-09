@@ -35,7 +35,7 @@ let state = {
   clearHeader: true, 
   backgroundType: "random", 
   statsForNerds: true, 
-  hideSidebar: true,
+  hideSidebar: true, // Default hide sidebar enabled
   disableNewItemPopup: false,
   newItemPopupSound: false,
   showHeaderTitle: true,
@@ -65,6 +65,9 @@ let state = {
   botTradeTradableIds: [], 
   tabTitle: "Counter-Strike 2 Lite",
   hideExperimentalStickers: false,
+  showEditSellContext: false,
+  showViewContext: false,
+  hideMockMeta: false,
   coinflipHistory: [],
   bulkSellMode: false,
   bulkSelectedIds: [],
@@ -112,6 +115,7 @@ let apiSkinVariants = [];
 let apiBaseWeapons = [];
 let apiCratesByName = new Map();
 let apiSkinVariantsByName = new Map();
+let apiSkinsByNormalizedName = new Map(); // Performance index
 let PRICE_FIXES = {};
 const STAT_TRAK_ICON_IMG = new Image();
 STAT_TRAK_ICON_IMG.src = "https://i.imgur.com/TRtzFCo.png";
@@ -120,6 +124,13 @@ const BET_FEE = 0.012;
 /**
  * Performance: Optimized Saving
  */
+const handleRightClickAttribs = (e) => {
+  e.preventDefault();
+  e.stopPropagation();
+  // ... placement logic removed as requested ...
+};
+
+// Optimized saving with passive execution
 function throttle(func, limit) {
   let lastFunc;
   let lastRan;
@@ -140,6 +151,8 @@ function throttle(func, limit) {
     }
   }
 }
+// Performance: minimize stringification overhead
+let _lastStringifiedState = "";
 
 // Unified Robust Storage Layer
 const DB_NAME = "CS2InventoryDB";
@@ -570,22 +583,44 @@ function getWearName(wear) {
   return "";
 }
 
-function getRawApiName(itemOrName) {
-  if (!itemOrName) return "";
-  if (typeof itemOrName === "string") return normalizeMarketHashName(itemOrName);
+/**
+ * Robustly unwraps market listings and items to ensure resolvers see consistent properties.
+ */
+function getWearImageLookupItem(input) {
+  if (!input || typeof input !== 'object') return input;
+  // Handle wrapped listing objects like { item: {...}, wear: "..." }
+  if (input.item && typeof input.item === 'object' && !Array.isArray(input.item)) {
+    return { ...input.item, wear: input.wear || input.item.wear };
+  }
+  return input;
+}
+
+function getRawApiName(input) {
+  const item = getWearImageLookupItem(input);
+  if (!item) return "";
+  if (typeof item === "string") return normalizeMarketHashName(item);
   return normalizeMarketHashName(
-    itemOrName.skinBidsApiName ||
-    itemOrName.market_hash_name ||
-    itemOrName.hash_name ||
-    itemOrName.name ||
+    item.skinBidsApiName ||
+    item.market_hash_name ||
+    item.hash_name ||
+    item.name ||
     ""
   );
 }
 
-function findExactApiItemByName(itemOrName) {
-  const item = typeof itemOrName === "string" ? { name: itemOrName } : (itemOrName || {});
+function findExactApiItemByName(input) {
+  const item = getWearImageLookupItem(input);
+  if (!item) return null;
   const rawName = getRawApiName(item);
   if (!rawName) return null;
+
+  const norm = normalizeMarketHashName(rawName).toLowerCase();
+  
+  // Use performance index for instant lookup
+  const quickFound = apiSkinsByNormalizedName.get(norm);
+  // Doppler items need specialized phase/paint checks, so bypass quickFound for them
+  if (quickFound && !norm.includes("doppler")) return quickFound;
+
   const wearName = getWearName(item.wear);
   const explicitPhase = String(
     item.phase ||
@@ -703,14 +738,288 @@ function isStickerSlabItem(item) {
   return name.includes("sticker slab") || type.includes("sticker slab");
 }
 
-function isSouvenirGoldStickerItem(item) {
-  const name = String(item?.name || "").toLowerCase();
+function isSouvenirStickerCandidateItem(item) {
+  const name = String(item?.name || item?.market_hash_name || "").toLowerCase();
   return name.includes("sticker") &&
-    /\(gold\)/i.test(String(item?.name || "")) &&
     !name.includes("slab") &&
-    !name.includes("champion") &&
-    !name.includes("ems") &&
     !name.includes("capsule");
+}
+
+function getItemNameText(item) {
+  if (typeof item === "string") return String(item || "").toLowerCase();
+  return String(item?.name || item?.market_hash_name || "").toLowerCase();
+}
+
+function getItemTypeText(item) {
+  if (typeof item === "string") return "";
+  return String(item?.type || item?.category?.name || item?.weapon?.name || "").toLowerCase();
+}
+
+function isStickerCapsuleItem(item) {
+  const name = getItemNameText(item);
+  const type = getItemTypeText(item);
+  if (!name && !type) return false;
+  return type.includes("sticker capsule") ||
+    (type.includes("capsule") && (type.includes("sticker") || name.includes("sticker"))) ||
+    (name.includes("capsule") && !name.includes("sticker |"));
+}
+
+function shouldForceNoWearItem(item) {
+  const name = getItemNameText(item);
+  const type = getItemTypeText(item);
+  if (!name && !type) return false;
+  if (item?.noWear) return true;
+  if (isContainer(item) || isKeyItem(item)) return true;
+  return name.startsWith("sticker |") ||
+    type === "sticker" ||
+    type.includes("sticker capsule");
+}
+
+function getSouvenirStickerSearchKeys(containerName) {
+  const raw = normalizeMarketHashName(containerName || "").replace(/\s+/g, " ").trim();
+  if (!raw) return [];
+
+  const keys = new Set();
+  const pushKey = (value) => {
+    const normalized = normalizeMarketHashName(value || "").replace(/\s+/g, " ").trim().toLowerCase();
+    if (!normalized || normalized.length < 4) return;
+    keys.add(normalized);
+  };
+
+  pushKey(raw);
+  pushKey(raw.replace(/\b(souvenir package|package|collection)\b/gi, " "));
+
+  const yearMatch = raw.match(/(.+?\b\d{4}\b)/i);
+  if (yearMatch) pushKey(yearMatch[1]);
+
+  const eventYearMatches = raw.match(/(katowice|cologne|dreamhack|mlg|cluj-napoca|columbus|atlanta|krakow|boston|london|berlin|stockholm|antwerp|rio|paris|budapest|austin|shanghai)\s+\d{4}/ig) || [];
+  eventYearMatches.forEach(pushKey);
+
+  return Array.from(keys).sort((a, b) => b.length - a.length);
+}
+
+function extractSouvenirPackageNameFromSource(source) {
+  const raw = String(source || "").trim();
+  if (!raw) return "";
+
+  const pulledMatch = raw.match(/pulled from\s+(.+)$/i);
+  if (pulledMatch) return pulledMatch[1].trim();
+  if (/(souvenir package|package|collection)/i.test(raw)) return raw;
+
+  return "";
+}
+
+function isGoldStickerName(name) {
+  return /\(gold\)/i.test(String(name || ""));
+}
+
+function toSouvenirGoldStickerName(name) {
+  const raw = String(name || "").trim();
+  if (!raw) return "";
+  if (isGoldStickerName(raw)) return raw;
+
+  if (/\s\((holo|foil|glitter|lenticular|blue|red)\)(\s*\|.*)?$/i.test(raw)) {
+    return raw.replace(/\s\((holo|foil|glitter|lenticular|blue|red)\)(\s*\|.*)?$/i, " (Gold)$2");
+  }
+
+  const eventSuffixMatch = raw.match(/^(.+?)(\s*\|\s*[^|]+\s+\d{4})$/i);
+  if (eventSuffixMatch) {
+    return `${eventSuffixMatch[1]} (Gold)${eventSuffixMatch[2]}`;
+  }
+
+  return `${raw} (Gold)`;
+}
+
+function createSouvenirGoldStickerCandidate(candidate, fallbackRarity = "Extraordinary") {
+  if (!candidate) return null;
+
+  const rawName = String(
+    candidate?.name || candidate?.market_hash_name || candidate?.hash_name || candidate || ""
+  ).trim();
+  if (!rawName) return null;
+
+  const goldName = toSouvenirGoldStickerName(rawName);
+  if (!goldName) return null;
+
+  const exactGold = allSkins.find(entry => (
+    normalizeMarketHashName(entry?.name || entry?.market_hash_name || entry?.hash_name || "").toLowerCase() ===
+    normalizeMarketHashName(goldName).toLowerCase()
+  ));
+
+  if (exactGold) {
+    return exactGold;
+  }
+
+  return {
+    ...candidate,
+    name: goldName,
+    market_hash_name: goldName,
+    rarity: candidate?.rarity || { name: fallbackRarity }
+  };
+}
+
+function getSouvenirStickerPoolForContainer(containerName) {
+  const searchKeys = getSouvenirStickerSearchKeys(containerName);
+  if (!searchKeys.length) {
+    return { goldPool: [], regularPool: [] };
+  }
+
+  const goldPoolByName = new Map();
+  const fallbackPoolByName = new Map();
+  const addCandidate = (candidate, fallbackRarity = "Extraordinary") => {
+    if (!candidate) return;
+
+    const rawName = String(
+      typeof candidate === "string"
+        ? candidate
+        : (candidate?.name || candidate?.market_hash_name || candidate?.hash_name || "")
+    ).trim();
+    if (!rawName || !/sticker/i.test(rawName) || /capsule|slab/i.test(rawName)) return;
+
+    const normalizedName = normalizeMarketHashName(rawName).toLowerCase();
+    if (!searchKeys.some(key => normalizedName.includes(key))) return;
+
+    let resolved = (typeof candidate === "string")
+      ? allSkins.find(entry => normalizeMarketHashName(entry?.name || entry?.market_hash_name || entry?.hash_name || "").toLowerCase() === normalizedName)
+      : candidate;
+
+    if (!resolved) {
+      resolved = {
+        name: rawName,
+        img: "",
+        price: PRICE_FIXES[rawName],
+        rarity: { name: fallbackRarity }
+      };
+    } else if (!resolved.rarity && fallbackRarity) {
+      resolved = { ...resolved, rarity: { name: fallbackRarity } };
+    }
+
+    const targetPool = isGoldStickerName(rawName) ? goldPoolByName : fallbackPoolByName;
+    if (!targetPool.has(rawName)) {
+      targetPool.set(rawName, resolved);
+    }
+  };
+
+  allSkins.forEach(entry => {
+    if (!isSouvenirStickerCandidateItem(entry)) return;
+    addCandidate(entry);
+  });
+
+  Object.entries(CASE_CONTENTS_DB || {}).forEach(([caseName, groups]) => {
+    const normalizedCaseName = normalizeMarketHashName(caseName).toLowerCase();
+    if (!searchKeys.some(key => normalizedCaseName.includes(key))) return;
+
+    Object.entries(groups || {}).forEach(([rarityKey, items]) => {
+      if (!Array.isArray(items)) return;
+      items.forEach(entry => addCandidate(
+        entry?.name ? { ...entry, rarity: entry.rarity || { name: rarityKey } } : entry,
+        rarityKey
+      ));
+    });
+  });
+
+  const regularPool = Array.from(fallbackPoolByName.values());
+  if (goldPoolByName.size > 0) {
+    return {
+      goldPool: Array.from(goldPoolByName.values()),
+      regularPool
+    };
+  }
+
+  const synthesizedGoldPool = [];
+  regularPool.forEach(entry => {
+    const goldEntry = createSouvenirGoldStickerCandidate(entry, entry?.rarity?.name || entry?.rarity || "Extraordinary");
+    if (goldEntry) synthesizedGoldPool.push(goldEntry);
+  });
+
+  return {
+    goldPool: synthesizedGoldPool,
+    regularPool
+  };
+}
+
+function buildSouvenirStickersForContainer(containerName, count = 4, priceMultiplier = 1) {
+  const query = containerName.toLowerCase();
+  const stickerPool = allSkins.filter(s => {
+      const sn = s.name.toLowerCase();
+      return sn.includes("sticker") && sn.includes("(gold)") && query.split(/\s+/).some(word => word.length > 2 && sn.includes(word));
+  });
+
+  if (stickerPool.length > 0) {
+      const picks = [];
+      for(let i=0; i<count; i++) {
+          const s = stickerPool[Math.floor(Math.random()*stickerPool.length)];
+          picks.push({
+            name: s.name,
+            img: getDisplayImage(s),
+            price: (PRICE_FIXES[s.name] || mockPrice(s)) * 0.5,
+            rarity: "Extraordinary",
+            scratchPercent: 0
+          });
+      }
+      return picks;
+  }
+
+  const { goldPool, regularPool } = getSouvenirStickerPoolForContainer(containerName);
+  if (!goldPool.length && !regularPool.length) return [];
+
+  const takeRandomSticker = (pool, uniquePool) => {
+    if (!pool.length) return null;
+    const sourcePool = uniquePool.length ? uniquePool : pool;
+    const idx = Math.floor(Math.random() * sourcePool.length);
+    return uniquePool.length ? uniquePool.splice(idx, 1)[0] : sourcePool[idx];
+  };
+
+  const uniqueGoldPool = [...goldPool];
+  const uniqueRegularPool = [...regularPool];
+  const stickers = [];
+  const goldCount = regularPool.length > 0 ? Math.min(count, goldPool.length) : count;
+
+  for (let i = 0; i < goldCount; i++) {
+    const sticker = takeRandomSticker(goldPool, uniqueGoldPool);
+    if (!sticker) continue;
+    const stickerName = sticker.name || sticker.market_hash_name || "";
+    const basePrice = PRICE_FIXES[stickerName] ?? sticker.price ?? mockPrice(sticker);
+    stickers.push({
+      name: stickerName,
+      img: getDisplayImage(sticker),
+      price: Math.max(0, Math.round((basePrice * priceMultiplier) * 100) / 100),
+      rarity: sticker.rarity?.name || sticker.rarity || "Extraordinary",
+      scratchPercent: 0
+    });
+  }
+
+  while (stickers.length < count && regularPool.length > 0) {
+    const sticker = takeRandomSticker(regularPool, uniqueRegularPool);
+    if (!sticker) break;
+    const stickerName = sticker.name || sticker.market_hash_name || "";
+    const basePrice = PRICE_FIXES[stickerName] ?? sticker.price ?? mockPrice(sticker);
+    stickers.push({
+      name: stickerName,
+      img: getDisplayImage(sticker),
+      price: Math.max(0, Math.round((basePrice * priceMultiplier) * 100) / 100),
+      rarity: sticker.rarity?.name || sticker.rarity || "Extraordinary",
+      scratchPercent: 0
+    });
+  }
+
+  const fallbackPool = goldPool.length ? goldPool : regularPool;
+  while (stickers.length < count && fallbackPool.length > 0) {
+    const sticker = fallbackPool[Math.floor(Math.random() * fallbackPool.length)];
+    if (!sticker) break;
+
+    const stickerName = sticker.name || sticker.market_hash_name || "";
+    const basePrice = PRICE_FIXES[stickerName] ?? sticker.price ?? mockPrice(sticker);
+    stickers.push({
+      name: stickerName,
+      img: getDisplayImage(sticker),
+      price: Math.max(0, Math.round((basePrice * priceMultiplier) * 100) / 100),
+      rarity: sticker.rarity?.name || sticker.rarity || "Extraordinary",
+      scratchPercent: 0
+    });
+  }
+
+  return stickers;
 }
 
 const API_CONTAINER_ALIASES = {
@@ -760,9 +1069,6 @@ function normalizeApiContainerName(name) {
 }
 
 function indexApiData() {
-  // Optimization: Skip if already indexed and we have data
-  if (apiCratesByName && apiCratesByName.size > 0 && apiSkinVariantsByName && apiSkinVariantsByName.size > 0) return;
-
   apiCratesByName = new Map();
   apiSkinVariantsByName = new Map();
 
@@ -822,7 +1128,18 @@ function findApiCrateByName(caseName) {
   return null;
 }
 
-function getApiWearVariant(item) {
+function getResolvedWearVariantImage(input) {
+  const item = getWearImageLookupItem(input);
+  if (!item) return "";
+  const lowerName = String(item.name || "").toLowerCase();
+  if (lowerName.includes("doppler")) return ""; // Exclude Dopplers
+
+  const variant = getApiWearVariant(input);
+  return variant?.image || variant?.img || "";
+}
+
+function getApiWearVariant(input) {
+  const item = getWearImageLookupItem(input);
   if (!item) return null;
   const wearName = getWearName(item.wear);
   if (!wearName) return null;
@@ -851,9 +1168,13 @@ function getApiWearVariant(item) {
   }) || null;
 }
 
-function syncItemWearImage(item) {
-  if (!item || typeof item !== "object") return item;
+function syncItemWearImage(input) {
+  const item = getWearImageLookupItem(input);
+  if (!item || typeof item !== "object") return input;
   const lowerName = String(item.name || "").toLowerCase();
+
+  // Exclude Dopplers from generic wear path as they use phase logic
+  if (lowerName.includes("doppler")) return input;
 
   const typeText = String(item.type || item.category?.name || item.weapon?.name || "").toLowerCase();
   const isCaseHardened = lowerName.includes("case hardened");
@@ -869,17 +1190,17 @@ function syncItemWearImage(item) {
     !lowerName.includes("graffiti") &&
     !lowerName.includes("agent") &&
     !lowerName.includes("storage unit");
-  if (!isWeaponLike) return item;
 
-  const exactApiImage = getExactApiImage(item);
+  if (!isWeaponLike) return input;
+
+  const exactApiImage = getExactApiImage(input);
   if (exactApiImage) {
     item.image = exactApiImage;
     item.img = exactApiImage;
-    return item;
+    return input;
   }
 
-  const wearVariant = getApiWearVariant(item);
-  const resolvedImage = wearVariant?.image || wearVariant?.img || "";
+  const resolvedImage = getResolvedWearVariantImage(input);
   if (resolvedImage) {
     item.image = resolvedImage;
     item.img = resolvedImage;
@@ -890,7 +1211,7 @@ function syncItemWearImage(item) {
       item.img = baseImage;
     }
   }
-  return item;
+  return input;
 }
 
 const BASE_WEAPON_ID_PREFIX = "default::";
@@ -1196,19 +1517,20 @@ function buildCaseContentsFromApi(crate) {
   };
   const findExactCaseSkin = (entry) => {
     const rawName = entry?.name || entry?.market_hash_name || "";
-    const lookupNames = Array.from(new Set([
+    if (!rawName) return null;
+
+    const lookupNames = [
       normalizeMarketHashName(rawName).toLowerCase(),
-      normalizeMarketHashName(String(rawName || "").replace(/^souvenir\s+/i, "")).toLowerCase(),
-      normalizeMarketHashName(String(rawName || "").replace(/^stattrak(?:™)?\s+/i, "")).toLowerCase(),
-      normalizeMarketHashName(normalizeContainerLookupItemName(rawName)).toLowerCase(),
-      normalizeMarketHashName(normalizeContainerLookupItemName(String(rawName || "").replace(/^souvenir\s+/i, ""))).toLowerCase(),
-      normalizeMarketHashName(normalizeImageLookupName(normalizeContainerLookupItemName(rawName))).toLowerCase()
-    ].filter(Boolean)));
-    if (!lookupNames.length || !Array.isArray(allSkins)) return null;
-    return allSkins.find(s => {
-      const skinName = normalizeMarketHashName(s?.name || s?.hash_name || "").toLowerCase();
-      return lookupNames.includes(skinName);
-    }) || null;
+      normalizeMarketHashName(rawName.replace(/^souvenir\s+/i, "")).toLowerCase(),
+      normalizeMarketHashName(rawName.replace(/^stattrak(?:™)?\s+/i, "")).toLowerCase(),
+      normalizeMarketHashName(normalizeContainerLookupItemName(rawName)).toLowerCase()
+    ];
+
+    for (const name of lookupNames) {
+      const found = apiSkinsByNormalizedName.get(name);
+      if (found) return found;
+    }
+    return null;
   };
   const pushItems = (items, fallbackRarity) => {
     if (!Array.isArray(items)) return;
@@ -1255,10 +1577,10 @@ function buildCaseContentsFromApi(crate) {
 
 function resolveCaseContentsData(caseName) {
   const rawName = String(caseName || "").replace(/^Souvenir\s+/i, "").trim();
-  if (CASE_CONTENTS_DB[rawName]) return CASE_CONTENTS_DB[rawName];
   const apiCrate = findApiCrateByName(caseName);
   const apiContents = buildCaseContentsFromApi(apiCrate);
   if (apiContents) return apiContents;
+  if (CASE_CONTENTS_DB[rawName]) return CASE_CONTENTS_DB[rawName];
   return CASE_CONTENTS_DB[caseName] || null;
 }
 
@@ -1350,6 +1672,12 @@ function normalizeState() {
       if (!it) return;
       if (renameMap[it.name]) it.name = renameMap[it.name];
       if (it.name === "Sealed Dead Hand Terminal" || it.name === "Sealed Genesis Terminal") it.type = "Container";
+      if (!it.type && it.category?.name) it.type = it.category.name;
+      if (shouldForceNoWearItem(it)) {
+        it.wear = null;
+        it.floatVal = null;
+        it.pattern = null;
+      }
       syncItemWearImage(it);
       if (syncPersistedDopplerPresentation(it)) didMutateState = true;
       if (Array.isArray(it.contents)) {
@@ -1359,6 +1687,12 @@ function normalizeState() {
         if (!child) return;
         if (renameMap[child.name]) child.name = renameMap[child.name];
         if (child.name === "Sealed Dead Hand Terminal" || child.name === "Sealed Genesis Terminal") child.type = "Container";
+        if (!child.type && child.category?.name) child.type = child.category.name;
+        if (shouldForceNoWearItem(child)) {
+          child.wear = null;
+          child.floatVal = null;
+          child.pattern = null;
+        }
         syncItemWearImage(child);
         if (syncPersistedDopplerPresentation(child)) didMutateState = true;
       });
@@ -1395,6 +1729,11 @@ function normalizeState() {
         if (it && Array.isArray(it.contents)) {
           it.contents = it.contents.filter(child => !isBlockedInventoryItem(child));
         }
+        if (it && shouldForceNoWearItem(it)) {
+          it.wear = null;
+          it.floatVal = null;
+          it.pattern = null;
+        }
     });
     if (!acc.goldsPerCase) acc.goldsPerCase = {};
     if (!Array.isArray(acc.equippedItemIds)) acc.equippedItemIds = [];
@@ -1417,14 +1756,22 @@ function normalizeState() {
       if (it.img && it.img.includes("raw.githubusercontent.com")) it.img = "";
       if (!it.id) it.id = "it_" + Date.now() + "_" + Math.random().toString(16).slice(2);
       if (it.source && String(it.source).toLowerCase().includes("added")) it.source = "Purchased";
-      if (it && it.wear) {
+      if (it && shouldForceNoWearItem(it)) {
+        it.wear = null;
+        it.floatVal = null;
+        it.pattern = null;
+      } else if (it && it.wear) {
         it.floatVal = getUniqueFloatForItem(it, usedFloats);
       }
       if (it.contents) {
         it.contents.forEach(child => {
           if (child && !child.id) child.id = "it_" + Date.now() + "_" + Math.random().toString(16).slice(2);
           if (child && child.img && child.img.includes("raw.githubusercontent.com")) child.img = "";
-          if (child && child.wear) {
+          if (child && shouldForceNoWearItem(child)) {
+            child.wear = null;
+            child.floatVal = null;
+            child.pattern = null;
+          } else if (child && child.wear) {
             child.floatVal = getUniqueFloatForItem(child, usedFloats);
           }
         });
@@ -1537,37 +1884,41 @@ async function saveStateToDB() {
       state.__lastSavedAt = snapshotObj.__lastSavedAt;
 
       let snapshotStr;
-      let criticalSnapshotStr;
       try {
         snapshotStr = JSON.stringify(snapshotObj);
-        criticalSnapshotStr = JSON.stringify(buildCriticalStateSnapshot(snapshotObj));
+        if (snapshotStr === _lastStringifiedState) {
+           isSaving = false;
+           return true;
+        }
+        _lastStringifiedState = snapshotStr;
       } catch (err) {
-        console.error("Critical Save Error: Stringification failed", err);
         isSaving = false;
-        if (saveRequested) setTimeout(saveStateToDB, 50);
         return false;
       }
 
-      // Primary persistent save to IndexedDB (async)
+      // Performance Optimization: Save to asynchronous IndexedDB frequently
       try {
-        const pureObj = JSON.parse(snapshotStr);
-        idbSuccess = await saveToIDB(STORAGE_KEY, pureObj);
-      } catch(e) {
-        console.warn("IDB Save Failed", e);
+        idbSuccess = await saveToIDB(STORAGE_KEY, snapshotObj);
+      } catch(e) {}
+
+      // ONLY write to slow synchronous localStorage if the save is significantly different or every ~30 seconds
+      const now = Date.now();
+      const shouldSaveToHardStorage = !window._lastHardSave || (now - window._lastHardSave > 30000);
+      
+      if (shouldSaveToHardStorage) {
+          window._lastHardSave = now;
+          try {
+            writeStringWithFallback(STORAGE_KEY, snapshotStr);
+            writeStringWithFallback(STORAGE_REFRESH_SAFE_KEY, JSON.stringify(buildRefreshSafeSnapshotObject()));
+          } catch(e) {}
       }
 
-      // Fallback LocalStorage save paths
+      // Keep window.name and sessionStorage updated for tab-refresh protection (fast)
       try {
-        writeStringWithFallback(STORAGE_KEY, snapshotStr);
-        writeStringWithFallback(STORAGE_BACKUP_KEY, snapshotStr);
-        localStorage.setItem(STORAGE_CRITICAL_KEY, criticalSnapshotStr);
-        writeStringWithFallback(STORAGE_EXPORT_MIRROR_KEY, snapshotStr);
         writeWindowNameSnapshot(snapshotStr);
-        const refreshSafeStr = JSON.stringify(buildRefreshSafeSnapshotObject());
-        writeStringWithFallback(STORAGE_REFRESH_SAFE_KEY, refreshSafeStr);
-      } catch(e) {
-        console.error("LocalStorage Save Failed", e);
-      }
+        sessionStorage.setItem(STORAGE_SESSION_KEY, snapshotStr);
+      } catch (e) {}
+
     } catch (globalErr) {
       console.error("Global Save Error:", globalErr);
     }
@@ -1588,13 +1939,12 @@ function saveState() {
   if (!isStateLoaded) return;
   isDirty = true;
   
-  // PERFORMANCE FIX: Remove heavy synchronous stringification on every interaction.
-  // Instead, rely on the debounced async save and beforeunload/visibilitychange handlers.
+  // PERFORMANCE FIX: Debounce save operation to prevent UI stutter
   if (saveDebounceTimer) clearTimeout(saveDebounceTimer);
   saveDebounceTimer = setTimeout(async () => {
     saveDebounceTimer = null;
     await saveStateToDB();
-  }, 2000); // 2 second debounce for heavy persistence
+  }, 3000); 
 }
 
 // Pulse save every 2 seconds to guarantee persistence against crashes
@@ -1692,51 +2042,7 @@ let jackpotPotValue = 0;
 let forceCoinflipWin = false;
 
 const RARE_NAMETAGS = [
-  "Magic Stick","Public Enemy No. 1","Headshot Machine","Aimbot.exe","Spray & Pray","YOLO","Clutch or Kick","Don't Blink","The Beast","Silver Elite","Global Elite","Dragon Born","Skin Lord","Silent Assassin","Boom Headshot","One Click","Game Over","Get Good","Clutch Queen","Aim Lock","Full Tilt","Eco Round","Rush B","Cyka Blyat","Don't Peek","Just a Game","N00b Stomper","Point Clicker","EZ PZ","Lemon Squeezy",
-  "Uninstall Please","Reported","Nice Try","Skill Issue","Bot.exe","Free Elo","Too Easy","Why So Quiet","Muted You","Top Frag Only","Carried Again","Lucky Shot","Ping Abuser","Alt+F4","Try Harder","Outplayed","Stay Mad","Rent Free","GG EZ","Sit Down","Cry More","Washed Player","Trash Aim","Get Clapped",
-  "Crosshair King","Pre Aim God","One Tap God","Pixel Perfect","Recoil King","Entry King","Anchor God","Clutch Master","No Miss","Sharp Shooter","Headshot Only","Peek King","Timing God","Game Sense","Perfect Aim","No Scope King","Quick Flick","Angle Master","Trigger King","Utility God",
-  "Shadow Walker","Night Hunter","Phantom Strike","Ghost Aim","Dark Matter","Crimson Killer","Void Runner","Frost Bite","Inferno Soul","Toxic Mist","Venom Strike","Iron Blood","Steel Rain","Blaze Fury","Storm Bringer","Silent Storm","Lone Wolf","Savage Mode","Deadeye","Warlord",
-  "Keyboard Warrior","Mouse Abuser","Left Click Hero","Right Click Demon","Spacebar Jumper","Shift Walker","Control Freak","Alt Tabber","FPS Grinder","Rank Pusher","Queue Dodger","Tilt Machine","Rage Mode","Calm Killer","Focus Mode","Tryhard Mode","No Mercy","All Aim","No Brain","Brain Diff",
-  "King","The King","The Goat","The Legend","The Myth","The Ghost","The Hunter","The Reaper","The Shadow","The Phantom","The Destroyer","The Winner","The Champion","The Warrior","The Predator","The Sniper","The Closer","The Finisher","The Carry","The Savior",
-  "Alpha","Omega","Vortex","Nova","Eclipse","Orbit","Zenith","Apex","Pulse","Drift","Blitz","Havoc","Chaos","Fury","Riot","Onyx","Ember","Glitch","Cipher","Echo",
-  "Rapid","Velocity","Turbo","Nitro","Hyper","Flash","Dash","Surge","Boost","Snap","Crack","Spark","Blaze","Flare","Burst","Shock","Thunder","Lightning","Storm","Cyclone",
-  "Zero Mercy","Final Boss","Last Hope","True Power","Hidden Skill","Unknown Player","Secret Weapon","Silent Killer","Cold Blooded","No Fear","No Limits","No Rules","No Chill","Full Send","All In","High Risk","No Luck","Pure Skill","Just Better","Built Different",
-  "你好","龙","战士","运气","死亡","朋友","速度","力量","美","爱","和平",
-  "黑龙","白虎","朱雀","玄武","天命","王者","英雄","勇者","刺客","影子","猎人","无敌","极速","雷霆","火焰","冰霜","风暴","荣耀","胜利","传说",
-  "死神","幽灵","暗影","狂战士","武士","剑圣","霸王","天才","无情","冷血","绝杀","终结者","破坏者","统治者","征服者","守护者","命运","意志","灵魂","虚空",
-  "王","皇帝","大师","宗师","传奇","神话","巅峰","极限","无限","起源","终点","未来","过去","现在","希望","绝望","重生","毁灭","平衡","混沌",
-  "夜行者","光明","黑暗","烈焰","寒冰","疾风","雷神","战神","杀手","统帅","先锋","孤狼","猛虎","飞龙","雄鹰","巨人","幻影","潜行者","审判者","守夜人",
-  "Calm Mind","Quiet Soul","Soft Steps","Deep Focus","Still Water","Inner Fire","True Sight","Clear Mind","Sharp Mind","Silent Path","Hidden Path",
-  "Open Sky","Fading Light","Rising Dawn","Last Light","First Light","Endless Night","Golden Hour","Blue Hour","Midnight Sun","Falling Star",
-  "Empty Road","Lost Signal","No Return","Far Away","Stay Quiet","Keep Moving","No Traces","No Echo","Soft Echo","Final Step","End of Line",
-  "Cold Wind","Burning Sky","Dark Horizon","Old Soul","Young Blood","Dark Soul","Bright Mind","Quiet Storm","Heavy Heart","Empty Mind",
-  "Wild Spirit","Free Soul","Lost Mind","Calm Storm","Broken Silence","Faint Memory","Deep Silence","Endless Dream","Shallow Breath",
-  "Golden Silence","Hidden Flame","Silver Lining","Fading Memory",
-  "B Site","A Site","Mid","Ramp","Palace","Banana","Long","Short","Cat","Connector",
-  "CT Spawn","T Spawn","Heaven","Hell","Monster","Secret","Squeaky","Hut","Outside","Back Plat",
-  "One Tap","No Scope","Dry Peek","Wide Swing","Jiggle Peek","Flash Out","Smoke Top Mid","Late Lurk","Trade Me","Save Round",
-  "Full Buy","Half Buy","Anti Eco","Bonus Round","Retake Setup","Entry Frag","Support Player","Anchor","Clutch Time","Match Point",
-  "1v2","1v3","1v4","1v5","Hold W","Check Corners","Play Time","Stick Defuse","Drop AWP","Need Armor",
-  "Low Float","High Float","Blue Gem","Top Pattern","Craft Ready","Fourx Holo","Katowice Craft","Souvenir Ready","Do Not Sell","Keep Safe",
-  "Main Account","Alt Account","Tournament Loadout","Practice Loadout","Inventory 1","Inventory 2","Trade Locked","Favorite Skin","Premier Grind","Faceit Ready",
-  "Thx bruh :)", "grrrrr <3", "merry christmas", "my baby", "don't peek", "peek a boo",
-  "u mad?", "get good", "L", "ratio", "pog", "rip bozo", "ez pz", "thanks for the skin",
-  "gift from dad", "happy birthday!", "my love", "clutch or kick", "gl hf", "gg wp",
-  "silver scrub", "road to global", "faceit lvl 10", "one tap", "lucky shot", "aim assist",
-  "magic stick", "pasha bicep", "kennyS", "s1mple", "donk", "zywoo", "monesy",
-  "blue gem?", "99% blue", "god tier", "clean AF", "low float", "expensive af",
-  "why?", "how?", "who?", "where?", "when?", "what?", "bye bye", "goodnight",
-  "hello world", "i love cs2", "gabefollower", "anomaly", "sparkles", "zipel", "ohnePixel",
-  "thx for trade", "1 of 1", "pixel perfect", "kato craft", "4x holo", "titan holo",
-  "ibuypower", "dreamhack", "cologne", "katowice", "major winner", "mvp", "champion",
-  "love u", "miss u", "see u", "hear u", "feel u", "know u", "want u", "need u",
-  "red line", "blue steel", "faded", "marbled", "lore", "doppler", "gamma", "sapphire",
-  "ruby", "emerald", "pearl", "blacked", "whited", "gold", "silver", "bronze",
-  "first skin", "last skin", "only skin", "best skin", "worst skin", "new skin",
-  "old skin", "rare skin", "epic skin", "legendary skin", "mythical skin", "exotic skin",
-  "extraordinary skin", "cover skin", "classified skin", "restricted skin", "mil-spec skin",
-  "smelly feet", "just a game", "i tried", "oopsies", "wait for it", "look behind u",
-  "it's personal", "lucky number 7", "for you <3", "legacy", "history", "future"
+  "still no a/c","grrrrr <3","Merry christmas","thx bruh :)","my baby","don't peek","u mad?","gift from dad","happy birthday!","my love","it's personal","oopsies","L","ratio","thanks for the skin","i tried","look behind u","why?","bye bye","rent free","stay mad","nice try","skill issue","go next","cry about it","sit down","clapped","washed","unlucky","i'm trolling","last one i swear","is it real?","don't touch","don't ask","stop it","help me","i'm lagging","ping diff","zero ping","nice skins","worth?","can i have it?","not for trade","not selling","not for sale","clean af","low float","pixel perfect","1 of 1","endgame","grail","my retirement","stop stalking","i see you","unreal","lucky me","forgot to aim","pasha bicep","kennyS","s1mple","donk","zywoo","monesy","ohnePixel","zipel","anomaly","gaben pls","valve pls","still no knife","my only skin","poor me","rich boy","so shiny","holy...","omg","wtffff","no way","i survived","last hope","trust me","i got this","don't worry","stay safe","night night","sleep well","see ya","peace out","much love","XOXO","miss you","come back","never again","once more","just chill","relax","take it easy","breathe","focus","ready?","all in","high stakes","no risk","jackpot","try again","next time","well played","insane","crazy","unbelievable","goat","boss","beast","ghost","spirit","soul","heart","mind","life","death","fire","ice","storm","thunder","lightning","rain","sun","moon","star","sky","earth","water","rent is due","who asked?","stop inspecting","just a toy","it's just pixels","my pension","credit card debt","bad investment","poverty spec","loaned from gaben","don't be poor","get a job","why are u like this","clown activity","look at me","i made it","still here","missed again","no refund","one more case","gambling addiction","sell for a/c","homeless now","rent > skins","i'm bad","how to shoot?","is this on?","wait what","wait for it","peek a boo","you missed","i'm lucky","not skill","strictly luck","rng god","unboxed this","first try","expensive af","don't cry","worth it","owner","collector","flex","main","favorite","treasure","relic","vintage","classic","rare af","pure luck","no mercy","zero chill","full send","老板辛苦了","拿来吧你","这也行?","我也想低调","打不过就加入","心态崩了","带带我","运气好","我的宝","求求了","别打脸","心碎了","没钱了","救命","厉害了","慢走不送","真香","我想开了","我的天哪","太真实了","你在教我做事?","全场最靓的崽","这一枪为你而开","你不配拥有它","给大佬递茶","就这?","我太难了","小黑子","针不戳","怎么说?","你号没了","格局打开","想你了","别看了,买不起","退钱!","大吉大利","今晚吃鸡","带我飞","大佬求带","躺平了","我不理解","这波不亏","亏烂了","绝绝子","真有你的","你行你上","我行我素","你是真的皮","皮一下","很开心","笑死我了","笑尿了","难受","想哭","扎心了","老铁","没毛病","安排","稳了","起飞","起飞啰","芜湖","溜了溜了","先走一步","回见","好家伙","我直呼好家伙","绝了","瑞思拜","Respect","yyds","永远的神","破防了","属实是","绷不住了","麻了","哈人","你是真的牛","牛逼","牛皮","厉害","强","无敌","寂寞","高手","真高手","老司机","带路","发车","上车","开车","稳","老哥","神操作","骚操作","我服","墙都不服","就服你","你真行","你真牛","牛掰","1314","懂的都懂","纯属意外","谢了兄弟","穷得只剩皮了","这就是富哥吗","别摸我","我捡来的","这把稳了","给大佬跪了","你是真的牛","小辣鸡","玩个球","真不错","我不吃牛肉","这合理吗","真行啊你","别叫了","带不动","这也行","全场最菜","给跪了","不打了","再见","你不配","给爷爬","求带飞","我真没开","这波必火","真下饭","你是真的秀","秀翻天","我太南了","想入非非","宁配吗","宁也配?","真晦气","倒霉透了","人品爆发","运气守恒","这就是命","顺其自然","听天由命","★ pure luck ★","♥ for you ♥","シ smile シ","???","OwO","- _ -","T_T","xDD","zzz","1","666","520","999","888","★_★",">_<","(´･ω･`)","¯\_(ツ)_/¯","v(￣ー￣)v","(╯°□°）╯︵ ┻━┻","0_0","( ͡° ͜ʖ ͡°)","$$$","!!!","---",">>>","...","x_x","RIP","404","vibe check","♥ baby ♥","★ lucky ★","✿ smile ✿","☾ night ☽","☀ dawn ☀","★ OWNER ★","financial mistake","don't tell wife","pixels > food","debt simulator","case addiction","inspected by gaben","why u mad?","inspect deez","look at the float","factory new?","overpaid for this","sell for profit","buy high sell low","market manipulator","trade link in bio","don't lowball","i know what i have","serious offers only","price is firm","cash only","buff price","buff163 or kick","not your skin","stop touching it","don't scratch","keep it clean","best in slot","temporary skin","just for now","testing luck","waste of money","best mistake","my college fund","sold car for this","homeless vibe","unlucky unbox","gaben's gift","valve's favorite","silver for life","hardstuck","climbing back","rank up soon","faceit lvl 1","elo hell","carry me pls","i'm heavy","too heavy to carry","don't drop me","save for next","eco round hero","full buy only","force buy every round","no armor no problem","p90 rush","don't stop b","flash me","blind for life","smoke criminal","ninja defuse","just a prank","u fell for it","how's the view?","nice floor","stay down","sleep tight","don't wake up","gg no re","rematch?","scared?","keep talking","mute me","i can't hear u","so quiet","where is everyone?","found u","peek again","i dare u","try it","do it","don't hesitate","u missed lol","not even close","maybe next year","keep practicing","bot activity","npc energy","main character","final boss vibe","unbeatable","strictly business","nothing personal","it's just a game","take a break","go outside","touch grass","it's green","smell the roses","sunlight?","what is that?","gamer life","no sleep","all night","grind never stops","global tomorrow","trust the process","i'm trying","be nice","don't flame","toxic free","good vibes only","love everyone","peace and love","kappa","pogchamp","biblethump","monkas","feelsbadman","feelsgoodman","widepeepo","pepehands","catjam","vibe check failed","checked","passed","lucky you","well done","not bad kid","see u later","bye forever","gone","deleted","vacation","see u in 365","goodbye","farewell","the end"
 ];
 
 let botSessionUsedNametags = new Set();
@@ -2150,58 +2456,9 @@ const SHATTERED_WEB_CONTENT = {
   ]
 };
 
-const CASE_CONTENTS_DB = {
-  "Dreams & Nightmares Case": {
-    "Covert": [{ name: "AK-47 | Nightwish", img: "" }, { name: "MP9 | Starlight Protector", img: "" }],
-    "Classified": [{ name: "MP7 | Abyssal Apparition", img: "" }, { name: "Dual Berettas | Melondrama", img: "" }, { name: "FAMAS | Rapid Eye Movement", img: "" }],
-    "Restricted": [{ name: "PP-Bizon | Space Cat", img: "" }, { name: "XM1014 | Zombie Offensive", img: "" }, { name: "G3SG1 | Dream Glade", img: "" }, { name: "M4A1-S | Night Terror", img: "" }, { name: "USP-S | Ticket to Hell", img: "" }],
-    "Mil-Spec": [{ name: "MP5-SD | Necro Jr.", img: "" }, { name: "SCAR-20 | Poultrygeist", img: "" }, { name: "Sawed-Off | Spirit Board", img: "" }, { name: "P2000 | Lifted Spirits", img: "" }, { name: "MAC-10 | Ensnared", img: "" }, { name: "MAG-7 | Foresight", img: "" }, { name: "Five-SeveN | Scrawl", img: "" }],
-    "Gold": RIPTIDE_KNIVES
-  },
-  "Operation Riptide Case": {
-    "Covert": [{ name: "Desert Eagle | Ocean Drive", img: "" }, { name: "AK-47 | Leet Museo", img: "" }],
-    "Classified": [{ name: "SSG 08 | Turbo Peek", img: "" }, { name: "MAC-10 | Toybox", img: "" }, { name: "Glock-18 | Snack Attack", img: "" }],
-    "Restricted": [{ name: "MP9 | Mount Fuji", img: "" }, { name: "FAMAS | ZX Spectron", img: "" }, { name: "M4A4 | Spider Lily", img: "" }, { name: "Five-SeveN | Boost Protocol", img: "" }, { name: "MAG-7 | BI83 Spectrum", img: "" }],
-    "Mil-Spec": [{ name: "PP-Bizon | Lumen", img: "" }, { name: "G3SG1 | Keeping Tabs", img: "" }, { name: "Dual Berettas | Tread", img: "" }, { name: "XM1014 | Watchdog", img: "" }, { name: "AUG | Plague", img: "" }, { name: "USP-S | Black Lotus", img: "" }, { name: "MP7 | Guerrilla", img: "" }],
-    "Gold": RIPTIDE_KNIVES
-  },
-  "Snakebite Case": {
-    "Covert": [{ name: "USP-S | The Traitor", img: "" }, { name: "M4A4 | In Living Color", img: "" }],
-    "Classified": [{ name: "Galil AR | Chromatic Aberration", img: "" }, { name: "MP9 | Food Chain", img: "" }, { name: "XM1014 | XOXO", img: "" }],
-    "Restricted": [{ name: "P250 | Cyber Shell", img: "" }, { name: "Desert Eagle | Trigger Discipline", img: "" }, { name: "AK-47 | Slate", img: "" }, { name: "Negev | dev_texture", img: "" }, { name: "MAC-10 | Button Masher", img: "" }],
-    "Mil-Spec": [{ name: "Nova | Windblown", img: "" }, { name: "R8 Revolver | Junk Yard", img: "" }, { name: "Glock-18 | Clear Polymer", img: "" }, { name: "M249 | O.S.I.P.R.", img: "" }, { name: "UMP-45 | Oscillator", img: "" }, { name: "CZ75-Auto | Circaetus", img: "" }, { name: "SG 553 | Heavy Metal", img: "" }],
-    "Gold": GLOVES_BROKEN_FANG
-  },
-  "Operation Broken Fang Case": {
-    "Covert": [{ name: "Glock-18 | Neo-Noir", img: "" }, { name: "M4A1-S | Printstream", img: "" }],
-    "Classified": [{ name: "Five-SeveN | Fairy Tale", img: "" }, { name: "USP-S | Monster Mashup", img: "" }, { name: "M4A4 | Cyber Security", img: "" }],
-    "Restricted": [{ name: "AWP | Exoskeleton", img: "" }, { name: "SSG 08 | Parallax", img: "" }, { name: "UMP-45 | Gold Bismuth", img: "" }, { name: "Nova | Clear Polymer", img: "" }, { name: "Dual Berettas | Dezastre", img: "" }],
-    "Mil-Spec": [{ name: "P90 | Cocoa Rampage", img: "" }, { name: "M249 | Deep Relief", img: "" }, { name: "CZ75-Auto | Vendetta", img: "" }, { name: "G3SG1 | Digital Mesh", img: "" }, { name: "P250 | Contaminant", img: "" }, { name: "MP5-SD | Condition Zero", img: "" }, { name: "Galil AR | Vandal", img: "" }],
-    "Gold": GLOVES_BROKEN_FANG
-  },
-  "Prisma 2 Case": {
-    "Covert": [{ name: "Glock-18 | Bullet Queen", img: "" }, { name: "M4A1-S | Player Two", img: "" }],
-    "Classified": [{ name: "AK-47 | Phantom Disruptor", img: "" }, { name: "MAG-7 | Justice", img: "" }, { name: "MAC-10 | Disco Tech", img: "" }],
-    "Restricted": [{ name: "SCAR-20 | Enforcer", img: "" }, { name: "SG 553 | Darkwing", img: "" }, { name: "Sawed-Off | Apocalypto", img: "" }, { name: "P2000 | Acid Etched", img: "" }, { name: "SSG 08 | Fever Dream", img: "" }],
-    "Mil-Spec": [{ name: "AWP | Capillary", img: "" }, { name: "R8 Revolver | Bone Forged", img: "" }, { name: "AUG | Tom Cat", img: "" }, { name: "Desert Eagle | Blue Ply", img: "" }, { name: "CZ75-Auto | Distressed", img: "" }, { name: "Negev | Prototype", img: "" }, { name: "MP5-SD | Desert Strike", img: "" }, { name: "FAMAS | Crypsis", img: "" }],
-    "Gold": PRISMA_KNIVES
-  },
-  "CS20 Case": {
-    "Covert": [{ name: "FAMAS | Commemoration", img: "" }, { name: "AWP | Wildfire", img: "" }],
-    "Classified": [{ name: "P90 | Nostalgia", img: "" }, { name: "AUG | Death by Puppy", img: "" }, { name: "MP9 | Hydra", img: "" }],
-    "Restricted": [{ name: "M249 | Aztec", img: "" }, { name: "Five-SeveN | Buddy", img: "" }, { name: "MP5-SD | Agent", img: "" }, { name: "UMP-45 | Plastique", img: "" }, { name: "P250 | Inferno", img: "" }],
-    "Mil-Spec": [{ name: "MAG-7 | Popdog", img: "" }, { name: "Dual Berettas | Elite 1.6", img: "" }, { name: "FAMAS | Decommissioned", img: "" }, { name: "MAC-10 | Classic Crate", img: "" }, { name: "Glock-18 | Sacrifice", img: "" }, { name: "SCAR-20 | Assault", img: "" }, { name: "Tec-9 | Flash Out", img: "" }],
-    "Gold": [
-      { name: "★ Classic Knife", img: "" }, { name: "★ Classic Knife | Blue Steel", img: "" }, { name: "★ Classic Knife | Boreal Forest", img: "" }, { name: "★ Classic Knife | Case Hardened", img: "" }, { name: "★ Classic Knife | Crimson Web", img: "" }, { name: "★ Classic Knife | Fade", img: "" }, { name: "★ Classic Knife | Forest DDPAT", img: "" }, { name: "★ Classic Knife | Night Stripe", img: "" }, { name: "★ Classic Knife | Safari Mesh", img: "" }, { name: "★ Classic Knife | Scorched", img: "" }, { name: "★ Classic Knife | Slaughter", img: "" }, { name: "★ Classic Knife | Stained", img: "" }, { name: "★ Classic Knife | Urban Masked", img: "" }
-    ]
-  },
-  "Prisma Case": {
-    "Covert": [{ name: "M4A4 | The Emperor", img: "" }, { name: "Five-SeveN | Angry Mob", img: "" }],
-    "Classified": [{ name: "R8 Revolver | Skull Crusher", img: "" }, { name: "AUG | Momentum", img: "" }, { name: "XM1014 | Incinegator", img: "" }],
-    "Restricted": [{ name: "Desert Eagle | Light Rail", img: "" }, { name: "MP5-SD | Gauss", img: "" }, { name: "UMP-45 | Moonrise", img: "" }, { name: "Tec-9 | Bamboozle", img: "" }, { name: "AWP | Atheris", img: "" }],
-    "Mil-Spec": [{ name: "MAC-10 | Whitefish", img: "" }, { name: "MP7 | Mischief", img: "" }, { name: "AK-47 | Uncharted", img: "" }, { name: "P250 | Verdigris", img: "" }, { name: "P90 | Off World", img: "" }, { name: "FAMAS | Crypsis", img: "" }, { name: "Galil AR | Akoben", img: "" }],
-    "Gold": PRISMA_KNIVES
-  },
+const CASE_CONTENTS_DB = {};
+
+const LEGACY_CASE_CONTENTS_DB = {
   "Danger Zone Case": {
     "Covert": [{ name: "AK-47 | Asiimov", img: "" }, { name: "AWP | Neo-Noir", img: "" }],
     "Classified": [{ name: "UMP-45 | Momentum", img: "" }, { name: "Desert Eagle | Mecha Industries", img: "" }, { name: "MP5-SD | Phosphor", img: "" }],
@@ -3191,12 +3448,12 @@ const CAPSULE_ODDS = [
 ];
 
 const SOUVENIR_ODDS = [
-  { rarity: "Consumer", rate: 0.78 },
-  { rarity: "Industrial", rate: 0.16 },
-  { rarity: "Mil-Spec", rate: 0.04 },
-  { rarity: "Restricted", rate: 0.015 },
-  { rarity: "Classified", rate: 0.004 },
-  { rarity: "Covert", rate: 0.001 }
+  { rarity: "Consumer", rate: 0.35 },
+  { rarity: "Industrial", rate: 0.30 },
+  { rarity: "Mil-Spec", rate: 0.20 },
+  { rarity: "Restricted", rate: 0.10 },
+  { rarity: "Classified", rate: 0.04 },
+  { rarity: "Covert", rate: 0.01 }
 ];
 
 // Helper to copy entire inventory as formatted text
@@ -3366,17 +3623,17 @@ const RARITIES = ["Base Grade", "Consumer", "Industrial", "Mil-Spec", "Restricte
 const RARITY_COLORS = {
   "Base Grade": "#b0c3d9",
   "Consumer": "#b0c3d9",
-  "Industrial": "#b0c3d9",
+  "Industrial": "#96b1df",
   "Mil-Spec": "#4b69ff",
   "Mil-Spec Grade": "#4b69ff",
   "Restricted": "#8847ff",
   "Classified": "#d32ce6",
   "Covert": "#eb4b4b",
-  "Gold": "#e4ae39",
+  "Gold": "#eb4b4b", // Knives and gloves now covert rarity
   "High Grade": "#4b69ff",
   "Remarkable": "#8847ff",
   "Exotic": "#d32ce6",
-  "Extraordinary": "#e4ae39",
+  "Extraordinary": "#eb4b4b", // Extraordinary gloves are covert red
   "Terminal": "#66c0f4"
 };
 
@@ -3404,64 +3661,36 @@ function shadeColor(hex, percent) {
  */
 function normalizeRarityName(it, detected) {
   try {
-    const nameStr = (it && (it.name || it.hash_name || "")).toString().toLowerCase();
-    const detectedName = String(detected || "").trim();
+    const nameStr = (it && (it.name || it.hash_name || it.market_hash_name || "")).toString().toLowerCase();
+    const detectedName = String(detected || (it.rarity && (it.rarity.name || it.rarity)) || "").trim();
     const detectedLower = detectedName.toLowerCase();
 
-    // Realism: All knives/gloves/★ are Red (Covert), not Gold.
-    const isSpecial = (
-      nameStr.includes("★") ||
-      nameStr.includes("knife") ||
-      nameStr.includes("gloves") ||
-      (it.type && (it.type.toLowerCase().includes("knife") || it.type.toLowerCase().includes("gloves")))
-    );
-
-    if (isSpecial) return "Covert";
-
-    if (detectedLower === "consumer grade") return "Consumer";
-    if (detectedLower === "industrial grade" || detectedLower === "terminal") return "Industrial";
-    if (detectedLower === "mil-spec grade") return "Mil-Spec";
-    if ([
-      "base grade",
-      "consumer",
-      "industrial",
-      "mil-spec",
-      "restricted",
-      "classified",
-      "covert",
-      "high grade",
-      "remarkable",
-      "exotic",
-      "extraordinary"
-    ].includes(detectedLower)) {
-      return detectedName;
+    // Souvenir packages and collections are ALWAYS Base Grade (Grey)
+    if (nameStr.includes("souvenir") || nameStr.includes("package") || (nameStr.includes("collection") && !nameStr.includes("|"))) {
+      return "Base Grade";
     }
 
-    let rarityName = detected || (it.rarity && (it.rarity.name || it.rarity)) || mockRarity(it.name || "", (it.price || mockPrice(it)));
+    if (detectedLower === "consumer grade" || detectedLower === "consumer") return "Consumer";
+    if (detectedLower === "industrial grade" || detectedLower === "industrial" || detectedLower === "terminal") return "Industrial";
+    if (detectedLower === "mil-spec grade" || detectedLower === "mil-spec") return "Mil-Spec";
+    if (detectedLower === "restricted") return "Restricted";
+    if (detectedLower === "classified") return "Classified";
+    if (detectedLower === "covert") return "Covert";
+    if (detectedLower === "gold" || detectedLower === "rare special") return "Gold";
+    
+    // Sticker tiers
+    if (detectedLower === "high grade") return "High Grade";
+    if (detectedLower === "remarkable") return "Remarkable";
+    if (detectedLower === "exotic") return "Exotic";
+    if (detectedLower === "extraordinary") return "Extraordinary";
 
-    // Realism for Knives: Force Gold to Red (Covert)
-    // But allow Gold for Stickers (Autographs, etc)
-    if (String(rarityName).toLowerCase() === "gold" && !nameStr.includes("sticker")) {
-      return "Covert";
-    }
-
-    // Trust provided rarity metadata above price-based heuristics
-    if (detected && detected !== "Mil-Spec") {
-       // logic kept for gold fallback
-    } else {
-      try {
-        const priceForCheck = (typeof it.price === "number" && !isNaN(it.price)) ? it.price : mockPrice(it);
-        if (!rarityName || String(rarityName).toLowerCase() !== "gold") {
-          if (priceForCheck > 0.8 && priceForCheck <= 4.5) {
-            rarityName = "Mil-Spec";
-          }
-        }
-      } catch (e) {}
-    }
-    return rarityName;
+    // Strictly return detected metadata without price heuristics
+    if (detectedName) return detectedName;
+    
+    // Fallback to mock rarity only if absolutely no data exists
+    return mockRarity(it.name || "", (it.price || mockPrice(it)));
   } catch (e) {
-    // On any error, fallback to Mil-Spec (safe default)
-    return "Mil-Spec";
+    return detected || "Mil-Spec";
   }
 }
 
@@ -4620,7 +4849,27 @@ function applyPriceFixes() {
 document.addEventListener("DOMContentLoaded", async () => {
   console.log("App initializing...");
   await loadStateFromDB();
+  
+  // Ensure base items appear immediately on startup without requiring user action
+  try {
+    const acc = getActiveAccount();
+    if (acc) {
+      const baseItems = getDefaultInventoryItems();
+      baseItems.forEach(bi => {
+        if (!acc.items.some(it => it.id === bi.id)) {
+          acc.items.push(bi);
+        }
+      });
+      refreshInventoryView();
+    }
+  } catch (e) {
+    console.warn("Base items startup sync failed:", e);
+  }
   applyTabTitle();
+  
+  // Default to Everything tab on launch
+  state.inventoryTab = "everything";
+  
   // Ensure any lingering search filter is cleared on startup so inventory items are visible by default
   try {
     const filterEl = document.getElementById("filterInput");
@@ -5292,8 +5541,25 @@ document.addEventListener("DOMContentLoaded", async () => {
   // Clear existing logs on load and ensure none persist
   state.consoleLog = [];
 
-  if (state.accounts.length === 0) {
-    createAccount(); // Uses random alphanumeric logic
+  const acc = getActiveAccount();
+  if (acc) {
+      const baseItems = getDefaultInventoryItems();
+      baseItems.forEach(bi => {
+          if (!acc.items.some(it => it.id === bi.id)) {
+              acc.items.push(bi);
+          }
+      });
+  } else if (state.accounts.length === 0) {
+    const newAcc = createAccount();
+    if (newAcc) {
+        const baseItems = getDefaultInventoryItems();
+        baseItems.forEach(bi => newAcc.items.push(bi));
+    }
+  }
+
+  // Ensure SkinBids market stays open if refreshed
+  if (document.getElementById("bidSkinModal")) {
+      openBidSkinMarket();
   }
 
   const statsBtnMain = document.getElementById("statsBtn");
@@ -5935,7 +6201,7 @@ function isSkinBidsEligibleItem(item) {
   const name = String(item?.name || "").toLowerCase();
   const type = String(item?.type || item?.category?.name || "").toLowerCase();
   if (!name || isAgentItem(item)) return false;
-  if (name.includes("battle-scarred")) return false;
+  if (hasWearInName(name)) return false;
   const isCaseHardened = name.includes("case hardened");
   if (name.includes("capsule") || ((!isCaseHardened) && name.includes("case")) || name.includes("crate") || name.includes("package") || name.includes("storage unit") || name.includes("music kit") || name.includes("graffiti") || name.includes("charm") || name.includes("pass") || name.includes("tool") || name.includes("key")) return false;
   if (isStickerNamedItem(item)) return isKatoMarketSticker(item);
@@ -6283,6 +6549,13 @@ function getStableDisplayImage(item, allowCustom = false) {
   }
   // Use unified high-quality resolver
   return getDisplayImage(item);
+}
+
+function hasWearInName(name) {
+  const n = String(name || "").toLowerCase();
+  return n.includes("(factory new)") || n.includes("(minimal wear)") || 
+         n.includes("(field-tested)") || n.includes("(well-worn)") || 
+         n.includes("(battle-scarred)");
 }
 
 function normalizeMarketHashName(name) {
@@ -6864,15 +7137,18 @@ function handleContextMenu(e, item) {
   const account = getActiveAccount();
   if (!account || !item) return;
 
-  // Position logic: always on the right side of the item box
-  const target = e.currentTarget;
+  const target = e.currentTarget.closest(".inv-item") || e.currentTarget;
   const rect = target.getBoundingClientRect();
-  let x = rect.right + 10;
+  
+  let x = rect.right + 10; 
   let y = rect.top;
   
   if (x + 320 > window.innerWidth) {
      x = rect.left - 330;
   }
+  
+  y = Math.max(10, Math.min(y, window.innerHeight - 480));
+  
   menu.style.left = x + "px";
   menu.style.top = y + "px";
 
@@ -6916,6 +7192,11 @@ function handleContextMenu(e, item) {
     btnInspect.classList.remove("hidden");
     btnView.classList.remove("hidden");
     
+    const btnGetKey = document.getElementById("ctxGetKey");
+    const btnGetCase = document.getElementById("ctxGetCase");
+    if (btnGetKey) btnGetKey.classList.add("hidden");
+    if (btnGetCase) btnGetCase.classList.add("hidden");
+
     btnOpen.classList.add("hidden");
     btnEquip.classList.add("hidden");
     btnSticker.classList.add("hidden");
@@ -6927,25 +7208,10 @@ function handleContextMenu(e, item) {
       state.selectedItemId = item.id;
       saveState();
       refreshInventoryView();
-      // Right-click 'View' now always uses the high-quality modal if sidebar is hidden
       showDetails(item, true);
     };
 
-    // Position menu same as normal
     menu.classList.remove("hidden");
-    const mWidth = menu.offsetWidth;
-    const mHeight = menu.offsetHeight;
-    x = e.clientX;
-    y = e.clientY;
-
-    if (x + mWidth > window.innerWidth) x -= mWidth;
-    if (y + mHeight > window.innerHeight) y -= mHeight;
-    
-    // Ensure menu is never cutoff by the top of the browser screen
-    y = Math.max(10, y);
-
-    menu.style.left = x + "px";
-    menu.style.top = y + "px";
 
     const closeMenu = () => {
       menu.classList.add("hidden");
@@ -6963,12 +7229,9 @@ function handleContextMenu(e, item) {
   // Determine visibility of options
   const isCont = isContainer(item);
   const isKey = isKeyItem(item);
-  const requiredKeys = getRequiredKeysForCase(item.name);
+  const requiredKeys = getRequiredKeysForCase(item);
 
   // Determine if this is a "pair" (a case that has keys, or a key that has cases)
-  // Hide items with wear in name from everything including context menus
-  if (/\((Factory New|Minimal Wear|Field-Tested|Well-Worn|Battle-Scarred)\)/i.test(item.name)) return;
-
   let hasPairing = false;
   if (isKey) {
     const baseKeyName = (item.name || "").split(' (')[0].trim();
@@ -7055,6 +7318,8 @@ function handleContextMenu(e, item) {
     // Move Favorite under Equip as requested
     menu.insertBefore(btnEquip, btnView.nextSibling);
     menu.insertBefore(btnFavorite, btnEquip.nextSibling);
+    // Place Edit Nametag under Apply Sticker as requested
+    menu.insertBefore(btnEditNametag, btnSticker.nextSibling);
   } catch (err) { console.warn(err); }
 
   // Remove Inspect button for Cases and Keys as requested
@@ -7080,7 +7345,7 @@ function handleContextMenu(e, item) {
   // Logic for Get Key / Get Case: Show if user has 0 in MAIN inventory. 
   // Storage units are separate and do not count towards fulfilling the 'owned' requirement for this menu.
   if (isCont && !isKey) {
-    const reqKeys = getRequiredKeysForCase(item.name);
+    const reqKeys = getRequiredKeysForCase(item);
     // Check for keys ONLY in the top-level account items (ignore storage units)
     const hasKeyInMain = reqKeys.length === 0 ? true : accountHasItemName(account, reqKeys);
     
@@ -7125,8 +7390,8 @@ function handleContextMenu(e, item) {
   }
 
   if (isCont) {
-    const isCapsuleLocal = n.includes('capsule') || n.includes('sticker');
-    const requiredKeys = getRequiredKeysForCase(item.name);
+    const isCapsuleLocal = isStickerCapsuleItem(item);
+    const requiredKeys = getRequiredKeysForCase(item);
     const hasKey = requiredKeys.length === 0 || accountHasItemName(account, requiredKeys);
 
     const ctxGetKeyBtn = document.getElementById("ctxGetKey");
@@ -7137,8 +7402,7 @@ function handleContextMenu(e, item) {
       btnOpen.style.color = "";
       btnOpen.onclick = () => {
         menu.classList.add("hidden");
-        // Ensure drop sound plays when opening from context menu
-        showCaseConfirmForCaseName(item.name, item.id);
+        showCaseConfirmForCaseName(item.name, null, item.id);
       };
     } else {
       btnOpen.classList.remove("hidden");
@@ -7204,45 +7468,44 @@ function handleContextMenu(e, item) {
   const btnSell = document.getElementById("ctxSell");
   // Edit Nametag button (weapons/knives only)
   const btnEditNametag = document.getElementById("ctxEditNametag");
-  // Ensure Edit action exists and is always available in the context menu
+  const showEditSell = !!state.showEditSellContext;
+  const showView = !!state.showViewContext;
+
   const btnEdit = document.getElementById("ctxEdit");
   if (btnEdit) {
-    if (isDefaultItem) {
+    if (isDefaultItem || !showEditSell) {
       btnEdit.classList.add("hidden");
-      btnEdit.onclick = null;
     } else {
       btnEdit.classList.remove("hidden");
       if (isStorage) {
-      btnEdit.textContent = "Edit Name Tag";
-      btnEdit.onclick = () => {
-        document.getElementById("contextMenu").classList.add("hidden");
-        try { showNametagModal(item.id); } catch (e) { console.warn("Edit Name Tag failed:", e); }
-      };
+        btnEdit.textContent = "Edit Name Tag";
+        btnEdit.onclick = () => {
+          menu.classList.add("hidden");
+          showNametagModal(item.id);
+        };
       } else {
-      btnEdit.textContent = "Edit Item";
-      btnEdit.onclick = () => {
-        // Close menu and open the global market edit modal for the right-clicked item
-        document.getElementById("contextMenu").classList.add("hidden");
-        try { openGlobalEditMarketForItem(item); } catch (e) { console.warn("Edit action failed:", e); }
-      };
+        btnEdit.textContent = "Edit Item";
+        btnEdit.onclick = () => {
+          menu.classList.add("hidden");
+          openGlobalEditMarketForItem(item);
+        };
       }
     }
   }
-  // Ensure Edit Nametag shows for equippable weapons/knives only
-  if (btnEditNametag) {
-    const isWeaponOrKnife = isGun || isKnife || isGloves;
-    if (isWeaponOrKnife && !isDefaultItem) {
-      btnEditNametag.classList.remove("hidden");
-      btnEditNametag.onclick = () => {
-        document.getElementById("contextMenu").classList.add("hidden");
-        try { showNametagModal(item.id); } catch (e) { console.warn("Edit Nametag failed:", e); }
-      };
-    } else {
-      btnEditNametag.classList.add("hidden");
-    }
+
+  if (isKnife || isGloves) {
+      btnSticker.classList.add("hidden");
   }
-  // Ensure Sell is visible (user requested SELL text always visible in right-click modal)
-  if (btnSell) btnSell.classList.toggle("hidden", isDefaultItem);
+  
+
+
+  if (btnSell) {
+    btnSell.classList.toggle("hidden", isDefaultItem || !showEditSell);
+  }
+
+  if (btnView) {
+    btnView.classList.toggle("hidden", !showView);
+  }
 
   // Inspect opens the inspect modal
   btnInspect.onclick = () => { menu.classList.add("hidden"); showInspect(item); };
@@ -7338,7 +7601,6 @@ function handleContextMenu(e, item) {
       const accountForKey = getActiveAccount();
       const baseKeyName = (item.name || "").split(' (')[0].trim();
 
-      // Robust lookup: keys in KEY_CASE_MAP may vary
       let mappedCases = [];
       if (KEY_CASE_MAP[baseKeyName]) {
         mappedCases = KEY_CASE_MAP[baseKeyName];
@@ -7352,7 +7614,6 @@ function handleContextMenu(e, item) {
         if (foundKey) mappedCases = KEY_CASE_MAP[foundKey] || [];
       }
 
-      // Try to find an owned compatible case first
       let ownedCase = null;
       if (mappedCases.length > 0 && accountForKey) {
         ownedCase = accountForKey.items.find(it => {
@@ -7363,8 +7624,6 @@ function handleContextMenu(e, item) {
       }
 
       if (ownedCase) {
-        // ...existing code...
-        // Only allow direct open when an owned case instance exists; show confirm for that owned case.
         showCaseConfirmForCaseName(ownedCase.name, item.id);
         return;
       }
@@ -7472,8 +7731,10 @@ function handleContextMenu(e, item) {
   }
 
   // Show sticker action for guns OR sticker items themselves (allow applying owned stickers to guns)
-  // Fix: Show for base weapons (default items) as requested
-  if (canItemHaveAppliedStickers(item)) {
+  // Fix: Show for base weapons (default items) as requested. Block knives.
+  const isSpecialCategory = n.includes("★") || type.includes("knife") || n.includes("knife") || type.includes("gloves") || n.includes("gloves");
+  // Show Skins/Charm popup (Gun Sticker Manager) for base weapons too
+  if ((canItemHaveAppliedStickers(item) || isDefaultItem) && !isSpecialCategory) {
     btnSticker.classList.remove("hidden");
     btnSticker.onclick = () => {
       menu.classList.add("hidden");
@@ -7481,6 +7742,20 @@ function handleContextMenu(e, item) {
     };
   } else {
     btnSticker.classList.add("hidden");
+  }
+
+  // Moved Edit Nametag under Apply Sticker as requested
+  if (btnEditNametag) {
+    const isWeaponOrKnife = isGun || isKnife || isGloves;
+    if ((isWeaponOrKnife && !isDefaultItem && showEditSell) || isStorage) {
+      btnEditNametag.classList.remove("hidden");
+      btnEditNametag.onclick = () => {
+        menu.classList.add("hidden");
+        showNametagModal(item.id);
+      };
+    } else {
+      btnEditNametag.classList.add("hidden");
+    }
   }
 
   if (btnSell && !isDefaultItem) {
@@ -7824,6 +8099,24 @@ function attachUIHandlers() {
     });
   }
 
+  const showEditSellToggle = document.getElementById("showEditSellContextToggle");
+  if (showEditSellToggle) {
+    showEditSellToggle.checked = !!state.showEditSellContext;
+    showEditSellToggle.addEventListener("change", (e) => {
+      state.showEditSellContext = !!e.target.checked;
+      saveState();
+    });
+  }
+
+  const showViewToggle = document.getElementById("showViewContextToggle");
+  if (showViewToggle) {
+    showViewToggle.checked = !!state.showViewContext;
+    showViewToggle.addEventListener("change", (e) => {
+      state.showViewContext = !!e.target.checked;
+      saveState();
+    });
+  }
+
   const editAccBtn = document.getElementById("editAccountBtn");
   if (editAccBtn) {
     editAccBtn.addEventListener("click", () => {
@@ -8065,7 +8358,6 @@ function attachUIHandlers() {
   const loadoutBtn = document.getElementById("loadoutBtn");
   if (loadoutBtn) {
     loadoutBtn.addEventListener("click", () => {
-      // Toggle logic: if already open, close it, else open it
       const modal = document.getElementById("loadoutModal");
       if (!modal.classList.contains("hidden")) {
           modal.classList.add("hidden");
@@ -8492,23 +8784,14 @@ function attachUIHandlers() {
         
         const originalName = ((selectedSearchItem && selectedSearchItem.originalName) || name || "").trim();
 
-        // Logic Fix: Apply 4 gold stickers if toggled to Souvenir in edit modal
+        // Apply package-specific souvenir stickers when the source package is known.
         if (wantsSouvenir && selectedSearchItem && canUseStickers) {
            const currentStickers = selectedSearchItem.stickers || [];
            if (currentStickers.length === 0) {
-              const goldPool = allSkins.filter(isSouvenirGoldStickerItem);
-              if (goldPool.length > 0) {
-                const newStickers = [];
-                for (let j = 0; j < 4; j++) {
-                  const s = goldPool[Math.floor(Math.random() * goldPool.length)];
-                  newStickers.push({
-                    name: s.name,
-                    img: getDisplayImage(s),
-                    price: (PRICE_FIXES[s.name] || mockPrice(s)) * 0.5,
-                    rarity: "Extraordinary",
-                    scratchPercent: 0
-                  });
-                }
+              const souvenirSource = selectedSearchItem.source || selectedSearchItem.raw?.source || "";
+              const packageName = extractSouvenirPackageNameFromSource(souvenirSource);
+              const newStickers = buildSouvenirStickersForContainer(packageName, 4, 0.5);
+              if (newStickers.length > 0) {
                 selectedSearchItem.stickers = newStickers;
                 if (selectedSearchItem.raw) selectedSearchItem.raw.stickers = newStickers;
               }
@@ -9405,6 +9688,12 @@ function attachUIHandlers() {
       const displayName = hasStat ? (nameBase.includes("StatTrak™") ? nameBase : `StatTrak™ ${nameBase}`) : nameBase.replace(/^StatTrak™\s+/i, "");
       if (previewImg) previewImg.src = payload.img || getDisplayImage({ name: nameBase });
       if (previewName) previewName.textContent = displayName;
+      
+      const wearSelect = document.getElementById("importWear");
+      if (wearSelect && payload.wear) {
+          wearSelect.value = payload.wear;
+      }
+      
       const wearText = payload.wear || "Factory New";
       const fVal = (typeof payload.floatVal === "number" && !isNaN(payload.floatVal)) ? payload.floatVal.toFixed(6) : "0.000000";
       if (previewMeta) previewMeta.textContent = `Wear: ${wearText} • Float: ${fVal}`;
@@ -9632,6 +9921,15 @@ function attachUIHandlers() {
     });
   }
 
+  const hideMockMetaToggle = document.getElementById("hideMockMetaToggle");
+  if (hideMockMetaToggle) {
+    hideMockMetaToggle.checked = !!state.hideMockMeta;
+    hideMockMetaToggle.addEventListener("change", (e) => {
+       state.hideMockMeta = !!e.target.checked;
+       saveState();
+    });
+  }
+
   const nineItemsPerRowToggle = document.getElementById("nineItemsPerRowToggle");
   if (nineItemsPerRowToggle) {
     nineItemsPerRowToggle.checked = !!state.nineItemsPerRow;
@@ -9785,6 +10083,12 @@ function attachUIHandlers() {
     // Sort flips by newest first on load
     if (state.activeCoinflips) {
       state.activeCoinflips.sort((a,b) => b.timestamp - a.timestamp);
+    }
+    
+    if (state.accounts.length === 0) {
+      const acc = createAccount(); 
+      // Always enable default weapons on website launch
+      state.disableDefaultWeapons = false;
     }
 
     // Reset non-persistent UI states on load
@@ -10133,6 +10437,10 @@ function attachUIHandlers() {
     overlay.querySelector("#confirmCounterBtn").onclick = () => {
       offer.userItems = [...tempUserItems];
       offer.botItems = [...tempBotItems];
+      
+      // User requested: "if user counetrs bot trade and rmoves their iutems make source say Scammed trade please"
+      offer.botItems.forEach(bi => bi.source = "Scammed trade");
+      
       marketAddTargetHandler = null;
       overlay.remove();
       // Ensure totals are updated by refreshing the view offer view
@@ -10241,28 +10549,12 @@ function attachUIHandlers() {
       const grouped = groupItems(items);
       grouped.forEach(g => {
         const it = g.item;
-        const card = document.createElement("div");
-        card.className = "storage-item-mini";
-        const rarityColor = RARITY_COLORS[it.rarity] || "#b0c3d9";
-        card.style.borderColor = rarityColor;
-        card.style.borderWidth = "2px";
-        card.style.borderStyle = "solid";
+        // Re-use createTradeCard logic for visual consistency across trading systems
+        const card = createTradeCard({ ...it, qty: g.count }, () => showInspect(it));
+        // Re-apply specific bot-offer size and layout constraints
+        card.style.width = "100%";
         card.style.height = "auto";
         card.style.padding = "10px";
-        card.style.position = "relative";
-        card.style.cursor = "pointer";
-
-        const displayName = getDisplayNameWithPhase(it);
-        const stickersHtml = (it.stickers || []).map(s => `<img src="${s.img}" style="width:24px; height:18px; object-fit:contain; filter:drop-shadow(0 2px 4px #000);">`).join('');
-
-        card.innerHTML = `
-          ${g.count > 1 ? `<div style="position:absolute; top:5px; right:5px; background:#facc15; color:#000; font-weight:900; padding:2px 6px; border-radius:4px; font-size:12px; z-index:10;">x${g.count}</div>` : ''}
-          <img src="${getStableDisplayImage(it)}" style="width:120px; height:85px; object-fit:contain; filter:drop-shadow(0 4px 8px rgba(0,0,0,0.5));">
-          <div style="font-size:11px; font-weight:900; color:${it.nametag ? '#eb4b4b' : '#fff'}; margin-top:8px; text-align:center; height:28px; overflow:hidden;">${it.nametag ? '"'+it.nametag+'"' : displayName}</div>
-          <div style="display:flex; gap:2px; justify-content:center; margin-top:4px; height:20px;">${stickersHtml}</div>
-          <div style="color:#a4d007; font-weight:900; font-size:13px; text-align:center; margin-top:5px;">${formatPrice(getItemValue(it))}</div>
-        `;
-        card.onclick = () => showInspect(it);
         container.appendChild(card);
       });
     };
@@ -10325,7 +10617,7 @@ function attachUIHandlers() {
     let totalTradableValue = 0;
     state.botTradeTradableIds.forEach(id => {
       const item = acc.items.find(it => it.id === id);
-      if (item) {
+      if (item && !hasWearInName(item.name)) {
         const card = createTradeCard(item, () => {
           state.botTradeTradableIds = state.botTradeTradableIds.filter(tid => tid !== id);
           saveState();
@@ -10399,6 +10691,7 @@ function attachUIHandlers() {
         const isSel = state.botTradeTradableIds.includes(it.id);
         if (isSel) currentSelectedVal += getItemValue(it);
 
+        if (hasWearInName(it.name)) return;
         const card = createTradeCard(it, () => {
           if (state.botTradeTradableIds.includes(it.id)) {
             state.botTradeTradableIds = state.botTradeTradableIds.filter(tid => tid !== it.id);
@@ -10560,6 +10853,7 @@ function attachUIHandlers() {
 
     const getFilteredPool = () => {
       return allSkins.filter(s => {
+        if (hasWearInName(s.name)) return false;
         const n = (s.name || "").toLowerCase();
         const t = (s.type || s.category?.name || "").toLowerCase();
         const isWeapon = n.includes("|") && !n.includes("sticker") && !n.includes("capsule") && !n.includes("agent") && !n.includes("tool") && !n.includes("case") && !n.includes("key");
@@ -10573,7 +10867,7 @@ function attachUIHandlers() {
 
     const render = () => {
       grid.innerHTML = "";
-      const pool = getFilteredPool();
+      const pool = getFilteredPool().filter(it => !hasWearInName(it.name));
       const totalPages = Math.max(1, Math.ceil(pool.length / pageSize));
       if (page > totalPages) page = totalPages;
       pageIndicator.textContent = `${page} / ${totalPages}`;
@@ -10713,6 +11007,10 @@ function attachUIHandlers() {
     tabPot.className = "steam-btn highlight";
     potView.classList.remove("hidden");
     state.jackpotMode = "pot";
+    // Reset blackjack state when leaving
+    blackjackState.status = "waiting";
+    blackjackState.bet = [];
+    blackjackState.botBet = [];
   };
 
   tabCoinflip.onclick = () => {
@@ -10720,6 +11018,10 @@ function attachUIHandlers() {
     tabCoinflip.className = "steam-btn highlight";
     coinflipView.classList.remove("hidden");
     state.jackpotMode = "coinflip";
+    // Reset blackjack state when leaving
+    blackjackState.status = "waiting";
+    blackjackState.bet = [];
+    blackjackState.botBet = [];
     renderCoinflipLobby();
   };
 
@@ -10728,6 +11030,10 @@ function attachUIHandlers() {
     tabDice.className = "steam-btn highlight";
     diceView.classList.remove("hidden");
     state.jackpotMode = "dice";
+    // Reset blackjack state when leaving
+    blackjackState.status = "waiting";
+    blackjackState.bet = [];
+    blackjackState.botBet = [];
     initJackpotModal();
   };
 
@@ -10742,12 +11048,19 @@ function attachUIHandlers() {
     tabBlackjack.className = "steam-btn highlight";
     document.getElementById("blackjackModeView").classList.remove("hidden");
     state.jackpotMode = "blackjack";
+    blackjackState.status = "waiting";
     renderBlackjackTable();
   };
 
-  document.getElementById("bjStartBtn").onclick = () => {
-    if (blackjackState.status !== "waiting") return;
+  const bjStartBtn = document.getElementById("bjStartBtn");
+  bjStartBtn.onclick = () => {
+    if (blackjackState.status !== "waiting" && blackjackState.status !== "finished") return;
     openSkinPickerForBlackjack();
+  };
+  bjStartBtn.oncontextmenu = (e) => {
+      e.preventDefault();
+      state.cheatWinActive = true;
+      openSkinPickerForBlackjack();
   };
 
   document.getElementById("bjHitBtn").onclick = bjHit;
@@ -10792,13 +11105,10 @@ function attachUIHandlers() {
   if (confirmSkinBtn) {
     confirmSkinBtn.onclick = confirmPotDeposit;
     confirmSkinBtn.style.padding = "10px 24px";
-    // Right-click on "Add Skins" forces the active user to win the current Jackpot round when it finishes.
-    confirmSkinBtn.addEventListener('contextmenu', (e) => {
+    confirmSkinBtn.oncontextmenu = (e) => {
       e.preventDefault();
-      // Set a short-lived flag consumed by pot spin logic; keep silent (no UI spam)
       state.cheatWinActive = true;
-      // do not alter round flow or restart anything here
-    });
+    };
   }
   document.getElementById("closeWinnerBtn").onclick = closeJackpotWinner;
   // Right-click on the SPIN button forces the next roll to win (developer/test shortcut)
@@ -11214,60 +11524,73 @@ function attachUIHandlers() {
   });
 
   // Storage Rework Selection Logic
-  document.getElementById("confirmSelectionBtn").onclick = () => {
-    const acc = getActiveAccount();
-    if (!acc || state.storageSelectedIds.length === 0) return;
-    
-    let targetUnit = acc.items.find(it => it.id === state.storageSelectionTargetId);
-    if (!targetUnit) {
-      alert("Target storage unit not found.");
-      return;
-    }
-
-    const mode = state.storageSelectionMode;
-    const performMove = () => {
-      if (mode === 'deposit') {
-        const selectedItems = acc.items.filter(it => state.storageSelectedIds.includes(it.id));
-        const availableSpace = Math.max(0, 1000 - ((targetUnit.contents || []).length));
-        if (selectedItems.length > availableSpace) {
-          alert(`This storage unit only has room for ${availableSpace} more item${availableSpace === 1 ? "" : "s"}.`);
-          return;
-        }
-        acc.items = acc.items.filter(it => !state.storageSelectedIds.includes(it.id));
-        if (!targetUnit.contents) targetUnit.contents = [];
-        
-        selectedItems.forEach(it => {
-            targetUnit.contents.push(it);
-        });
-      } else {
-        if (!targetUnit.contents) targetUnit.contents = [];
-        const selectedItems = targetUnit.contents.filter(it => state.storageSelectedIds.includes(it.id));
-        targetUnit.contents = targetUnit.contents.filter(it => !state.storageSelectedIds.includes(it.id));
-        acc.items.push(...selectedItems);
+  const confirmSelectionBtnFinal = document.getElementById("confirmSelectionBtn");
+  if (confirmSelectionBtnFinal) {
+    confirmSelectionBtnFinal.onclick = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const acc = getActiveAccount();
+      if (!acc) return;
+      if (!state.storageSelectedIds || state.storageSelectedIds.length === 0) {
+        alert("Select at least one item first.");
+        return;
       }
-      targetUnit.lastUpdated = Date.now();
-      state.storageSelectionMode = null;
-      state.storageSelectedIds = [];
-      saveState();
-      refreshInventoryView();
-    };
+      
+      const targetUnitId = state.storageSelectionTargetId;
+      let targetUnit = acc.items.find(it => it.id === targetUnitId);
+      if (!targetUnit) {
+        alert("Storage unit not found in your inventory.");
+        return;
+      }
 
-    if (state.storageNoConfirm) {
-      // Skips the artificial loading confirmation delay but still requires the manual confirm click
-      performMove();
-    } else {
+      const mode = state.storageSelectionMode;
+      const selectedIdsSet = new Set(state.storageSelectedIds);
+
+      const performMove = () => {
+        const modeLocal = state.storageSelectionMode;
+        const targetUnitIdLocal = state.storageSelectionTargetId;
+        const selectedIdsSetLocal = new Set(state.storageSelectedIds);
+        const targetUnitLocal = acc.items.find(it => it.id === targetUnitIdLocal);
+        
+        if (!targetUnitLocal) return;
+
+        if (modeLocal === 'deposit') {
+          const selectedItems = acc.items.filter(it => selectedIdsSetLocal.has(it.id));
+          acc.items = acc.items.filter(it => !selectedIdsSetLocal.has(it.id));
+          if (!targetUnitLocal.contents) targetUnitLocal.contents = [];
+          targetUnitLocal.contents.push(...selectedItems);
+        } else {
+          if (!targetUnitLocal.contents) return;
+          const selectedItems = targetUnitLocal.contents.filter(it => selectedIdsSetLocal.has(it.id));
+          targetUnitLocal.contents = targetUnitLocal.contents.filter(it => !selectedIdsSetLocal.has(it.id));
+          acc.items.push(...selectedItems);
+        }
+        
+        targetUnitLocal.lastUpdated = Date.now();
+        state.storageSelectionMode = null;
+        state.storageSelectedIds = [];
+        state.storageSelectionTargetId = null;
+        saveState();
+        refreshInventoryView();
+        document.getElementById("selectionActionBar").classList.add("hidden");
+      };
+
       const overlay = document.getElementById("transferOverlay");
-      const statusText = document.getElementById("transferStatusText");
-      overlay.classList.remove("hidden");
-      overlay.style.display = "flex";
-      statusText.textContent = mode === 'deposit' ? "Moving to Storage Unit..." : "Moving to Inventory...";
-      setTimeout(() => {
+      if (overlay) {
+        overlay.classList.remove("hidden");
+        overlay.style.display = "flex";
+        const statusText = document.getElementById("transferStatusText");
+        if (statusText) statusText.textContent = mode === 'deposit' ? "Depositing into Storage Unit..." : "Withdrawing from Storage Unit...";
+        setTimeout(() => {
+          performMove();
+          overlay.classList.add("hidden");
+          overlay.style.display = "none";
+        }, 600);
+      } else {
         performMove();
-        overlay.classList.add("hidden");
-        overlay.style.display = "none";
-      }, 1000);
-    }
-  };
+      }
+    };
+  }
 
   document.getElementById("cancelSelectionBtn").onclick = () => {
     state.storageSelectionMode = null;
@@ -11570,7 +11893,7 @@ const getItemValue = (it) => {
 };
 
 const getInventoryAddedValueBreakdown = (it) => {
-  if (!it || !it.name || String(it.name).toLowerCase().includes("storage unit")) return null;
+  if (!it || !it.name || String(it.name).toLowerCase().includes("storage unit") || it.isDefaultItem) return null;
 
   const rawBasePrice = (typeof it.price === "number") ? it.price : 0;
   let wearAdded = 0;
@@ -11661,9 +11984,6 @@ function isWeaponMarketItem(item) {
   const name = String(item?.name || "").toLowerCase();
   const type = String(item?.type || item?.category?.name || "").toLowerCase();
   if (!name || name.includes("sticker") || name.includes("capsule") || name.includes("storage unit")) return false;
-  // Hide everything with wear in name
-  if (/\((Factory New|Minimal Wear|Field-Tested|Well-Worn|Battle-Scarred)\)/i.test(name)) return false;
-
   return name.includes("|") ||
     name.includes("â˜…") ||
     name.includes("knife") ||
@@ -11686,7 +12006,7 @@ function canItemReceiveStickers(item) {
   if (!item) return false;
   const name = String(item?.name || "").toLowerCase();
   const type = String(item?.type || item?.category?.name || item?.weapon?.name || "").toLowerCase();
-  if (!name) return false;
+  if (!name || name.includes("sticker")) return false; // STICKERS NEVER HAVE STICKERS
   if (item.isDefaultItem && !name.includes("knife") && !name.includes("gloves")) return true;
   if (name.includes("case hardened")) {
     if (name.includes("knife") || name.includes("gloves") || type.includes("knife") || type.includes("gloves")) return false;
@@ -11718,8 +12038,10 @@ function matchesSearchCategoryStrict(item, catId) {
   if (cat === "custom") return true;
   if (cat === "stickers") {
     const isSticker = (name.startsWith("sticker |") || name.startsWith("sticker ") || type.includes("sticker") || catName.includes("sticker"));
-    // Explicitly exclude capsules and slabs from regular sticker category
-    return isSticker && !name.includes("capsule") && !name.includes("sticker slab") && !name.includes("slab |");
+    const isContainer = name.includes("capsule") || name.includes("package") || name.includes("case") || type.includes("container") || type.includes("crate") || type.includes("capsule") || name.includes("storage unit");
+    const isBlacklisted = name.includes("rio 2022") || name.includes("champion") || name.includes("ems");
+    const isSlab = name.includes("sticker slab") || name.includes("slab |");
+    return isSticker && !isContainer && !isBlacklisted && !isSlab;
   }
   if (cat === "case") return (name.includes("case") || name.includes("capsule") || name.includes("package") || name.includes("collection") || catName.includes("case") || catName.includes("capsule")) && !name.includes("|") && !name.includes("sticker |");
   if (cat === "key") {
@@ -11854,7 +12176,7 @@ async function searchByCategory(catId) {
     return;
   }
 
-  searchResults = allSkins.filter(item => matchesSearchCategoryStrict(item, cat));
+  searchResults = allSkins.filter(item => !hasWearInName(item.name) && matchesSearchCategoryStrict(item, cat));
   // USER REQUEST: Sort the OCNTENTS OF EACH TAB ALPHEBETICALORDER
   searchResults.sort((a, b) => (a.name || "").localeCompare(b.name || ""));
   searchPage = 1;
@@ -11946,11 +12268,41 @@ function refreshInventoryView() {
     return rs;
   };
 
+  // Update Categories using Mykel API Category field if available
+  sourceItems.forEach(it => {
+    if (it && it.category && it.category.name) {
+      const cat = it.category.name;
+      if (cat.toLowerCase() === "sticker capsules") {
+        it.type = "Sticker Capsule";
+      } else if (cat.toLowerCase() === "stickers") {
+        it.type = "Sticker";
+      } else {
+        it.type = cat;
+      }
+    }
+  });
+
+  // Update Categories using Mykel API Category field if available
+  sourceItems.forEach(it => {
+    if (it && it.category && it.category.name) {
+      const cat = it.category.name;
+      if (cat.toLowerCase() === "sticker capsules") {
+        it.type = "Sticker Capsule";
+      } else if (cat.toLowerCase() === "stickers") {
+        it.type = "Sticker";
+      } else {
+        it.type = cat;
+      }
+    }
+  });
+
   // Pre-resolve source items based on current view/mode context
   if (isStorageSelection) {
     const targetUnit = targetAccount.items.find(i => i.id === state.storageSelectionTargetId);
     if (state.storageSelectionMode === 'withdraw' && targetUnit) {
       sourceItems = targetUnit.contents || [];
+    } else {
+      sourceItems = targetAccount.items;
     }
   } else if (isViewingStorage && !viewingProfile) {
     const unit = targetAccount.items.find(i => i.id === state.viewingStorageUnitId);
@@ -11966,8 +12318,6 @@ function refreshInventoryView() {
   });
 
   // 1. Filter (Search text + Rarity dropdown + Tab)
-  sourceItems = sourceItems.filter(it => !/\((Factory New|Minimal Wear|Field-Tested|Well-Worn|Battle-Scarred)\)/i.test(it.name));
-
   const sort = state.currentSort || "recent";
   const activeRarityFilter = state.rarityFilter || "all";
   if (sort === "favorites") {
@@ -11983,6 +12333,7 @@ function refreshInventoryView() {
   const activeTab = state.inventoryTab || "everything";
   
   let items = sourceItems.filter(it => {
+    if (hasWearInName(it.name)) return false;
     // If in deposit mode, never show equipped items or other storage units
     if (state.storageSelectionMode === 'deposit') {
       if (equippedIds.includes(it.id)) return false;
@@ -12171,13 +12522,9 @@ function refreshInventoryView() {
   }
 
   // 2. Sort (explicit ordering: equipped items -> recently-updated storage units (3hrs) -> other sort)
-  const isKnifeLike = (n) => {
-    const nl = String(n || "").toLowerCase();
-    return nl.includes("★") || nl.includes("knife") || nl.includes("gloves");
-  };
-
-  // Only pin equipped items when the inventory is explicitly sorted by Equipped or Favorites.
-  const shouldPinEquipped = (sort === "equipped" || sort === "favorites");
+  // Optimization: Disable jumping to top during storage selection/viewing
+  const isSelectionActive = !!state.storageSelectionMode || !!state.viewingStorageUnitId;
+  const shouldPinEquipped = (sort === "equipped" || sort === "favorites") && !isSelectionActive;
 
   const equippedItems = [];
   const nonEquipped = [];
@@ -12188,52 +12535,37 @@ function refreshInventoryView() {
       else nonEquipped.push(it);
     });
   } else {
-    // Treat all items equally for sorting
     nonEquipped.push(...items);
   }
 
-  // Keep equipped items pinned for non-equipped sorts, but still sort them by the chosen dropdown.
   applyInventorySort(nonEquipped, sort);
   if (shouldPinEquipped) applyInventorySort(equippedItems, sort);
 
-  // Then elevate recently-updated storage units within non-equipped items (they should appear immediately after equipped items),
-  // but always place storage units themselves at the very end of the list.
   const now = Date.now();
-  const threeHours = 3 * 60 * 60 * 1000;
+  const threeHours = isSelectionActive ? -1 : (3 * 60 * 60 * 1000);
   const updatedUnits = [];
   const otherNonUpdated = [];
   const storageUnits = [];
 
   nonEquipped.forEach(it => {
+    if (hasWearInName(it.name)) return;
     const isStorageUnit = String(it.name).toLowerCase().includes("storage unit");
     if (isStorageUnit) {
-      // Collect storage units to append at the very end
       storageUnits.push(it);
       return;
     }
-    const isRecentlyUpdated = it.lastUpdated && (now - it.lastUpdated < threeHours);
+    const isRecentlyUpdated = !isSelectionActive && it.lastUpdated && (now - it.lastUpdated < threeHours);
     if (isRecentlyUpdated) updatedUnits.push(it);
     else otherNonUpdated.push(it);
   });
 
-  // Final items order: equippedItems -> updatedUnits -> otherNonUpdated -> storageUnits -> defaultItems
   const justDefault = items.filter(it => it.isDefaultItem);
-  const notDefault = items.filter(it => !it.isDefaultItem);
 
   if (shouldPinEquipped) {
     const eqNotDefault = equippedItems.filter(it => !it.isDefaultItem);
-    const nonEqNotDefault = nonEquipped.filter(it => !it.isDefaultItem);
-    items = [...eqNotDefault, ...updatedUnits, ...nonEqNotDefault, ...storageUnits, ...justDefault];
+    items = [...eqNotDefault, ...updatedUnits, ...otherNonUpdated, ...storageUnits, ...justDefault];
   } else {
-    // If not pinning, merge each group only once and keep storage units and defaults at bottom
-    items = [...updatedUnits, ...otherNonUpdated, ...storageUnits];
-    if (sort === "priceDesc") items.sort((a,b) => getItemValue(b) - getItemValue(a));
-    else if (sort === "priceAsc") items.sort((a,b) => getItemValue(a) - getItemValue(b));
-    else if (sort === "name") items.sort((a,b) => a.name.localeCompare(b.name));
-    
-    const justStorage = items.filter(it => String(it.name).toLowerCase().includes("storage unit"));
-    const notStorage = items.filter(it => !String(it.name).toLowerCase().includes("storage unit") && !it.isDefaultItem);
-    items = [...notStorage, ...justStorage, ...justDefault];
+    items = [...updatedUnits, ...otherNonUpdated, ...storageUnits, ...justDefault];
   }
 
   // NEW badges expire per-item after 2 minutes (no global cap)
@@ -12252,12 +12584,11 @@ function refreshInventoryView() {
   }
 
   // 3. Stats (Context-aware: Profile vs Storage Unit vs Account)
-  // Ensure nametag rule: Red color
-  document.querySelectorAll('.inv-item-name').forEach(el => {
-    if (el.textContent && el.textContent.includes('"')) {
-       el.style.setProperty('color', '#eb4b4b', 'important');
-    }
+  // Performance: Attach counts to items for faster details rendering
+  items.forEach(it => {
+    it._cachedCount = countMap.get(`${it.name}|${it.nametag || ""}`) || (it.qty || 1);
   });
+
 
   const headerGameTitle = document.getElementById("headerGameTitle");
   if (headerGameTitle) {
@@ -12342,8 +12673,12 @@ function refreshInventoryView() {
   if (state.viewingStorageUnitId || state.storageSelectionMode) {
     const gridWrapper = document.querySelector(".inventory-grid-wrapper");
     if (gridWrapper) gridWrapper.scrollTop = 0;
+    const gridInnerScroll = document.querySelector(".steam-grid.scroll-mode");
+    if (gridInnerScroll) gridInnerScroll.scrollTop = 0; // GO TO TOP OF INVENTORY
     const limiter = document.querySelector(".grid-scroll-limiter");
     if (limiter) limiter.scrollTop = 0;
+    const gridElInner = document.querySelector(".steam-grid.scroll-mode");
+    if (gridElInner) gridElInner.scrollTop = 0;
     window.scrollTo(0, 0);
   }
 
@@ -12377,8 +12712,11 @@ function refreshInventoryView() {
       })
     : [];
 
-  if (state.disablePagination || state.currentPage === 1) {
-    pageItems = [...pageItems, ...defaultInventoryItems];
+  if (!state.disableDefaultWeapons) {
+    if (state.disablePagination || state.currentPage === totalPages || items.length === 0) {
+      // Always show base weapons at the end of everything or if inventory empty
+      pageItems = [...pageItems, ...defaultInventoryItems];
+    }
   }
 
   grid.innerHTML = "";
@@ -12504,7 +12842,9 @@ function refreshInventoryView() {
     
     let stattrakHtml = "";
     if (String(item.name || "").toLowerCase().includes("stattrak") && state.showStatTrakOverlay !== false) {
-      stattrakHtml = `<img src="https://i.imgur.com/TRtzFCo.png" class="inv-sticker-mini inv-sticker-stattrak" title="StatTrak™">`;
+      const isKnife = item.name.includes("★") || item.name.toLowerCase().includes("knife");
+      const stIcon = isKnife ? "https://i.imgur.com/txeWcrS.png" : "https://i.imgur.com/TRtzFCo.png";
+      stattrakHtml = `<img src="${stIcon}" class="inv-sticker-mini inv-sticker-stattrak" title="StatTrak™">`;
     }
 
     const finalStickersHtml = gridStickers.slice(0, 5).map(s => {
@@ -12580,11 +12920,15 @@ function refreshInventoryView() {
        }
     }
 
-    const nameToDisplay = isStorageUnit ? "Storage Unit" : (typePart === "Custom Container" || typePart === "Custom Collection" ? "Container" : typePart);
+    let nameToDisplay = isStorageUnit ? "Storage Unit" : (typePart === "Custom Container" || typePart === "Custom Collection" ? "Container" : typePart);
+    if (String(item.name).toLowerCase().includes("sticker") || String(item.type).toLowerCase().includes("sticker")) {
+        nameToDisplay = "Sticker";
+    }
+    
     nameLabel.innerHTML = `
         <div style="${nameColorStyle || 'color: #fff;'} font-weight: 800; font-size: 16px; margin-bottom: 2px;">${escapeHtml(nameToDisplay)}</div>
         <div style="font-size: 14px; color: #94a3b8;">${escapeHtml(finalSkinName).replace('|', '')}</div>
-        ${item.nametag ? `<div style="font-size: 12px; color: #eb4b4b !important; font-weight: 800; margin-top: 2px;">"${escapeHtml(item.nametag)}"</div>` : ''}
+        ${item.nametag ? `<div class="inv-extra-nametag" style="font-size: 11px; margin-top: 2px;">"${escapeHtml(item.nametag)}"</div>` : ''}
     `;
 
     wrapper.appendChild(div);
@@ -12598,7 +12942,7 @@ function refreshInventoryView() {
         e.stopPropagation();
         
         if (state.storageNoConfirm) {
-           // Instant Move Logic
+           // Instant Move Logic - Optimized to avoid freezing
            const acc = getActiveAccount();
            const targetUnitId = state.storageSelectionTargetId;
            const targetUnit = acc.items.find(u => u.id === targetUnitId);
@@ -12607,7 +12951,7 @@ function refreshInventoryView() {
            if (state.storageSelectionMode === 'deposit') {
               const idx = acc.items.findIndex(ai => ai.id === item.id);
               if (idx !== -1) {
-                const [moved] = acc.items.splice(idx, 1);
+                const moved = acc.items.splice(idx, 1)[0];
                 if (!targetUnit.contents) targetUnit.contents = [];
                 targetUnit.contents.push(moved);
                 targetUnit.lastUpdated = Date.now();
@@ -12616,24 +12960,42 @@ function refreshInventoryView() {
               if (targetUnit.contents) {
                 const cIdx = targetUnit.contents.findIndex(ci => ci.id === item.id);
                 if (cIdx !== -1) {
-                  const [moved] = targetUnit.contents.splice(cIdx, 1);
+                  const moved = targetUnit.contents.splice(cIdx, 1)[0];
                   acc.items.push(moved);
                   targetUnit.lastUpdated = Date.now();
                 }
               }
            }
            saveState();
-           refreshInventoryView();
+           // Use requestAnimationFrame to let browser breathe
+           requestAnimationFrame(() => refreshInventoryView());
            return;
         }
 
         const isSelected = state.storageSelectedIds.includes(item.id);
         if (isSelected) {
           state.storageSelectedIds = state.storageSelectedIds.filter(id => id !== item.id);
+          div.classList.remove("storage-selected-deposit", "storage-selected-withdraw");
         } else {
           state.storageSelectedIds.push(item.id);
+          div.classList.add(state.storageSelectionMode === 'deposit' ? "storage-selected-deposit" : "storage-selected-withdraw");
         }
-        refreshInventoryView();
+        
+        // Lightweight update of the selection bar instead of full re-render
+        const count = state.storageSelectedIds.length;
+        const countEl = document.getElementById("selectionCount");
+        if (countEl) countEl.textContent = `${count} item${count > 1 ? 's' : ''} selected`;
+        
+        const valueEl = document.getElementById("selectionValue");
+        if (valueEl) {
+           let selectedValue = 0;
+           const acc = getActiveAccount();
+           const searchPool = state.storageSelectionMode === 'withdraw' 
+             ? (acc.items.find(u => u.id === state.storageSelectionTargetId)?.contents || [])
+             : acc.items;
+           searchPool.forEach(si => { if(state.storageSelectedIds.includes(si.id)) selectedValue += getItemValue(si); });
+           valueEl.textContent = formatPrice(selectedValue);
+        }
         return;
       }
 
@@ -12702,6 +13064,9 @@ function refreshInventoryView() {
 
   // Commit the entire fragment to the DOM in one operation to eliminate stutter
   grid.appendChild(fragment);
+
+  // Final sort cleanup: Base weapons always last on any selection/inventory view
+  // already handled via getDefaultInventoryItems and items mapping.
 
   // Only auto-update the sidebar IF it's already visible (Desktop sidebar mode)
   // Stop auto-showing the modal popup.
@@ -13195,10 +13560,20 @@ function openKeyCaseSelector(item) {
 /**
  * Resolves which keys can open a specific case.
  */
-function getRequiredKeysForCase(caseName) {
+function getRequiredKeysForCase(caseItemOrName) {
+  const caseName = typeof caseItemOrName === "string"
+    ? caseItemOrName
+    : (caseItemOrName?.name || caseItemOrName?.market_hash_name || "");
   const lowerCaseName = String(caseName || "").toLowerCase();
+  const typeText = getItemTypeText(caseItemOrName);
+
+  // Explicitly return keys for Sticker Capsules
+  if (lowerCaseName.includes("sticker capsule 1")) return ["Community Sticker Capsule 1 Key"];
+  if (lowerCaseName.includes("sticker capsule 2")) return ["CS:GO Capsule Key"];
+
   // MLG Columbus 2016 capsules are keyless
   if (lowerCaseName.includes("mlg columbus 2016")) return [];
+  
   if ((lowerCaseName.includes("capsule") || lowerCaseName.includes("sticker")) &&
       !lowerCaseName.includes("sticker capsule 1") &&
       !lowerCaseName.includes("sticker capsule 2")) {
@@ -13307,13 +13682,19 @@ function showCaseConfirmForCaseName(caseName, sourceKeyId = null, caseItemId = n
   forcedCaseWinner = null;
   forcedCaseRarity = null;
 
+  const ownedCaseRef = account
+    ? (account.items.find(it => it?.id === caseItemId) || account.items.find(it => (it.name || "").split(' (')[0].trim() === caseName))
+    : null;
+
   // Prepare a synthetic case item object for display purposes
   const caseItem = {
     id: "case_preview_" + Date.now(),
     name: caseName,
-    img: getDisplayImage({ name: caseName }),
-    price: PRICE_FIXES[caseName] || mockPrice({ name: caseName }),
-    type: "Container"
+    img: ownedCaseRef?.img || getDisplayImage({ name: caseName }),
+    price: ownedCaseRef?.price || PRICE_FIXES[caseName] || mockPrice({ name: caseName }),
+    type: ownedCaseRef?.type || ownedCaseRef?.category?.name || "Container",
+    category: ownedCaseRef?.category || null,
+    noWear: ownedCaseRef?.noWear || false
   };
 
   const titleEl = document.getElementById("caseConfirmTitle");
@@ -13327,7 +13708,7 @@ function showCaseConfirmForCaseName(caseName, sourceKeyId = null, caseItemId = n
 
   // Count owned cases and keys for display (write into the dedicated count spans)
   const ownedCases = account ? account.items.filter(it => (it.name || "").split(' (')[0].trim() === caseName).length : 0;
-  const requiredKeys = getRequiredKeysForCase(caseName);
+  const requiredKeys = getRequiredKeysForCase(caseItem);
   let ownedKeys = 0;
   if (account && requiredKeys.length > 0) {
     ownedKeys = account.items.filter(it => {
@@ -13533,8 +13914,12 @@ function showCaseConfirmForCaseName(caseName, sourceKeyId = null, caseItemId = n
   // Bind confirm behavior: when confirmed, create the case item in inventory and open it immediately (consuming a key if available)
   confirmBtn.onclick = () => {
     // IMMEDIATELY show loading/animation modal to prevent UI "closing" appearance
-    document.getElementById("caseOpeningModal").classList.remove("hidden");
+    const openingModal = document.getElementById("caseOpeningModal");
+    openingModal.style.background = "transparent";
+    openingModal.classList.remove("hidden");
     document.getElementById("caseConfirmModal").classList.add("hidden");
+    
+    // Play case_u during loading screen as requested
     playCaseUnlockSound();
 
     try {
@@ -13822,10 +14207,11 @@ function populateDetailsDOM(root, item) {
 
   // Add StatTrak™ virtual sticker if weapon is StatTrak
   if (item.name.includes("StatTrak™")) {
+      const isKnifeItem = item.name.includes("★") || item.name.toLowerCase().includes("knife");
       // Place StatTrak first in the array so it shows up at the start of the sticker list
       appliedStickers.unshift({
           name: "StatTrak™ Module",
-          img: "https://i.imgur.com/TRtzFCo.png",
+          img: isKnifeItem ? "https://i.imgur.com/txeWcrS.png" : "https://i.imgur.com/TRtzFCo.png",
           isStatTrakModule: true,
           price: 0.05
       });
@@ -13951,10 +14337,10 @@ function populateDetailsDOM(root, item) {
     if (item.nametag) {
       ntLabel.textContent = `"${item.nametag}"`;
       ntLabel.classList.remove("hidden");
-      ntLabel.classList.add("nametag-red");
+      ntLabel.style.color = "#fff"; // Force white in sidebar as requested
+      ntLabel.classList.remove("nametag-red");
     } else {
       ntLabel.classList.add("hidden");
-      ntLabel.classList.remove("nametag-red");
     }
   }
 
@@ -14082,7 +14468,7 @@ function populateDetailsDOM(root, item) {
     const isKey = isKeyItem(item);
     const baseName = item.name.split(' (')[0].trim();
     const matchedKeyName = Object.keys(KEY_CASE_MAP).find(k => k.toLowerCase().trim() === baseName.toLowerCase());
-    const requiredKeys = getRequiredKeysForCase(item.name);
+    const requiredKeys = getRequiredKeysForCase(item);
 
     if (isKey) {
       const caseNames = KEY_CASE_MAP[matchedKeyName] || [];
@@ -14174,7 +14560,7 @@ function populateDetailsDOM(root, item) {
      n.includes("karambit") ||
      n.includes("butterfly"));
 
-  const canStickerTarget = !isDefaultItem && canItemReceiveStickers(item) && !isKnifeOrGloveItem(item);
+  const canStickerTarget = canItemReceiveStickers(item) && !isKnifeOrGloveItem(item);
   const applyBtn = root.querySelector("#applyStickerBtn");
   if (applyBtn) {
     const isStorageUnit = item.name.toLowerCase().includes('storage unit');
@@ -14405,10 +14791,10 @@ function populateDetailsDOM(root, item) {
         }
       }
     } else if (isCase) {
-      const requiredKeys = getRequiredKeysForCase(item.name);
+      const requiredKeys = getRequiredKeysForCase(item);
       
       const isSouvenir = n.includes('souvenir') || n.includes('package');
-      const isCapsule = n.includes('capsule') || n.includes('sticker') || n.includes('mlg columbus 2016');
+      const isCapsule = isStickerCapsuleItem(item) || n.includes('mlg columbus 2016');
       
       openBtn.textContent = isCapsule ? "Open Capsule" : "Open Case";
       openBtn.classList.remove('hidden');
@@ -14493,24 +14879,21 @@ function updateModalBlurState() {
   const app = document.getElementById("app");
   if (!app) return;
   
-  // Find all active modal overlays. Consider hidden or display:none as inactive.
   const overlays = document.querySelectorAll(".modal-overlay");
   let hasVisible = false;
   
   overlays.forEach(m => {
     const isActuallyHidden = m.classList.contains("hidden") || m.style.display === "none";
     if (!isActuallyHidden) {
-      // Ignore specific results popups from causing blur if they are empty
-      if (m.id === "purchaseResultModal" && purchaseResultList.length === 0) return;
+      if (m.id === "purchaseResultModal") return; // No blur when new item box shows as requested
+      // Opening animation and result screens don't use standard blur to avoid stacking lag
+      if (m.id === "caseOpeningModal") return; 
       hasVisible = true;
     }
   });
 
-  if (hasVisible) {
-    app.classList.add("modal-open");
-  } else {
-    app.classList.remove("modal-open");
-  }
+  if (hasVisible) app.classList.add("modal-open");
+  else app.classList.remove("modal-open");
 }
 
 // Global cleanup: ensure all Close clicks trigger a blur recalculation
@@ -14625,7 +15008,8 @@ async function openCase(itemId, skipConfirm = false, keyToUseId = null, openCoun
   let keyIdx = -1;
   let noKeyNeeded = false;
   const n = caseItem.name.toLowerCase();
-  const isSouvenir = n.includes('souvenir') || n.includes('package');
+  const caseTypeLower = getItemTypeText(caseItem);
+  const isSouvenir = n.includes('souvenir') || n.includes('package') || n.includes('collection');
 
   // Explicitly treat DreamHack 2014 Legends (Holo/Foil) as keyless
   if (n.includes("dreamhack 2014 legends")) noKeyNeeded = true;
@@ -14634,7 +15018,7 @@ async function openCase(itemId, skipConfirm = false, keyToUseId = null, openCoun
   // but keep specific "Sticker Capsule 1/2" requiring keys.
   // This makes items like "Katowice 2019 Minor Challengers" openable without keys.
   const lowerName = n.toLowerCase();
-  const looksLikeStickerCapsule = lowerName.includes("sticker") || lowerName.includes("capsule");
+  const looksLikeStickerCapsule = isStickerCapsuleItem(caseItem) || lowerName.includes("sticker") || lowerName.includes("capsule");
   const isExplicitCommunityOrSpecial = lowerName.includes("sticker capsule 1") ||
                                        lowerName.includes("sticker capsule 2");
   
@@ -14655,6 +15039,7 @@ async function openCase(itemId, skipConfirm = false, keyToUseId = null, openCoun
   if (lowerName.includes("10 year birthday sticker capsule")) noKeyNeeded = true;
   // Explicitly treat the MLG Columbus 2016 Challengers capsule as keyless
   if (lowerName.includes("mlg columbus 2016")) noKeyNeeded = true;
+  if (lowerName.includes("sticker capsule") && !lowerName.includes("sticker capsule 1") && !lowerName.includes("sticker capsule 2")) noKeyNeeded = true;
   // Norse Case takes no key
   if (lowerName.includes("norse")) noKeyNeeded = true;
   // Sealed terminals are keyless and should never prompt for a key
@@ -14667,17 +15052,16 @@ async function openCase(itemId, skipConfirm = false, keyToUseId = null, openCoun
   }
 
   if (!isSouvenir && !noKeyNeeded) {
+    // Correctly identify key for Sticker Capsules 1 & 2
+    const requiredKeys = getRequiredKeysForCase(caseItem);
+    
     if (keyToUseId) {
       keyIdx = account.items.findIndex(it => it.id === keyToUseId);
-    } else {
-      // Find any valid key
-      const requiredKeys = getRequiredKeysForCase(caseItem.name);
-      if (requiredKeys.length > 0) {
-        keyIdx = account.items.findIndex(it => {
-          const itName = it.name.toLowerCase().split(' (')[0].trim();
-          return requiredKeys.some(rk => rk.toLowerCase().trim() === itName);
-        });
-      }
+    } else if (requiredKeys.length > 0) {
+      keyIdx = account.items.findIndex(it => {
+        const itName = (it.name || "").toLowerCase().split(' (')[0].trim();
+        return requiredKeys.some(rk => rk.toLowerCase().trim() === itName);
+      });
     }
 
     if (keyIdx === -1) {
@@ -14686,7 +15070,7 @@ async function openCase(itemId, skipConfirm = false, keyToUseId = null, openCoun
         showInScreenConfirm(`You need a key to open "${caseItem.name}". Would you like to buy a key?`, () => {
           // If user confirms in the in-screen modal, open the Get Key flow for this case
           try {
-            const reqKeys = getRequiredKeysForCase(caseItem.name);
+            const reqKeys = getRequiredKeysForCase(caseItem);
             if (reqKeys.length > 0) {
               const kName = reqKeys[0];
               const kData = MARKET_KEYS.find(k => k.name === kName) || allSkins.find(s => s.name === kName);
@@ -14723,7 +15107,8 @@ async function openCase(itemId, skipConfirm = false, keyToUseId = null, openCoun
   let caseDataRaw = resolveCaseContentsData(fullName) ||
                resolveCaseContentsData(baseName) ||
                resolveCaseContentsData(fullName.replace(/'/g, "")) ||
-               resolveCaseContentsData(baseName.replace(/'/g, ""));
+               resolveCaseContentsData(baseName.replace(/'/g, "")) ||
+               resolveCaseContentsData(caseName);
     
   // Ensure item names in pool don't have Souvenir prefix to avoid double-prefixing and avoid filtering out entire pools
   let caseData = null;
@@ -14754,7 +15139,7 @@ async function openCase(itemId, skipConfirm = false, keyToUseId = null, openCoun
   }
   // Only skip wear assignment for sticker/capsule-type containers (stickers don't have weapon wear)
   const nameLower = fullName.toLowerCase();
-  const noWearForCase = nameLower.includes('sticker') || nameLower.includes('capsule') || nameLower.includes('katowice');
+  const noWearForCase = isStickerCapsuleItem(caseItem) || caseTypeLower.includes("sticker capsule") || nameLower.includes('sticker') || nameLower.includes('capsule') || nameLower.includes('katowice');
 
   // Determine how many cases we can actually open given available cases & keys
   const allCasesSame = account.items.filter(it => it.name === caseItem.name);
@@ -14763,7 +15148,7 @@ async function openCase(itemId, skipConfirm = false, keyToUseId = null, openCoun
   // If container is a souvenir OR explicitly marked as noKeyNeeded (e.g. sticker capsules like EMS Katowice 2014),
   // don't require keys when computing how many can be opened.
   if (!isSouvenir && !noKeyNeeded) {
-    const requiredKeysForThis = getRequiredKeysForCase(caseItem.name);
+    const requiredKeysForThis = getRequiredKeysForCase(caseItem);
     if (requiredKeysForThis.length > 0) {
       keyCount = account.items.filter(it => {
         const itName = it.name.toLowerCase().split(' (')[0].trim();
@@ -14801,7 +15186,7 @@ async function openCase(itemId, skipConfirm = false, keyToUseId = null, openCoun
 
       // If we didn't get an explicit key, fall back to matching required key names as before.
       if (!isSouvenir && !noKeyNeeded && kIdx === -1) {
-        const requiredKeysForThis = getRequiredKeysForCase(caseItem.name);
+        const requiredKeysForThis = getRequiredKeysForCase(caseItem);
         if (requiredKeysForThis.length > 0) {
           const keyItem = account.items.find((it, idx) => {
             if (idx === cIdx) return false;
@@ -14816,7 +15201,6 @@ async function openCase(itemId, skipConfirm = false, keyToUseId = null, openCoun
       }
 
       // 3. Remove the case and exactly one key (if found).
-      // Logic Fix: user requested 1 key per case. We ensure exactly one case and one key are spliced.
       const indicesToRemove = [cIdx];
       if (kIdx !== -1 && kIdx !== cIdx) {
         indicesToRemove.push(kIdx);
@@ -14824,7 +15208,8 @@ async function openCase(itemId, skipConfirm = false, keyToUseId = null, openCoun
       indicesToRemove.sort((a, b) => b - a);
       indicesToRemove.forEach(idx => {
         if (idx >= 0 && idx < account.items.length) {
-          account.items.splice(idx, 1);
+          const removed = account.items.splice(idx, 1)[0];
+          if (removed) account.equippedItemIds = (account.equippedItemIds || []).filter(id => id !== removed.id);
         }
       });
 
@@ -14844,7 +15229,7 @@ async function openCase(itemId, skipConfirm = false, keyToUseId = null, openCoun
       const accountRef = getActiveAccount();
       const base = (caseItem && caseItem.name) ? (caseItem.name.split(' (')[0].trim()) : (caseName || "");
       const ownedCasesNow = accountRef ? accountRef.items.filter(it => (it.name || "").split(' (')[0].trim() === base).length : 0;
-      const requiredKeysNow = getRequiredKeysForCase(caseItem.name);
+      const requiredKeysNow = getRequiredKeysForCase(caseItem);
       let ownedKeysNow = 0;
       if (accountRef && requiredKeysNow.length > 0) {
         ownedKeysNow = accountRef.items.filter(it => {
@@ -14934,7 +15319,7 @@ async function openCase(itemId, skipConfirm = false, keyToUseId = null, openCoun
     // (some flows previously failed to remove the custom key instance; this forcibly removes one if present).
     try {
       const accountRef = getActiveAccount();
-      const requiredKeysNow = getRequiredKeysForCase(caseItem.name);
+      const requiredKeysNow = getRequiredKeysForCase(caseItem);
       if (Array.isArray(requiredKeysNow) && requiredKeysNow.includes("Custom key") && accountRef) {
         // Remove one top-level Custom key only (do not remove keys stored inside storage units)
         const keyIndex = accountRef.items.findIndex(it => {
@@ -14975,7 +15360,12 @@ async function openCase(itemId, skipConfirm = false, keyToUseId = null, openCoun
     const revealNow = () => {
       if (hasRevealed) return;
       hasRevealed = true;
+
+      // Reveal faster as requested once animation stops
+      // Reduced freeze risk: use a precise small delay
+      setTimeout(() => {
       lensState.active = false; // STOP MAGNIFIER
+      if (window._caseLoadingTimeout) clearTimeout(window._caseLoadingTimeout);
 
       const isRealistic = !!state.realisticCaseOpening;
       
@@ -15021,7 +15411,12 @@ async function openCase(itemId, skipConfirm = false, keyToUseId = null, openCoun
       winners.forEach(w => {
         // Reset and churn randomness for every item to prevent biased drops
         Math.random(); 
-        const r = normalizeRarityName(w, (w.rarity && (w.rarity.name || w.rarity)) ? (w.rarity.name || w.rarity) : null);
+        const rRaw = (w.rarity && (w.rarity.name || w.rarity)) ? (w.rarity.name || w.rarity) : null;
+        const r = normalizeRarityName(w, rRaw);
+        // Correct Souvenir Purple Rarity if detected as Base Grade
+        if (r === "Base Grade" && (rRaw === "Classified" || rRaw === "Restricted")) {
+           w.rarity = { name: rRaw };
+        }
         if ((rarityRank[r] || 0) > (rarityRank[highest] || 0)) highest = r;
       });
       playAwardSound(highest);
@@ -15052,10 +15447,12 @@ async function openCase(itemId, skipConfirm = false, keyToUseId = null, openCoun
 
         const isSouvenirBox = String(caseItem.name).toLowerCase().includes("souvenir") || String(caseItem.name).toLowerCase().includes("package") || String(caseItem.name).toLowerCase().includes("collection");
 
-        // Logic Fix: Souvenir weapons CAN NOT be StatTrak
         if (isSouvenirBox) {
             finalName = finalName.replace(/StatTrak(?:™|â„¢|™| )*/gi, "").trim();
             if (!finalName.startsWith("Souvenir")) finalName = "Souvenir " + finalName;
+            // Apply correct pool rarity to souvenirs
+            const poolItem = (caseData && caseData[winner.rarity?.name]) ? caseData[winner.rarity?.name].find(x => x.name === winner.name) : null;
+            if (poolItem && poolItem.rarity) winner.rarity = poolItem.rarity;
             finalPriceAdjusted = price; 
         } else if (finalName.includes("StatTrak™") && finalPriceAdjusted === price) {
             finalPriceAdjusted = Math.round((price * 1.15) * 100) / 100;
@@ -15074,19 +15471,12 @@ async function openCase(itemId, skipConfirm = false, keyToUseId = null, openCoun
           qty: 1,
           source: `Pulled from ${caseItem.name}`,
           prevOwners: 0, // User requested pulled items have 0 owners
-          stickers: isSouvenirBox ? generateRandomAppliedStickers(null, 4).filter(isSouvenirGoldStickerItem).map(s => ({ ...s, rarity: "Extraordinary" })) : []
+          stickers: []
         };
         
-        if (isSouvenirBox && finalItemData.stickers.length === 0) {
-           const goldPool = allSkins.filter(isSouvenirGoldStickerItem);
-           if (goldPool.length > 0) {
-             for(let k=0; k<4; k++) {
-               const s = goldPool[Math.floor(Math.random()*goldPool.length)];
-               finalItemData.stickers.push({
-                 name: s.name, img: getDisplayImage(s), price: (PRICE_FIXES[s.name] || mockPrice(s)), rarity: "Extraordinary", scratchPercent: 0
-               });
-             }
-           }
+        // Souvenir pulls must use stickers from the same package/event instead of a random gold pool.
+        if (isSouvenirBox && finalName.includes("|")) {
+           finalItemData.stickers = buildSouvenirStickersForContainer(caseItem.name);
         }
 
         // record whether account already owned this item BEFORE we add it
@@ -15126,7 +15516,8 @@ async function openCase(itemId, skipConfirm = false, keyToUseId = null, openCoun
 
       if (numToOpen === 1) {
         const winner = winnerDataList[0];
-        const rarityColor = RARITY_COLORS[winner.rarity?.name] || RARITY_COLORS["Consumer"];
+        const rarityName = normalizeRarityName(winner, winner.rarity?.name || winner.rarity);
+        const rarityColor = RARITY_COLORS[rarityName] || RARITY_COLORS["Consumer"];
         title.textContent = ""; 
 
         const displayName = winner.nametag ? `"${winner.nametag}"` : winner.name;
@@ -15142,20 +15533,21 @@ async function openCase(itemId, skipConfirm = false, keyToUseId = null, openCoun
 
         spinnerResult.innerHTML = `
           <div style="display:flex; flex-direction:column; align-items:center; width: 100%; height: 740px; justify-content:flex-start; padding-top: 0px;">
-            <div style="text-align: center; z-index: 10; margin-top: -20px;">
-              ${isSouv ? `<div style="color:#ffd700; font-weight:900; letter-spacing:4px; font-size:16px; margin-bottom:5px;">SOUVENIR</div>` : ''}
+            <div style="text-align: center; z-index: 1000; margin-top: -20px; position: relative;">
               <h1 style="color: ${nameColor}; font-size: 56px; font-weight: 900; margin: 0; line-height: 1.0;">${displayName}</h1>
-              <div style="display: flex; align-items: center; justify-content: center; gap: 10px; color: #d1d5db; font-size: 16px; font-weight: 700; margin-top: 2px;">
+              ${winner.nametag ? `<div style="font-size: 18px; color: #fff; margin-top: 5px;">"${winner.nametag}"</div>` : ''}
+              <div style="font-size: 16px; color: #94a3b8; font-weight: 800; text-transform: uppercase; margin-top: 4px;">${winner.finalWear || ''}</div>
+              <div style="display: flex; align-items: center; justify-content: center; gap: 10px; color: #d1d5db; font-size: 16px; font-weight: 700; margin-top: 5px;">
                 <img src="${getDisplayImage({name: containerName})}" style="width:24px; height:24px; object-fit:contain;"> ${containerName}
               </div>
               <div class="unlocked-rarity-bar" style="width: 500px; max-width: 80%; height: 6px; background: ${rarityColor}; margin: 15px auto 0 auto;"></div>
             </div>
             
-            <div id="unlocked3dWrapper" class="unlocked-3d-container" style="height: 680px; margin-top: -60px; pointer-events: auto;">
+            <div id="unlocked3dWrapper" class="unlocked-3d-container" style="height: 680px; margin-top: -60px; pointer-events: auto; z-index: 1;">
               <div class="unlocked-inner-3d" style="transform-style: preserve-3d; display: flex; align-items: center; justify-content: center; width: 100%; height: 100%; pointer-events: none;">
                 <img src="${finalRevealImg}" class="inspect-face" draggable="false" style="max-width: 100%; max-height: 100%; object-fit: contain; filter: drop-shadow(0 20px 80px rgba(0,0,0,0.7)); pointer-events: none;">
               </div>
-              <div id="unlockedStickers"></div>
+              <div id="unlockedStickers" style="z-index: 9000; pointer-events: none;"></div>
             </div>
           </div>
         `;
@@ -15278,7 +15670,7 @@ async function openCase(itemId, skipConfirm = false, keyToUseId = null, openCoun
 
       // Restyle actions area to be centered and clean
       actions.style.display = "flex";
-      actions.style.flexDirection = "column";
+      actions.style.flexDirection = "row";
       actions.style.alignItems = "center";
       actions.style.marginTop = "20px";
 
@@ -15290,108 +15682,56 @@ async function openCase(itemId, skipConfirm = false, keyToUseId = null, openCoun
         closeCaseBtn.style.fontWeight = "900";
       }
 
-      // Clear and rebuild actions reorder
+      // Clear and rebuild actions reorder: Attributes at top, then Open Next Case, then vertical column of Claim Reward | Sell | Equip | Edit
       actions.innerHTML = "";
       actions.style.display = "flex";
       actions.style.flexDirection = "row";
-      actions.style.justifyContent = "center";
+      actions.style.justifyContent = "space-between";
       actions.style.alignItems = "center";
-      actions.style.width = "100%";
-      actions.style.padding = "20px";
-      actions.style.background = "transparent";
+      actions.style.width = "500px";
+      actions.style.padding = "10px 20px";
+      actions.style.borderTop = "1px solid rgba(255,255,255,0.1)";
+      actions.style.background = "rgba(0,0,0,0.25)";
       actions.style.position = "fixed";
-      actions.style.bottom = "0px";
-      actions.style.left = "0";
-      actions.style.right = "0";
+      actions.style.bottom = "30px";
+      actions.style.left = "50%";
+      actions.style.transform = "translateX(-50%)";
       actions.style.zIndex = "1000";
       actions.style.pointerEvents = "auto";
       actions.style.opacity = "1";
 
+      const attribsWrap = document.createElement("div");
+      attribsWrap.style.display = "flex";
+      attribsWrap.style.alignItems = "center";
+      attribsWrap.innerHTML = createInfoIconHtml(rewardData, { includeShare: true });
+      actions.appendChild(attribsWrap);
+
+      // Bind share button click after injecting HTML
+      const shareBtn = attribsWrap.querySelector('.info-share-btn');
+      if (shareBtn) {
+          shareBtn.onclick = (e) => {
+              e.stopPropagation();
+              lastInspectItem = rewardData;
+              openShareItemModal();
+          };
+      }
+
       const closeTextBtn = document.createElement("div");
-      closeTextBtn.style.color = "rgba(255,255,255,0.7)";
-      closeTextBtn.style.fontSize = "18px";
+      closeTextBtn.style.color = "#fff";
+      closeTextBtn.style.fontSize = "24px";
       closeTextBtn.style.fontWeight = "900";
       closeTextBtn.style.cursor = "pointer";
       closeTextBtn.style.textTransform = "uppercase";
-      closeTextBtn.style.letterSpacing = "4px";
+      closeTextBtn.style.letterSpacing = "2px";
       closeTextBtn.textContent = "CLOSE";
-      closeTextBtn.style.padding = "20px 60px";
       closeTextBtn.onclick = () => {
         document.querySelectorAll('.modal-overlay').forEach(m => m.classList.add("hidden"));
         showGroupedPurchaseResult();
       };
       actions.appendChild(closeTextBtn);
-
-      const closeUnlockedActionsMenu = () => {
-        ddMenu.style.display = "none";
-        actionDropdown.classList.remove("open");
-      };
-
-      ddBtn.onclick = (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        const isOpen = ddMenu.style.display === "flex";
-        if (isOpen) {
-          closeUnlockedActionsMenu();
-        } else {
-          ddMenu.style.display = "flex";
-          actionDropdown.classList.add("open");
-        }
-      };
-
-      const sellBtn = ddMenu.querySelector(".act-sell");
-      const equipBtnAction = ddMenu.querySelector(".act-equip");
-      const editNametagBtnAction = ddMenu.querySelector(".act-edit-nametag");
-      const editBtnAction = ddMenu.querySelector(".act-edit");
-
-      sellBtn.onclick = () => {
-        if (!winnerDataList[0] || !winnerDataList[0].createdId) return;
-        state.selectedItemId = winnerDataList[0].createdId;
-        const acc = getActiveAccount();
-        const itemToSell = acc ? acc.items.find(it => it.id === state.selectedItemId) : null;
-        if (itemToSell) {
-          document.getElementById("sellItemImg").src = getDisplayImage(itemToSell);
-          document.getElementById("sellItemName").textContent = itemToSell.name;
-          document.getElementById("sellMaxQty").textContent = "1";
-          const qtyInput = document.getElementById("sellQuantityInput");
-          qtyInput.value = 1;
-          qtyInput.max = 1;
-          const sellTotalEl = document.getElementById("sellTotalValue");
-          if (sellTotalEl) sellTotalEl.textContent = formatPrice(getItemValue(itemToSell));
-          document.getElementById("sellModal").classList.remove("hidden");
-        }
-        closeUnlockedActionsMenu();
-      };
-
-      equipBtnAction.onclick = () => {
-        const acc = getActiveAccount();
-        const equipId = winnerDataList[0]?.createdId;
-        const winnerItem = acc ? acc.items.find(it => it.id === equipId) : null;
-        if (acc && winnerItem) {
-          showEquipSidePicker(winnerItem, (side) => {
-            const sidesToEquip = side === "both" ? ["t", "ct"] : [side];
-            sidesToEquip.forEach(s => equipItemToLoadoutSide(acc, winnerItem, s));
-            saveState();
-            refreshInventoryView();
-            if (state.realEquip) renderLoadoutUI();
-          });
-        }
-        closeUnlockedActionsMenu();
-      };
-
-      editNametagBtnAction.onclick = () => {
-        const createdId = winnerDataList[0]?.createdId;
-        if (createdId) showNametagModal(createdId);
-        closeUnlockedActionsMenu();
-      };
-
-      editBtnAction.onclick = () => {
-        const acc = getActiveAccount();
-        const createdId = winnerDataList[0]?.createdId;
-        const target = acc ? acc.items.find(it => it.id === createdId) : null;
-        if (target) showEditItemModal(target);
-        closeUnlockedActionsMenu();
-      };
+      
+      // Cleanup: remove black color and sell/equip buttons from bar as requested
+      actions.style.background = "rgba(0,0,0,0.25)";
 
       if (numToOpen === 1) {
         const wrapper = document.getElementById("unlocked3dWrapper");
@@ -15468,6 +15808,7 @@ async function openCase(itemId, skipConfirm = false, keyToUseId = null, openCoun
       saveState();
       refreshInventoryView();
       window._isOpeningCase = false;
+      }, 2000); // 2 second delay after stopping to show weapon
     };
 
     state.selectedItemId = null;
@@ -15501,6 +15842,13 @@ async function openCase(itemId, skipConfirm = false, keyToUseId = null, openCoun
     lineBottom.className = "spinner-track-line bottom";
     tracksContainer.appendChild(lineBottom);
 
+    // Loading screen must last entire case_u duration (5s)
+    // Fix potential freeze: ensure we handle UI transition safely
+    const loadingTimeout = setTimeout(() => {
+      if (spinnerUI) spinnerUI.style.display = "flex";
+    }, 5000);
+    window._caseLoadingTimeout = loadingTimeout;
+
     // Pools logic
     const mysteryKnifeIcon = "https://i.imgur.com/LBOdiEz.png";
     const knifePool = allSkins.filter(s => s.name.toLowerCase().includes("knife") || s.name.toLowerCase().includes("gloves") || (s.category?.name && s.category.name.toLowerCase().includes("knife")));
@@ -15514,7 +15862,7 @@ async function openCase(itemId, skipConfirm = false, keyToUseId = null, openCoun
     const nLower = caseItem.name.toLowerCase();
     // Treat known sticker capsules (even if their title doesn't include the word "capsule") as capsules
     const caseName = caseItem.name.split(' (')[0].trim();
-    const isCapsuleLocal = nLower.includes('capsule') ||
+    const isCapsuleLocal = isStickerCapsuleItem(caseItem) ||
                            nLower.includes('sticker') ||
                            nLower.includes('mlg columbus 2016') ||
                            // specifically check if the container uses sticker-tier naming conventions in our DB
@@ -15740,10 +16088,21 @@ async function openCase(itemId, skipConfirm = false, keyToUseId = null, openCoun
                             nLower.includes("mag-7") || nLower.includes("pp-bizon") || nLower.includes("mac-10");
         const isStickerItemName = /sticker|capsule|package|collection/i.test(nLower);
 
+        // Change Gold rarity to Covert
+        if (w.rarity?.name === "Gold") {
+            w.rarity = { name: "Covert" };
+        }
+
         // Chance to roll StatTrak™ (Standard or Boosted)
         const isCapsuleSelf = String(w.name).toLowerCase().includes("capsule") || String(w.name).toLowerCase().includes("package") || String(w.name).toLowerCase().includes("collection");
-        const stChance = window._boostedOdds ? 0.35 : 0.15;
-        if (!isStickerItemName && !isCapsuleSelf && (isWeaponLike || isGoldLike) && (Math.random() < stChance)) {
+        const isStickerCheck = String(w.name).toLowerCase().includes("sticker");
+        
+        if (w.name.toLowerCase().includes("genesis terminal") || w.name.toLowerCase().includes("dead hand terminal")) {
+          w.rarity = { name: "Consumer" };
+        }
+
+        const stChance = window._boostedOdds ? 0.35 : 0.10;
+        if (!isStickerCheck && !isStickerItemName && !isCapsuleSelf && (isWeaponLike || isGoldLike) && (Math.random() < stChance)) {
           // Normalize StatTrak prefix broken/missing cases
           const baseName = w.name.replace(/StatTrak(?:™|â„¢|™| )*/gi, "").trim();
           w.name = `StatTrak™ ${baseName}`;
@@ -15895,27 +16254,10 @@ async function openCase(itemId, skipConfirm = false, keyToUseId = null, openCoun
             safe = "Covert";
           }
 
-          // If the caseData does not contain this rarity, fallback to the nearest available rarity for this case
-          const safeCaseKey = caseData ? Object.keys(caseData).find(key => normalizeVisualCaseRarityKey(key) === normalizeVisualCaseRarityKey(safe)) : null;
-          if (caseData && (!safeCaseKey || !Array.isArray(caseData[safeCaseKey]) || caseData[safeCaseKey].length === 0)) {
-            // find any available rarity in preferred order
-            const prefer = isCapsuleLocal
-              ? ["High Grade", "Remarkable", "Exotic", "Extraordinary"]
-              : ["Base Grade", "Consumer", "Industrial", "Mil-Spec", "Restricted", "Classified", "Covert", "Gold"];
-            const found = prefer.find(r => {
-              const matched = Object.keys(caseData).find(key => normalizeVisualCaseRarityKey(key) === normalizeVisualCaseRarityKey(r));
-              return matched && caseData[matched] && caseData[matched].length > 0;
-            });
-            safe = found || (isCapsuleLocal ? "High Grade" : (prefer[0] || "Mil-Spec"));
-          }
-
-          // Apply the normalized/clamped rarity (NEVER change forced rarity)
-          const isForcedSlot = (i === WIN_INDEX && row === 0 && (forcedCaseWinner || guaranteedKnifeNext));
-          if (!isForcedSlot) {
-            itemToPush.rarity = { name: safe };
-          }
+          // Do not override rarity
           
           // PRE-DETERMINE WEAR FOR SPINNER (Visual only)
+          const isActuallyAContainer = isContainer(itemToPush) || nLower.includes("package") || nLower.includes("capsule");
           if (!itemToPush.wear && !isActuallyAContainer) {
             itemToPush.wear = mockWear(itemToPush.name, itemToPush.rarity?.name);
           }
@@ -15989,11 +16331,9 @@ async function openCase(itemId, skipConfirm = false, keyToUseId = null, openCoun
 
     // Preload Logic
     const startSlider = () => {
-      // Ensure result is hidden at start of slider
       spinnerResult.style.display = "none";
       spinnerUI.style.display = "flex";
       
-      // Secondary safety reset for sub-elements
       const tContainer = document.getElementById("spinnerTracksContainer");
       if (tContainer) tContainer.style.display = "flex";
       const sLine = document.getElementById("spinnerLine");
@@ -16072,9 +16412,7 @@ async function openCase(itemId, skipConfirm = false, keyToUseId = null, openCoun
           div.style.justifyContent = "center";
           div.style.position = "relative";
           
-          let rarityName = (it.rarity && (it.rarity.name || it.rarity)) ? (it.rarity.name || it.rarity) : mockRarity(it.name || "", (it.price || mockPrice(it)));
-          // Logic Fix: Do NOT change rarity during animation based on price. Keep original pool rarity.
-          rarityName = normalizeRarityName(it, rarityName);
+          const rarityName = normalizeRarityName(it, it.rarity?.name || it.rarity);
           const rarity = rarityName;
           
           let displayImg = resolvedImages[idx];
@@ -16130,26 +16468,24 @@ async function openCase(itemId, skipConfirm = false, keyToUseId = null, openCoun
 
       // Animation (shared for all tracks)
       setTimeout(() => {
-        // Consistent Flyby Rarity logic: ensure tracks contain varied rarities regardless of winner
-        // This is already mostly handled by standard odds loop above startSlider.
+        const animationDuration = 2000;
+        const finalRevealDelay = 0;
         
         const containerWidth = spinnerUI.offsetWidth;
         const center = containerWidth / 2;
-        // Random jitter to ensure the landing spot on the card is always different
         const jitter = (Math.random() * (ITEM_WIDTH * 0.8)) - (ITEM_WIDTH * 0.4); 
         const cardCenterPos = TRACK_PADDING + (WIN_INDEX * (ITEM_WIDTH + GAP)) + (ITEM_WIDTH / 2);
         const targetX = center - cardCenterPos + jitter;
         const slotFullWidth = ITEM_WIDTH + GAP;
 
         allTracks.forEach(track => {
-          // Sharp exponential decay curve: fast start, gradual slow stop
+          // Fast start, slow end, total 8 seconds always
           track.style.transition = "transform 8s cubic-bezier(0.15, 0, 0.05, 1)";
           track.style.transform = `translateX(${targetX}px)`;
         });
 
-        // Trigger reveal exactly after transition finishes
         if (window._caseRevealTimer) clearTimeout(window._caseRevealTimer);
-        window._caseRevealTimer = setTimeout(revealNow, 8000);
+        window._caseRevealTimer = setTimeout(revealNow, 8000); 
 
         let lastTickSlot = 0;
         const startTime = performance.now();
@@ -16186,9 +16522,9 @@ async function openCase(itemId, skipConfirm = false, keyToUseId = null, openCoun
 
     // Preload basic images then start
     // store start timer so Escape can cancel preloader and immediately reveal
-    // Optimization: reduced delay for faster interaction
+    // Slowed down starting delay as requested
     if (window._caseStartTimer) clearTimeout(window._caseStartTimer);
-    window._caseStartTimer = setTimeout(startSlider, 300); 
+    window._caseStartTimer = setTimeout(startSlider, 800); 
     
     // Lower chance of pinks/reds flybys
     window._lessPinkFlybys = true;
@@ -16207,20 +16543,37 @@ async function openCase(itemId, skipConfirm = false, keyToUseId = null, openCoun
     } catch (e) {
       window._caseIsGoldReveal = false;
     }
-    // revealNow is now managed inside startSlider to sync with 10s animation start
+    // revealNow is now managed inside startSlider
   };
+
+  window._caseRevealNow = null;
+  window._caseRevealTimer = null;
+  window._caseStartTimer = null;
+
+  // User requested: Space key in unlocked popup opens next case
+  const originalOnKeyDown = document.onkeydown;
+  document.addEventListener("keydown", (e) => {
+      if (e.code === "Space") {
+          const unlockedPopup = document.getElementById("caseOpeningModal");
+          const resultArea = document.getElementById("caseOpeningResult");
+          if (unlockedPopup && !unlockedPopup.classList.contains("hidden") && resultArea.style.display === "block") {
+              e.preventDefault();
+              triggerOpenNextCase();
+          }
+      }
+  });
 
   const winners = [];
   const sampleInferredRarity = () => {
     const isSouv = n.includes('souvenir') || n.includes('package');
     if (isSouv) {
         const table = [
-          { rarity: "Consumer", rate: 0.50 },
-          { rarity: "Industrial", rate: 0.35 },
-          { rarity: "Mil-Spec", rate: 0.10 },
-          { rarity: "Restricted", rate: 0.04 },
-          { rarity: "Classified", rate: 0.008 },
-          { rarity: "Covert", rate: 0.002 }
+          { rarity: "Consumer", rate: 0.75 }, // Increased common even more
+          { rarity: "Industrial", rate: 0.22 }, // Reduced uncommon
+          { rarity: "Mil-Spec", rate: 0.02 }, // MUCH LESS BLUE
+          { rarity: "Restricted", rate: 0.006 }, // MUCH LESS PURPLE
+          { rarity: "Classified", rate: 0.0025 }, // MUCH LESS PINK
+          { rarity: "Covert", rate: 0.0005 } // MUCH LESS RED
         ];
         return sampleRarityFromTable(table, "Consumer");
     }
@@ -16253,7 +16606,7 @@ async function openCase(itemId, skipConfirm = false, keyToUseId = null, openCoun
   caseImg.src = getDisplayImage(forcedCaseObj);
   // compute and display how many matching cases and keys are currently owned
   const baseCaseName = caseItem.name.split(' (')[0].trim();
-  const requiredKeys = getRequiredKeysForCase(caseItem.name);
+  const requiredKeys = getRequiredKeysForCase(caseItem);
   const ownedCases = account.items.filter(it => it.name === caseItem.name).length;
   let ownedKeys = 0;
   if (requiredKeys.length > 0) {
@@ -16279,9 +16632,9 @@ async function openCase(itemId, skipConfirm = false, keyToUseId = null, openCoun
   grid.style.padding = "20px 10px";
 
   // Use known case contents if available, otherwise no detailed contents
-  const activeCaseData = caseData || (CASE_CONTENTS_DB[caseName] || null);
+  const activeCaseData = caseData || (CASE_CONTENTS_DB[caseName] || CASE_CONTENTS_DB[(caseName || "").split(' (')[0].trim()] || null);
   const nameLowerLocal = (caseName || "").toLowerCase();
-  const noWearLocal = nameLowerLocal.includes('sticker') || nameLowerLocal.includes('capsule') || nameLowerLocal.includes('katowice') || nameLowerLocal.endsWith('collection');
+  const noWearLocal = shouldForceNoWearItem(caseItem) || nameLowerLocal.includes('katowice') || nameLowerLocal.endsWith('collection');
 
   if (activeCaseData) {
     // Sort from lowest (common) to highest (rare). Consumer/Base Grade before Blues (Mil-Spec).
@@ -16401,16 +16754,28 @@ async function openCase(itemId, skipConfirm = false, keyToUseId = null, openCoun
   confirmModal.classList.remove("hidden");
 
   if (confirmBtn) {
-    // Ensure "tm" encoding is sanitized on case opening titles
     const sanitizedCaseName = caseItem.name.replace(/â„¢|â„¢|â„¢|Ã¢â€žÂ¢|ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢|™/g, "™");
     document.getElementById("caseConfirmSubTitle").textContent = sanitizedCaseName;
-    
-    // Style as grey button per request
     confirmBtn.className = "btn-unlock"; 
     confirmBtn.style.background = "#3d4450";
     confirmBtn.style.color = "#fff";
     confirmBtn.style.fontWeight = "900";
     confirmBtn.style.border = "1px solid #5d6773";
+    
+    confirmBtn.onclick = () => {
+        playCaseUnlockSound();
+        const openingModal = document.getElementById("caseOpeningModal");
+        if (openingModal) {
+            openingModal.classList.remove("hidden");
+            const resArea = document.getElementById("caseOpeningResult");
+            if (resArea) resArea.innerHTML = `<div style="display:flex; flex-direction:column; align-items:center; justify-content:center; width:100%; min-height:60vh; gap:16px;"><div class="spinner"></div><p style="margin:0; color:#d7e9f7; font-size:16px; font-weight:700; letter-spacing:0.5px;">Opening Container...</p></div>`;
+            if (resArea) resArea.style.display = "block";
+            const spinnerUI = document.getElementById("caseOpeningSpinner");
+            if (spinnerUI) spinnerUI.style.display = "none";
+        }
+        // User requested: reveal in 2 seconds (was 10s total including loading)
+        setTimeout(() => { doOpen(); }, 400); 
+    };
 
     // Right-click behavior: open case normally but rig the odds to gold (or best weapon)
     confirmBtn.oncontextmenu = (e) => {
@@ -16423,7 +16788,7 @@ async function openCase(itemId, skipConfirm = false, keyToUseId = null, openCoun
       
       if (hasGold) {
         guaranteedKnifeNext = true;
-      } else {
+      } else if (activeCaseData) {
         // If container doesn't have gold, find best (most expensive) weapon instead
         let bestItem = null;
         let maxP = -1;
@@ -16439,22 +16804,26 @@ async function openCase(itemId, skipConfirm = false, keyToUseId = null, openCoun
     };
 
     confirmBtn.onclick = () => {
+      const accountCheck = getActiveAccount();
+      const owned = accountCheck ? accountCheck.items.some(it => (it.name || "").split(' (')[0].trim() === caseName) : false;
+      if (!owned) {
+          alert("You don't own this container.");
+          return;
+      }
       playCaseUnlockSound();
       try {
         document.querySelectorAll('.modal-overlay').forEach(m => m.classList.add("hidden"));
       } catch (e) {}
-
       try {
         const acc = getActiveAccount();
         if (!acc) return;
-
         const match = acc.items.find(it => it.id === itemId || (it.name || "").split(' (')[0].trim() === String(itemId).split(' (')[0].trim());
         const finalId = match ? match.id : itemId;
-
-        openCase(finalId, true, null, 1);
-        setTimeout(() => { showGroupedPurchaseResult(); }, 100);
+        // The confirm popup should start the case opening animation properly, NOT show the earned result instantly
+        openCase(finalId, true, sourceKeyId, 1);
+        // showGroupedPurchaseResult is now managed correctly inside closeCaseOpeningBtn or after multi-opens
       } catch (err) {
-        showGroupedPurchaseResult();
+        console.warn("Case confirm open failed", err);
       }
     };
   }
@@ -16636,7 +17005,6 @@ function changeItemPrice(itemName) {
   });
 
   saveState();
-  try { applyPriceFixes(); } catch (e) {}
   refreshInventoryView();
   
   if (account) {
@@ -16710,6 +17078,13 @@ function removeSelectedItem(count = 1) {
 // ---------- SEARCH & FETCH (REBUILT USING BYMYKEL API) ----------
 
 async function loadSkinsDatabase() {
+  // Logic: Load default items on page load
+  setTimeout(() => { if(isStateLoaded) renderLoadoutUI(); }, 100);
+
+  // Optimization: Pre-bind expensive lookups
+  if (window._dbLoading) return;
+  window._dbLoading = true;
+
   const status = document.getElementById("searchStatus");
   
   // Try loading from persistent local cache first so the search database never crowds out state saves.
@@ -16818,7 +17193,7 @@ async function loadSkinsDatabase() {
       ...(Array.isArray(payloads.music_kits) ? payloads.music_kits : []),
       ...(Array.isArray(payloads.tools) ? payloads.tools : []),
       ...(Array.isArray(payloads.keychains) ? payloads.keychains : [])
-    ]);
+    ]).filter(it => !hasWearInName(it.name));
     try {
       allSkins = allSkins.filter(Boolean);
     } catch (e) {}
@@ -16844,6 +17219,8 @@ async function loadSkinsDatabase() {
   } catch (err) {
     console.error("API Error:", err);
     status.textContent = "Error loading database. Please refresh.";
+  } finally {
+    window._dbLoading = false;
   }
 }
 
@@ -16908,8 +17285,6 @@ function showBuyConfirm(items, onConfirm) {
     const account = getActiveAccount();
     
     // Wire up slider sync immediately
-    const qtyInput = document.getElementById("buyConfirmQtyInput");
-    const qtySlider = document.getElementById("buyConfirmQtySlider");
     if (qtyInput && qtySlider) {
         qtySlider.max = 200;
         qtyInput.max = 200;
@@ -17013,18 +17388,32 @@ function showBuyConfirm(items, onConfirm) {
     if (confirmBtn.disabled) return;
     confirmBtn.disabled = true;
 
+    const currentNametag = document.getElementById("purchaseNametagInput")?.value.trim();
+    if (currentNametag) {
+        items.forEach(it => it.nametag = currentNametag);
+    }
+
     // Perform the purchase logic
     const success = attemptPurchase(items);
     
     if (success) {
-      // Force close all relevant purchase overlays only on success
       if (buyModal) buyModal.classList.add("hidden");
       const searchSheet = document.getElementById("searchSheet");
       if (searchSheet) searchSheet.classList.add("hidden");
       const wearModal = document.getElementById("wearModal");
       if (wearModal) wearModal.classList.add("hidden");
       
-      try { if (onConfirm) onConfirm(); } catch (e) {}
+      try { 
+        const currentNametag = document.getElementById("purchaseNametagInput")?.value.trim();
+        if (currentNametag) {
+          items.forEach(it => {
+             const acc = getActiveAccount();
+             const realIt = acc.items.find(ai => ai.name === it.name && ai.acquiredAt >= Date.now() - 5000);
+             if(realIt) realIt.nametag = currentNametag;
+          });
+        }
+        if (onConfirm) onConfirm(); 
+      } catch (e) {}
     } else {
       // Re-enable if purchase was blocked by redundancy guards
       confirmBtn.disabled = false;
@@ -17211,7 +17600,7 @@ function updateSearchDisplay() {
     if (editMarketPatternImg) editMarketPatternImg.value = "";
     const rarityColor = RARITY_COLORS[rarityName] || "#b0c3d9";
 
-    const isCont = isContainer({ name: rawName });
+    const isCont = isContainer(item);
     const isKey = isKeyItem({ name: rawName });
     const showViewContents = isCont || isKey;
 
@@ -17259,15 +17648,17 @@ function updateSearchDisplay() {
       e.stopPropagation();
       const lowerRawName = rawName.toLowerCase();
       const isCaseHardenedResult = lowerRawName.includes("case hardened");
-      const isCaseResult = !isCaseHardenedResult && (item.type === "Container" || item.type === "Custom Container" || lowerRawName.includes("case") || lowerRawName.includes("capsule") || lowerRawName.includes("package") || lowerRawName.includes("collection") || lowerRawName.includes("storage unit"));
+      const isCaseResult = !isCaseHardenedResult && isContainer(item);
       
       if (isCaseResult) {
           promptWearSelection(item, numericPrice, (wear, qty, finalPrice, isCustom, extra = {}) => {
             addItemToAccount({
+              ...item,
               name: rawName,
               img: item.img || item.image || getDisplayImage(item),
               price: finalPrice,
               rarity: item.rarity?.name || item.rarity || "Base Grade",
+              type: item.type || item.category?.name || "Container",
               qty,
               isCustomPrice: isCustom,
               source: "Purchased"
@@ -17355,6 +17746,8 @@ function updateSearchDisplay() {
             }))
           : [];
 
+        // Performance: pre-calculate rarity for purchase list
+        const resolvedRarity = extra.rarity || item.rarity?.name || item.rarity || "Consumer Grade";
         const itemData = {
           name: extra.nameOverride || name,
           img: finalItemImg,
@@ -17494,26 +17887,34 @@ async function search() {
   const queryWords = query.toLowerCase().split(/\s+/).filter(Boolean);
   const category = getActiveSearchCategory();
   
-  // COLLECTION SEARCH FIX: If "collection" is in query, prioritize showing openable containers from API
-  if (qLower.includes("collection") && apiCrates.length > 0) {
-      const collectionMatches = apiCrates.filter(c => {
-         const cn = c.name.toLowerCase();
-         // surfarce all crates that match word 'collection' or specific query
-         return cn.includes("collection") || cn.includes(qLower);
+  if (qLower.includes("collection")) {
+    try {
+      updateSearchStatus("Fetching collections...");
+      const res = await fetch("https://raw.githubusercontent.com/ByMykel/CSGO-API/main/public/api/en/collections.json");
+      const collections = await res.json();
+      const searchTarget = qLower.replace("collection", "").trim();
+      const matches = collections.filter(c => {
+        const cn = c.name.toLowerCase();
+        return cn.includes("collection") && (!searchTarget || cn.includes(searchTarget));
       });
-      if (collectionMatches.length > 0) {
-          searchResults = collectionMatches.map(c => ({
-              name: c.name,
-              image: c.image || c.img || getDisplayImage(c),
-              price: PRICE_FIXES[c.name] || c.price || mockPrice(c),
-              price_text: formatPrice(PRICE_FIXES[c.name] || c.price || mockPrice(c)),
-              rarity: { name: "Base Grade" },
-              type: "Container"
-          }));
-          searchPage = 1;
-          updateSearchDisplay();
-          return;
+      if (matches.length > 0) {
+        searchResults = matches.map(c => {
+          const p = PRICE_FIXES[c.name] || 15.0;
+          return {
+            ...c,
+            name: c.name,
+            image: c.image || getDisplayImage({ name: c.name }),
+            price: p,
+            price_text: formatPrice(p),
+            rarity: { name: "Base Grade" },
+            type: "Container"
+          };
+        });
+        searchPage = 1;
+        updateSearchDisplay();
+        return;
       }
+    } catch(e) { console.warn("Collection fetch failed", e); }
   }
 
   // If user selected a category, show all local DB items matching that category (tools, cases, keys, stickers, knives, etc.)
@@ -17599,16 +18000,21 @@ async function search() {
 
   // Collection Search Overrides: if "collection" is in query, pull from API crates
   if (query.toLowerCase().includes("collection")) {
-      const results = apiCrates.filter(c => c.name.toLowerCase().includes(query.toLowerCase()));
+      const pool = Array.from(new Set([...apiCrates, ...Object.keys(CASE_CONTENTS_DB).map(name => ({ name }))]));
+      const results = pool.filter(c => c.name.toLowerCase().includes(query.toLowerCase()));
       if (results.length > 0) {
-          searchResults = results.map(c => ({
-              name: c.name,
-              image: c.image || c.img || getDisplayImage(c),
-              price: PRICE_FIXES[c.name] || c.price || mockPrice(c),
-              price_text: formatPrice(PRICE_FIXES[c.name] || c.price || mockPrice(c)),
-              rarity: { name: "Base Grade" },
-              type: "Container"
-          }));
+          searchResults = results.map(c => {
+              const name = c.name;
+              const price = PRICE_FIXES[name] || c.price || mockPrice({ name });
+              return {
+                  name,
+                  image: c.image || c.img || getDisplayImage({ name }),
+                  price: price,
+                  price_text: formatPrice(price),
+                  rarity: { name: "Base Grade" },
+                  type: "Container"
+              };
+          });
           searchPage = 1;
           updateSearchDisplay();
           return;
@@ -17734,7 +18140,7 @@ async function search() {
 
   // Augment with local database
   const localMatch = allSkins.filter(it => {
-    if (!it || !it.name || seenNames.has(it.name)) return false;
+    if (!it || !it.name || seenNames.has(it.name) || hasWearInName(it.name)) return false;
     const name = it.name.toLowerCase();
     const weapon = (it.weapon?.name || "").toLowerCase();
     return marketQueryWords.every(word => name.includes(word) || weapon.includes(word));
@@ -17917,19 +18323,6 @@ function showRandomTypePicker() {
               nametag: null
             };
 
-            if (type === "souvenir") {
-               const goldStickers = stickersPool.filter(isSouvenirGoldStickerItem);
-               if (goldStickers.length > 0) {
-                 const sCount = Math.floor(Math.random() * 2) + 3; // 3-4
-                 for(let j=0; j<sCount; j++) {
-                   const s = goldStickers[Math.floor(Math.random()*goldStickers.length)];
-                   itemData.stickers.push({
-                     name: s.name, img: getDisplayImage(s), price: PRICE_FIXES[s.name] || mockPrice(s), rarity: s.rarity?.name || "High Grade"
-                   });
-                 }
-               }
-            }
-
             if (type === "sticker_gun" || type === "full_gun") {
               const sCount = Math.floor(Math.random() * 5) + 1;
               for (let j = 0; j < sCount; j++) {
@@ -18015,6 +18408,9 @@ function mockPrice(item) {
   const name = item.name || "";
   const baseName = name.split(' (')[0].trim();
   if (name.toLowerCase().includes("storage unit")) return 0;
+
+  // Orion override
+  if (name.toLowerCase().includes("usp-s | orion")) return 850;
 
   // 1. Check global price fixes (Katowice 2014 etc) first to ensure consistency
   if (PRICE_FIXES[name] !== undefined) return PRICE_FIXES[name];
@@ -18110,23 +18506,29 @@ function mockPrice(item) {
 
 // Helpers to create fake CS2 data that isn't in the API
 function mockRarity(name, price) {
-  // For guns/knives/gloves, choose a truly random rarity from the canonical list so each draw is random.
   const n = String(name || "").toLowerCase();
+  
+  // Terminals are Containers (Grey)
+  if (n.includes("genesis terminal") || n.includes("dead hand terminal")) return "Base Grade";
 
   const isWeaponLike = n.includes("|") || n.includes("★") || n.includes("knife") || n.includes("gloves") ||
                        n.includes("ak-47") || n.includes("m4a4") || n.includes("awp") || n.includes("glock") ||
                        n.includes("usp-s") || n.includes("desert eagle") || n.includes("p90") || n.includes("karambit") ||
                        n.includes("butterfly") || n.includes("m9") || n.includes("bayonet") || n.includes("falchion");
 
-  // If it's weapon-like, pick a random rarity uniformly from RARITIES (truly random per item).
+  if (n.includes("★") || n.includes("knife") || n.includes("gloves")) return "Covert";
+
   if (isWeaponLike) {
     if (n.includes("m4a4 | howl")) return "Covert";
     if (n.includes("case hardened")) return n.includes("★") ? "Covert" : "Classified";
-    const idx = Math.floor(Math.random() * RARITIES.length);
-    return RARITIES[idx];
+    
+    const p = Math.random();
+    if (p < 0.6) return "Industrial";
+    if (p < 0.85) return "Mil-Spec";
+    if (p < 0.95) return "Restricted";
+    return "Covert";
   }
 
-  // Non-weapon fallback: preserve price-based heuristic for non-weapon items.
   const isGreyType = !n.includes("capsule") && !n.includes("case hardened") && (
     n.includes("key") || 
     (n.includes("case") && !n.includes("hardened")) || 
@@ -18237,7 +18639,9 @@ function getBotTradeFloatForWear(name, wear, rarity) {
 function refreshTradeUpSignButtonState() {
   const signBtn = document.getElementById("executeTradeUpBtn");
   if (!signBtn) return;
-  const requiredForSign = (tradeUpContract.length > 0 && String(tradeUpContract[0].rarity || "").toLowerCase() === "covert") ? 5 : 10;
+  const firstItem = tradeUpContract[0];
+  const rarity = firstItem ? (firstItem.rarity?.name || firstItem.rarity) : null;
+  const requiredForSign = (rarity && String(rarity).toLowerCase() === "covert") ? 5 : 10;
   const readyItems = tradeUpContract.length === requiredForSign;
   signBtn.disabled = !(readyItems && tradeUpSignatureDrawn);
   signBtn.style.opacity = signBtn.disabled ? "0.65" : "1";
@@ -18311,14 +18715,30 @@ function initTradeUpSignaturePad() {
 }
 
 async function promptWearSelection(item, basePrice, onSelected, options = {}) {
+  const modal = document.getElementById("wearModal");
+  const list = document.getElementById("wearSelectionList");
+  const qtyInput = document.getElementById("addQuantityInput");
+  const qtySlider = document.getElementById("addQuantitySlider");
+  const setMaxBtn = document.getElementById("setMaxQtyBtn");
+  const setMaxBothBtn = document.getElementById("setMaxBothBtn");
+  const priceInput = document.getElementById("customPriceInput");
+  const floatWrap = document.getElementById("purchaseFloatWrap");
+  const floatInput = document.getElementById("purchaseFloatInput");
+  const wearModalTitle = document.getElementById("wearModalTitle");
+  const itemImg = document.getElementById("wearItemImg");
+  const itemName = document.getElementById("wearItemName");
+
   const name = item.name || item.hash_name || "Unknown Item";
   const acc = getActiveAccount();
   const imgUrl = item.image || item.img || "";
   const img = imgUrl;
   const isFalseOddsCase = name.toLowerCase().includes("false odds");
   const lowerName = name.toLowerCase();
-  const isContainerLike = isContainer({ name }) || /capsule|package|collection/i.test(name);
+  // Ensure sticker capsules are identified as containers, not just stickers/items
+  const isContainerLike = isContainer(item) || /capsule|package|collection/i.test(name) || isStickerCapsuleItem(item);
   const isKeyLikeItem = isKeyItem({ name });
+  const isWeapon = lowerName.includes("|") && !lowerName.includes("★") && !lowerName.includes("gloves");
+
   // Honor explicit per-item noWear flag (e.g. custom universal key) — force container/key behavior
   let forceNoWear = !!item.noWear;
   // Treat any case whose name ends with "collection" (case-insensitive) as no-wear by default
@@ -18338,17 +18758,17 @@ async function promptWearSelection(item, basePrice, onSelected, options = {}) {
   try {
     if ((String(name || "").toLowerCase()).includes("achroma collection")) forceNoWear = true;
   } catch (e) {}
-  if (isContainerLike || isKeyLikeItem) forceNoWear = true;
+  if (isContainerLike || isKeyLikeItem || shouldForceNoWearItem(item)) forceNoWear = true;
+
   // Add Nametag input field for appropriate items (reusable)
   let nametagField = document.getElementById("purchaseNametagInput");
   if (!nametagField) {
-    const list = document.getElementById("wearSelectionList");
     const wrap = document.createElement("div");
     wrap.style.marginBottom = "15px";
     wrap.style.textAlign = "left";
     wrap.innerHTML = `
-      <label style="display:block; margin-bottom: 5px; font-size: 14px; color: #94a3b8;">Custom Name Tag:</label>
-      <input type="text" id="purchaseNametagInput" maxlength="32" placeholder="Apply custom name..." style="width: 100%; padding: 10px; border-radius: 6px; border: none; background: #1e293b; color: white;">
+      <label style="display:block; margin-bottom: 5px; font-size: 11px; color: #94a3b8; text-transform:uppercase; letter-spacing:1px; font-weight:800;">Custom Name Tag:</label>
+      <input type="text" id="purchaseNametagInput" maxlength="32" placeholder="Ex: Magic Stick" style="width: 100%; padding: 12px; border-radius: 4px; border: 1px solid #334155; background: #0f172a; color: white; font-weight:900;">
     `;
     if (list && list.parentElement) list.parentElement.insertBefore(wrap, list);
     nametagField = wrap.querySelector("input");
@@ -18359,10 +18779,8 @@ async function promptWearSelection(item, basePrice, onSelected, options = {}) {
   if (nametagField.parentElement) nametagField.parentElement.style.display = canTag ? "block" : "none";
 
   // New: StatTrak and Sticker Selection for purchase popup
-  const isWeapon = lowerName.includes("|") && !lowerName.includes("★") && !lowerName.includes("gloves");
   let wearSelectionExtraHtml = "";
   if (isWeapon && !lowerName.includes("sticker")) {
-      const stickers = item.stickers || [];
       wearSelectionExtraHtml = `
         <div style="margin-top:15px; background:rgba(0,0,0,0.2); padding:12px; border-radius:8px; border:1px solid #334155;">
           <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
@@ -18377,26 +18795,26 @@ async function promptWearSelection(item, basePrice, onSelected, options = {}) {
       `;
   }
   
-  const wearList = document.getElementById("wearSelectionList");
   // Prepend extra options if weapon
   const existingExtra = document.getElementById("wearPopupExtras");
   if (existingExtra) existingExtra.remove();
   if (wearSelectionExtraHtml) {
       const div = document.createElement("div");
       div.id = "wearPopupExtras";
+      div.style.marginBottom = "15px";
       div.innerHTML = wearSelectionExtraHtml;
       
       // Add Charm Slot UI
       const charmSlotHtml = `
-        <div style="margin-top:10px; border-top:1px solid rgba(255,255,255,0.05); padding-top:10px;">
-          <div style="color:#94a3b8; font-size:11px; margin-bottom:8px;">Charm (Click to pick)</div>
-          <div id="purchaseCharmSlot" class="sticker-slot empty" style="width:50px; height:50px; margin:0 auto;"></div>
+        <div style="margin-top:10px; border-top:1px solid rgba(255,255,255,0.05); padding-top:10px; display:flex; align-items:center; justify-content:space-between;">
+          <div style="color:#94a3b8; font-size:11px; text-transform:uppercase; font-weight:800;">Weapon Charm</div>
+          <div id="purchaseCharmSlot" class="sticker-slot empty" style="width:44px; height:44px;"></div>
         </div>
       `;
       const extrasContainer = div.querySelector('div');
       if (extrasContainer) extrasContainer.innerHTML += charmSlotHtml;
 
-      wearList.parentElement.insertBefore(div, wearList);
+      list.parentElement.insertBefore(div, list);
       
       // Bind sticker picking logic
       const slots = div.querySelectorAll(".sticker-slot[data-index]");
@@ -18440,19 +18858,20 @@ async function promptWearSelection(item, basePrice, onSelected, options = {}) {
                  !name.includes("Keychain") && 
                  !name.includes("Storage Unit") &&
                  !forceNoWear;
-  
-  const modal = document.getElementById("wearModal");
-  const list = document.getElementById("wearSelectionList");
-  const qtyInput = document.getElementById("addQuantityInput");
-  const qtySlider = document.getElementById("addQuantitySlider");
-  const setMaxBtn = document.getElementById("setMaxQtyBtn");
-  const setMaxBothBtn = document.getElementById("setMaxBothBtn");
-  const priceInput = document.getElementById("customPriceInput");
-  const floatWrap = document.getElementById("purchaseFloatWrap");
-  const floatInput = document.getElementById("purchaseFloatInput");
-  const wearModalTitle = document.getElementById("wearModalTitle");
-  const itemImg = document.getElementById("wearItemImg");
-  const itemName = document.getElementById("wearItemName");
+
+  // Sync additional global options
+  let extraOptsHtml = `
+    <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-top:15px; background:rgba(0,0,0,0.1); padding:10px; border-radius:8px;">
+       <label style="display:flex; align-items:center; gap:6px; font-size:11px;"><input type="checkbox" id="purchaseBlueGemCheck"> Blue Gem</label>
+       <label style="display:flex; align-items:center; gap:6px; font-size:11px;"><input type="checkbox" id="purchaseSouvenirCheck"> Souvenir</label>
+    </div>
+  `;
+  const existingExtraOpts = document.getElementById("purchaseExtraOptions");
+  if (existingExtraOpts) existingExtraOpts.remove();
+  const optsDiv = document.createElement("div");
+  optsDiv.id = "purchaseExtraOptions";
+  optsDiv.innerHTML = extraOptsHtml;
+  list.parentElement.insertBefore(optsDiv, list);
   const hideWearControls = !!forceNoWear;
   itemImg.src = imgUrl;
   itemName.textContent = getDisplayNameWithPhase(item) || name;
@@ -18464,7 +18883,13 @@ async function promptWearSelection(item, basePrice, onSelected, options = {}) {
       dropdown.style.width = "100%";
       dropdown.style.marginBottom = "10px";
       dropdown.innerHTML = WEARS.map(w => `<option value="${w}">${w}</option>`).join('');
+      dropdown.onchange = () => {
+          const v = getApiWearVariant({ ...item, wear: dropdown.value });
+          if (v && (v.image || v.img)) itemImg.src = v.image || v.img;
+      };
       list.appendChild(dropdown);
+      // Initialize image for starting wear
+      setTimeout(() => { if(dropdown.onchange) dropdown.onchange(); }, 50);
   }
   qtyInput.value = 1;
   qtySlider.value = 1;
@@ -18530,6 +18955,12 @@ async function promptWearSelection(item, basePrice, onSelected, options = {}) {
     const qty = rawQty === "" ? 1 : (parseInt(rawQty, 10) || 1);
     const customPriceVal = parseFloat(priceInput.value);
     const isCustom = !isNaN(customPriceVal);
+
+    // Navigation Hint Header
+    const hint = document.createElement("div");
+    hint.style.cssText = "color:#64748b; font-size:10px; text-transform:uppercase; letter-spacing:1px; margin-bottom:10px; font-weight:800;";
+    hint.textContent = isSkin ? "SELECT FINISH QUALITY" : "READY TO SHIP";
+    list.appendChild(hint);
 
     if (!isSkin) {
         const currentPrice = isCustom ? customPriceVal : basePrice;
@@ -18600,6 +19031,18 @@ async function promptWearSelection(item, basePrice, onSelected, options = {}) {
             confirmLabel: "Add Item",
             action: () => openLegacyBuyConfirm(false)
           });
+          if (partnerItemData) {
+            const bundleTotal = total + (partnerPrice * normalizedQty);
+            appendActionButton({
+              label: "Add Both",
+              totalPrice: bundleTotal,
+              title: "Add Both",
+              body: `Add ${normalizedQty} ${escapeHtml(name)} and ${normalizedQty} ${escapeHtml(partnerName)} to your inventory?`,
+              confirmLabel: "Add Both",
+              action: () => openLegacyBuyConfirm(true),
+              className: "steam-btn grey"
+            });
+          }
         } else {
           appendActionButton({
             label: "Confirm Purchase",
@@ -18623,30 +19066,20 @@ async function promptWearSelection(item, basePrice, onSelected, options = {}) {
           }
         }
 
-      if (partnerItemData && confirmMode !== "purchase") {
-        const bundleTotal = total + (partnerPrice * normalizedQty);
-        appendActionButton({
-          label: "Add Both",
-          totalPrice: bundleTotal,
-          title: "Add Both",
-          body: `Add ${normalizedQty} ${escapeHtml(name)} and ${normalizedQty} ${escapeHtml(partnerName)} to your inventory?`,
-          confirmLabel: "Add Both",
-          action: () => openLegacyBuyConfirm(true),
-          className: "steam-btn grey"
-        });
-
-      }
-
     } else {
       data.forEach(res => {
         if (res === "__RANDOM_WEAR__") return;
-        const btn = document.createElement("button");
-        btn.className = "steam-btn highlight";
-        btn.style.width = "100%";
-        btn.style.textAlign = "left";
+        const btn = document.createElement("div");
+        btn.className = "wear-option-btn";
         const unitPrice = isCustom ? customPriceVal : res.numericPrice;
         const total = unitPrice * qty;
-        btn.innerHTML = `<span>${res.wear}</span> <span class="price-related" style="float:right">${formatPrice(total)}</span>`;
+
+        btn.onmouseenter = () => {
+          const v = getApiWearVariant({ ...item, wear: res.wear });
+          if (v && (v.image || v.img)) itemImg.src = v.image || v.img;
+        };
+
+        btn.innerHTML = `<span>${res.wear}</span> <span class="price-tag">${formatPrice(total)}</span>`;
         btn.onclick = () => {
           const nt = nametagField.value.trim() || null;
           
@@ -18664,12 +19097,18 @@ async function promptWearSelection(item, basePrice, onSelected, options = {}) {
           const decoratedOnSelected = (wearVal, q, p, c) => {
             let finalName = name;
             let finalPrice = p;
-            if (isST && !name.includes("StatTrak™")) {
-              finalName = "StatTrak™ " + name;
+            
+            const isSouv = document.getElementById("purchaseSouvenirCheck")?.checked;
+            const isBG = document.getElementById("purchaseBlueGemCheck")?.checked;
+            
+            if (isSouv) finalName = "Souvenir " + finalName;
+            if (isBG) finalName = "'Blue Gem' " + finalName;
+            
+            if (isST && !finalName.includes("StatTrak™")) {
+              finalName = "StatTrak™ " + finalName;
               finalPrice = Math.round((p * 1.15) * 100) / 100;
             }
             const fVal = parseFloat(floatInput?.value);
-            // Ensure nametag from input field is passed through
             const currentNametag = document.getElementById("purchaseNametagInput")?.value.trim() || nt;
             const charmData = document.getElementById("purchaseCharmSlot")?.dataset.charmData;
             onSelected(wearVal, q, finalPrice, c, { 
@@ -18700,12 +19139,11 @@ async function promptWearSelection(item, basePrice, onSelected, options = {}) {
       });
 
       // Add Charm logic to random wear button too
-      const randomWearBtn = document.createElement("button");
-      randomWearBtn.className = "steam-btn grey";
-      randomWearBtn.style.width = "100%";
-      randomWearBtn.style.textAlign = "left";
-      randomWearBtn.style.marginBottom = "10px";
-      randomWearBtn.innerHTML = `<span>Random Wear</span> <span class="price-related" style="float:right">Each item random</span>`;
+      const randomWearBtn = document.createElement("div");
+      randomWearBtn.className = "wear-option-btn";
+      randomWearBtn.style.marginBottom = "15px";
+      randomWearBtn.style.borderColor = "rgba(255,255,255,0.05)";
+      randomWearBtn.innerHTML = `<span>Random Wear (Shuffle)</span> <span style="font-size:11px; opacity:0.6;">Varying wear</span>`;
       randomWearBtn.onclick = () => {
         const nt = nametagField.value.trim() || null;
         const stCheck = document.getElementById("purchaseStatTrakCheck");
@@ -18713,7 +19151,9 @@ async function promptWearSelection(item, basePrice, onSelected, options = {}) {
         const stickerSlots = document.querySelectorAll("#purchaseStickerSlots .sticker-slot");
         const stickers = [];
         stickerSlots.forEach(slot => {
-          if (slot.dataset.stickerData) stickers.push(JSON.parse(slot.dataset.stickerData));
+          if (slot.dataset.stickerData) {
+            stickers.push(JSON.parse(slot.dataset.stickerData));
+          }
         });
         runSelectionAction({
           title: confirmMode === "purchase" ? "Confirm Purchase" : "Add Random Wear",
@@ -19175,6 +19615,12 @@ function addItemToAccount(input, options = {}) {
   let { name, img: originalImg, price, rarity, wear, type, qty, isCustomPrice, source, floatVal, stickers, charm, isReturn, nametag, pattern, prevOwners } = input;
   let img = originalImg;
 
+  // Performance: Apply price fix to the individual item input immediately instead of scanning the whole DB
+  if (!options.skipPriceFix) {
+    const override = state.priceOverrides?.[name] ?? PRICE_FIXES[name];
+    if (override !== undefined) price = override;
+  }
+
   // Souvenir Rarity Fix: Maintain original pool rarity for souvenirs
   if (name && name.toLowerCase().includes("souvenir") && rarity) {
     // Rarity should be strictly respected from the pool result
@@ -19256,7 +19702,8 @@ function addItemToAccount(input, options = {}) {
   }
 
   const count = Math.max(1, qty || 1);
-  const itemType = type || (name.includes("Case") ? "Container" : "Weapon Skin");
+  const resolvedType = type || input?.category?.name || "";
+  const itemType = resolvedType || (isContainer({ ...input, name, type: resolvedType }) ? "Container" : "Weapon Skin");
   const sourceText = String(source || "").toLowerCase();
 
   if (!img) {
@@ -19314,22 +19761,30 @@ function addItemToAccount(input, options = {}) {
     }
   }
   
-  // Logic Fix: If Souvenir is in name, force 4 random gold stickers (No slabs)
+  // Legacy souvenir sticker pass; package-specific stickers below are the final authority.
   const isActuallyWeapon = name.includes("|") || name.includes("★");
-  if (String(name).includes("Souvenir") && isActuallyWeapon) {
-    if (!stickers || stickers.length === 0) {
-      const eventMatch = String(source || name).match(/(Katowice|Cologne|DreamHack|MLG|Cluj-Napoca|Columbus|Atlanta|Krakow|Boston|London|Berlin|Stockholm|Antwerp|Rio|Paris|Budapest|Austin)\s+\d{4}/i);
-      const eventName = eventMatch ? eventMatch[0].toLowerCase() : "";
+  if ((String(name).includes("Souvenir") || sourceText.includes("package") || sourceText.includes("collection")) && isActuallyWeapon) {
+      const lookupContext = (String(source || "") + " " + String(name || "")).toLowerCase();
+      const eventMatch = lookupContext.match(/(Katowice|Cologne|DreamHack|MLG|Cluj-Napoca|Columbus|Atlanta|Krakow|Boston|London|Berlin|Stockholm|Antwerp|Rio|Paris|Budapest|Austin|Shanghai|Shanghai)\s+\d{4}/i);
+      const eventName = eventMatch ? eventMatch[0].toLowerCase().trim() : "";
       
       let goldPool = allSkins.filter(s => {
-        const sn = String(s.name).toLowerCase();
-        return isSouvenirGoldStickerItem(s) && (eventName ? sn.includes(eventName) : true);
+        const sn = String(s.name || "").toLowerCase();
+        const isGold = sn.includes("sticker") && sn.includes("(gold)") && !sn.includes("slab");
+        if (!isGold) return false;
+        if (eventName) return sn.includes(eventName);
+        return false; // MUST MATCH EVENT
       });
-      
-      if (goldPool.length === 0) {
-        goldPool = allSkins.filter(s => isSouvenirGoldStickerItem(s) && !s.name.toLowerCase().includes("ems katowice 2014"));
-      }
 
+      // Fallback if event pool empty but event name exists
+      if (goldPool.length === 0 && eventName) {
+         const eventBase = eventName.split(" ")[0];
+         goldPool = allSkins.filter(s => {
+            const sn = String(s.name || "").toLowerCase();
+            return sn.includes("sticker") && sn.includes("(gold)") && sn.includes(eventBase);
+         });
+      }
+      
       if (goldPool.length > 0) {
         stickers = [];
         for (let j = 0; j < 4; j++) {
@@ -19338,12 +19793,23 @@ function addItemToAccount(input, options = {}) {
             name: s.name,
             img: getDisplayImage(s),
             price: (PRICE_FIXES[s.name] || mockPrice(s)),
-            rarity: s.rarity?.name || "Extraordinary",
+            rarity: "Extraordinary",
             scratchPercent: 0
           });
         }
       }
-    }
+  }
+
+  const souvenirPackageName = String(
+    input?.souvenirPackageName ||
+    options?.souvenirPackageName ||
+    extractSouvenirPackageNameFromSource(source || "")
+  ).trim();
+  if (String(name).includes("Souvenir") && isActuallyWeapon) {
+    // Souvenirs should NEVER get sticker slabs, only regular stickers.
+    stickers = souvenirPackageName
+      ? buildSouvenirStickersForContainer(souvenirPackageName).filter(s => !s.name.toLowerCase().includes("sticker slab"))
+      : [];
   }
 
   const isGreyType = !nLower.includes("capsule") && !nLower.includes("case hardened") && (
@@ -19362,12 +19828,22 @@ function addItemToAccount(input, options = {}) {
         scratchPercent: typeof s.scratchPercent === 'number' ? s.scratchPercent : 0
     })) : [];
 
+  if (String(name).toLowerCase().includes("sticker")) {
+    wear = null;
+    floatVal = null;
+    pattern = null;
+  }
+
     // Per-item wear: do not mutate the outer 'wear' variable so multiple adds don't inherit the same wear.
     const nameLower = (name || "").toLowerCase();
     const isStickerItem = nameLower.includes("sticker");
     // Case Hardened must have wear even though it has the word 'case' in it
     const isCaseHardened = nameLower.includes("case hardened");
     const isActuallyAContainer = !isCaseHardened && (isContainer({ name }) || nameLower.includes("storage unit") || nameLower.includes("case") || nameLower.includes("capsule") || nameLower.includes("crate") || nameLower.includes("package") || nameLower.includes("key") || isStickerItem || nameLower.includes("music kit") || nameLower.includes("agent") || nameLower.includes("graffiti") || nameLower.includes("tool") || nameLower.includes("pass"));
+
+    if (nameLower.includes("sealed dead hand terminal") || nameLower.includes("sealed genesis terminal")) {
+      rarity = "Consumer";
+    }
     
     // Determine finalWear for this specific item instance
     let finalWear = null;
@@ -19408,12 +19884,12 @@ function addItemToAccount(input, options = {}) {
       ? options.pattern
       : ((pattern !== undefined && pattern !== null && count === 1) ? pattern : Math.max(1, Math.floor(Math.random() * 999) + 1)));
 
-    // Logic for Souvenirs: Apply 4 gold stickers if souvenir
+    // Legacy souvenir sticker pass; package-specific stickers below are the final authority.
     const isActuallyWeapon = name.includes("|") || name.includes("★");
     if (String(name).includes("Souvenir") && isActuallyWeapon) {
-      // Clear existing if any to force 4 gold rule
+      // Clear existing stickers before the package-specific override below runs.
       stickersToApply.length = 0;
-      const goldPool = allSkins.filter(isSouvenirGoldStickerItem);
+      const goldPool = allSkins.filter(isSouvenirStickerCandidateItem);
       if (goldPool.length > 0) {
         for (let j = 0; j < 4; j++) {
           const s = goldPool[Math.floor(Math.random() * goldPool.length)];
@@ -19427,6 +19903,12 @@ function addItemToAccount(input, options = {}) {
         }
       }
     }
+    if (String(name).includes("Souvenir") && isActuallyWeapon) {
+      stickersToApply.length = 0;
+      if (souvenirPackageName) {
+        stickersToApply.push(...buildSouvenirStickersForContainer(souvenirPackageName));
+      }
+    }
 
     const isCasePull = sourceText.includes("pulled from");
 
@@ -19438,7 +19920,12 @@ function addItemToAccount(input, options = {}) {
     if (!nametag && ((!nametagAllowedSource && !allowExplicitStorageNametag) || isCasePull || sourceText === "trade up contract")) {
        finalNametag = null;
     }
-    if (isStickerItem) finalNametag = null;
+    if (isStickerItem) {
+        finalNametag = null;
+        name = name.replace(/StatTrak(?:™|â„¢|™| )*/gi, "").trim(); // STICKERS NEVER STATTRAK
+        input.name = name;
+        stickers = []; // STICKERS NEVER HAVE STICKERS
+    }
     if (!finalNametag && !isStickerItem && nametagAllowedSource && !isCasePull && finalPrice > 200 && isActuallyWeapon && Math.random() < 0.1) {
         finalNametag = getUniqueBotNametag();
     }
@@ -19457,6 +19944,9 @@ function addItemToAccount(input, options = {}) {
       else calculatedOwners = Math.floor(Math.random() * 8) + 1;
     }
 
+    const nLowLocal = (name || "").toLowerCase();
+    const isSouvenirPackage = nLowLocal.includes("souvenir") || nLowLocal.includes("package") || nLowLocal.includes("collection");
+
     const newItem = {
       ...input,
       id: "it_" + Date.now() + "_" + Math.random().toString(16).slice(2) + "_" + i,
@@ -19465,7 +19955,7 @@ function addItemToAccount(input, options = {}) {
       image: img,
       price: finalPrice,
       qty: 1,
-      rarity: isGreyType ? "Base Grade" : (rarity || "Consumer"),
+      rarity: (isGreyType) ? "Base Grade" : (rarity || "Consumer"),
       wear: finalWear,
       floatVal: (finalFloat !== null && finalFloat !== undefined) ? finalFloat : null,
       pattern: (finalFloat !== null && finalFloat !== undefined) ? finalPattern : null,
@@ -19524,15 +20014,9 @@ function addItemToAccount(input, options = {}) {
   
   // Mark items as untradable only if they are storage units (internal flag)
   const nLowCheck = name.toLowerCase();
-  const isForbiddenType = nLowCheck.includes("storage unit");
+  const isForbiddenType = nLowCheck.includes("storage unit") || nLowCheck.includes("sticker");
   if (isForbiddenType) {
     if (lastAddedItem) lastAddedItem.isUntradable = true;
-    state.inventoryTab = "equipment";
-    state.currentPage = 999999;
-    state.viewingStorageUnitId = null;
-    state.storageSelectionMode = null;
-    state.storageSelectedIds = [];
-    state.selectedItemId = lastAddedItem?.id || null;
   }
 
   saveState();
@@ -19568,8 +20052,7 @@ function removeBlockedCollectibles(items) {
   if (!Array.isArray(items)) return [];
   return items.filter(item => {
     const name = String(item?.name || item?.market_hash_name || "").toLowerCase();
-    const hasWearStr = /\((Factory New|Minimal Wear|Field-Tested|Well-Worn|Battle-Scarred)\)/i.test(name);
-    return !name.includes("redacted map coin") && !hasWearStr;
+    return !name.includes("redacted map coin");
   });
 }
 
@@ -19636,7 +20119,7 @@ function lensLoop() {
         ctx.globalAlpha = brightness;
 
         // Draw Card Base (Gradient or Solid) with Fade Effect
-        const rarity = (it.rarity && (it.rarity.name || it.rarity)) || "Mil-Spec";
+        const rarity = normalizeRarityName(it, it.rarity?.name || it.rarity);
         const rarityColor = RARITY_COLORS[rarity] || "#ccc";
         
         const cardGrad = ctx.createLinearGradient(drawX, drawY - cardH/2, drawX, drawY + cardH/2);
@@ -19659,13 +20142,12 @@ function lensLoop() {
         const borderSize = (isMagnified ? 24 : 18) * targetScale;
         ctx.fillRect(drawX - cardW/2, drawY + cardH/2 - borderSize, cardW, borderSize);
 
-        // Draw Wear Text
-        if (it.wear && !isContainer(it)) {
-          ctx.fillStyle = "rgba(255, 255, 255, 0.6)";
-          ctx.font = `bold ${Math.floor(20 * targetScale)}px StratumNo2`;
-          ctx.textAlign = "left";
-          const shortWear = it.wear.split(' ').map(w => w[0]).join('');
-          ctx.fillText(shortWear, drawX - cardW/2 + 10, drawY - cardH/2 + 25 * targetScale);
+        // Show wear text in animation
+        if (isMagnified && it.wear) {
+          ctx.font = `bold ${14 * targetScale}px StratumNo2`;
+          ctx.fillStyle = "rgba(255,255,255,0.7)";
+          ctx.textAlign = "center";
+          ctx.fillText(it.wear.toUpperCase(), drawX, drawY + cardH/2 - (borderSize + 10));
         }
 
         // Draw Item Image
@@ -19738,6 +20220,7 @@ function lensLoop() {
  * Logic ensures it always shows if there is content to display.
  */
 function showGroupedPurchaseResult() {
+  const counterEl = document.getElementById("purchaseResultCounter");
   // Defensive initialization to avoid uncaught TypeErrors when globals or DOM are missing.
   if (!Array.isArray(purchaseResultList)) purchaseResultList = [];
   if (!Array.isArray(pendingPurchaseResults)) pendingPurchaseResults = [];
@@ -19796,11 +20279,9 @@ function showGroupedPurchaseResult() {
     modal.classList.remove("hidden");
     modal.style.display = "flex";
 
-    // Update the counter to show total stacked count of pending new items
-    const counterEl = document.getElementById("purchaseResultCounter");
+    // Update the counter to show total stacked count of pending new items (ALWAYS SAYS X/X)
     if (counterEl) {
-      const total = purchaseResultList.length;
-      counterEl.textContent = `${total}`;
+      counterEl.textContent = `${currentPurchaseResultIdx + 1} / ${purchaseResultList.length}`;
     }
     // mark that we've shown the popup for this batch (prevents accidental reopen on other modal closes)
     hasShownNewItemPopup = true;
@@ -19857,7 +20338,7 @@ function updatePurchaseResultView() {
     
     populatePurchaseText(item);
 
-    // Keep counter updated (no 20 cap)
+    // Keep counter updated (no 20 cap) (ALWAYS SAYS X/X)
     const counterEl = document.getElementById("purchaseResultCounter");
     if (counterEl) {
       counterEl.textContent = `${currentPurchaseResultIdx + 1} / ${purchaseResultList.length}`;
@@ -19871,6 +20352,7 @@ function updatePurchaseResultView() {
 }
 
 function populatePurchaseText(item) {
+  const actions = document.getElementById("caseOpeningActions");
   // Doppler Fix for New Item Popup: Ensure high quality images are resolved
   if (item && item.name && item.name.toLowerCase().includes("doppler")) {
     const exactImg = getExactApiImage(item) || getStableDisplayImage(item);
@@ -19943,9 +20425,10 @@ function populatePurchaseText(item) {
     
     const popupStickers = Array.isArray(item.stickers) ? [...item.stickers] : [];
     if (String(item.name || "").toLowerCase().includes("stattrak") && state.showStatTrakOverlay !== false) {
+      const isKnifeItem = item.name.includes("★") || item.name.toLowerCase().includes("knife");
       const stBadge = document.createElement("div");
       stBadge.className = "purchase-result-stattrak";
-      stBadge.innerHTML = `<img src="https://i.imgur.com/TRtzFCo.png" alt="StatTrak">`;
+      stBadge.innerHTML = `<img src="${isKnifeItem ? 'https://i.imgur.com/txeWcrS.png' : 'https://i.imgur.com/TRtzFCo.png'}" alt="StatTrak">`;
       imageWrapForST.appendChild(stBadge);
     }
 
@@ -19989,6 +20472,14 @@ function populatePurchaseText(item) {
     nameEl.textContent = getDisplayNameWithPhase(item);
     nameEl.classList.remove("nametag-red");
   }
+
+  // Add wear label to new item popup
+  if (item.wear) {
+    const wearEl = document.createElement("div");
+    wearEl.style.cssText = "font-size: 14px; color: #94a3b8; font-weight: 800; text-transform: uppercase; margin-top: 2px;";
+    wearEl.textContent = item.wear;
+    nameEl.parentElement.appendChild(wearEl);
+  }
   nameEl.style.color = rarityColor;
   
   const cs2Logo = "https://i.imgur.com/Vki8GHi.png";
@@ -20007,6 +20498,9 @@ function populatePurchaseText(item) {
       tradeUpProfitHtml = `<div style="color: #a4d007; font-size: 14px; font-weight: 800; margin-top: 4px;">Profit: +${formatPrice(profitVal)}</div>`;
     } catch (e) {}
   }
+
+  // Clear action bar background
+  if (actions) actions.style.background = "transparent";
 
   // Build a richer rarity/collection row that also surfaces the explicit item.source when available
   let sourceLabel = "";
@@ -20305,7 +20799,7 @@ function applyCS2InvColor() {
 }
 
 let backgroundRotationInterval = null;
-const BACKGROUND_MAPS = ["nuke", "anubis", "cobblestone", "chlorine", "county", "engage", "sirocco_night", "sirocco", "swamp", "blacksite", "guard", "vertigo", "apollo", "mutiny"];
+const BACKGROUND_MAPS = ["nuke", "nuke2", "anubis", "anubis1", "anubisw", "anubisw2", "overpass", "train", "inf2", "infb", "cobblestone", "chlorine", "county", "engage", "sirocco_night", "sirocco", "swamp", "blacksite", "guard", "vertigo", "apollo", "mutiny", "ancient"];
 
 function initBackgroundRotation() {
   if (backgroundRotationInterval) {
@@ -20366,7 +20860,8 @@ function applyCS2Background(forceRandom = false) {
     guard: "https://i.imgur.com/Ofd9ARm.mp4",
     vertigo: "https://i.imgur.com/VwkPWlz.mp4",
     apollo: "https://i.imgur.com/hrBxNTn.mp4",
-    mutiny: "https://i.imgur.com/KY62NkA.mp4"
+    mutiny: "https://i.imgur.com/KY62NkA.mp4",
+    ancient: "https://i.imgur.com/9vCRnHq.mp4"
   };
 
   const fileName = fileMap[map] || "https://i.imgur.com/koiSmTR.mp4";
@@ -20862,42 +21357,67 @@ function showInScreenConfirm(message, onConfirm) {
  * excluding skins that happen to have "Case" in the name.
  */
 function isContainer(item) {
-  if (!item || !item.name) return false;
-  const n = (item.name || "").toLowerCase();
+  if (!item) return false;
+  const n = getItemNameText(item);
+  const type = getItemTypeText(item);
+  const rawName = typeof item === "string" ? item : (item?.name || item?.market_hash_name || "");
+  if (!rawName && !type) return false;
   if (n.includes("case hardened")) return false;
   
-  if (n.includes("storage unit")) return true;
+  if (n.includes("storage unit") || type.includes("storage unit")) return true;
 
-  const isCapsule = n.includes('capsule') || n.includes('sticker') || n.includes('mlg columbus 2014') || n.includes('mlg columbus 2016');
-  const isTerminal = n.includes("terminal");
-  const fullName = (item.name || "").trim();
+  const isCapsule = isStickerCapsuleItem(item) ||
+    n.includes("mlg columbus 2014") ||
+    n.includes("mlg columbus 2016") ||
+    type.includes("capsule") ||
+    type.includes("sticker capsule");
+  const isTerminal = n.includes("terminal") || type.includes("terminal");
+  const fullName = String(rawName || "").trim();
   const baseName = fullName.split(' (')[0].trim();
-  const knownCaseEntry = Boolean(CASE_CONTENTS_DB && (CASE_CONTENTS_DB[fullName] || CASE_CONTENTS_DB[baseName]));
+  
+  // Rely more on API category than name strings
+  const apiCategory = (item?.category?.name || item?.category || "").toLowerCase();
+  const isApiCrate = apiCategory.includes("crate") || apiCategory.includes("case") || apiCategory.includes("container") || apiCategory.includes("package");
 
-  return (n.includes('case') || n.includes('package') || n.includes('crate') || n.includes('souvenir') || n.includes('collection') || isCapsule || isTerminal || knownCaseEntry)
+  const hasContainerType = type.includes("container") ||
+    type.includes("crate") ||
+    type.includes("package") ||
+    type.includes("collection") ||
+    type.includes("souvenir") ||
+    isApiCrate;
+
+  return (n.includes('case') || n.includes('package') || n.includes('crate') || n.includes('souvenir') || n.includes('collection') || isCapsule || isTerminal || hasContainerType)
           && !n.includes('|')
-          && !n.includes('key');
+          && !n.includes('key')
+          && !type.includes('key');
 }
 
 /**
  * Helper to identify if an item is a key for a container.
  */
 function isKeyItem(item) {
-  const baseName = item.name.split(' (')[0].toLowerCase().trim();
+  if (!item || !item.name) return false;
+  const n = String(item.name).toLowerCase();
+  if (n.includes("key") && !n.includes("|") && !n.includes("case")) return true;
+  const baseName = n.split(' (')[0].trim();
   return Object.keys(KEY_CASE_MAP).some(k => k.toLowerCase().trim() === baseName);
 }
 
+// Performance Optimized: Single-pass item counting to avoid O(N^2) complexity in large inventories
 function countExactMatchingItems(account, target) {
-  // Match only by Name and Nametag but treat storage-unit contents separately:
-  // - When counting for the main inventory, only consider top-level items (not items stored inside storage units)
-  // - When counting within a storage unit (i.e. when viewing a unit), caller should use the unit.contents directly.
-  // This function now returns the count of top-level matching items in the account only.
   if (!account || !Array.isArray(account.items)) return 0;
+  
+  // Return early if cached count is available (logic handled in callers like refreshInventoryView)
+  if (target._cachedCount !== undefined) return target._cachedCount;
+
   let count = 0;
-  for (const it of account.items) {
-    // Skip items that are contents of storage units (we only iterate top-level acc.items here)
-    if (!it) continue;
-    if (it.name === target.name && (it.nametag || "") === (target.nametag || "")) {
+  const targetName = target.name;
+  const targetNametag = target.nametag || "";
+  
+  const len = account.items.length;
+  for (let i = 0; i < len; i++) {
+    const it = account.items[i];
+    if (it && it.name === targetName && (it.nametag || "") === targetNametag) {
       count += (it.qty || 1);
     }
   }
@@ -20909,6 +21429,11 @@ function countExactMatchingItems(account, target) {
  * Added page system per user request.
  */
 function showStickerPickerForWearModal(onSelected, initialFilter = "") {
+  const targetGunId = directApplyTargetId;
+  const account = getActiveAccount();
+  const gun = account?.items.find(it => it.id === targetGunId);
+  const existingSlab = gun?.stickers?.find(s => s.name.toLowerCase().includes("sticker slab"));
+
   const overlay = document.createElement("div");
   overlay.className = "modal-overlay";
   overlay.style.zIndex = "10000";
@@ -20956,6 +21481,7 @@ function showStickerPickerForWearModal(onSelected, initialFilter = "") {
   };
   
   const pool = allSkins.filter(s => {
+    if (hasWearInName(s.name)) return false;
     const n = (s.name || "").toLowerCase();
     return n.includes("sticker") && !n.includes("capsule");
   });
@@ -20966,24 +21492,23 @@ function showStickerPickerForWearModal(onSelected, initialFilter = "") {
     
     // Filter out ems/champion stickers and capsules from pool as requested
     const sanitizedPool = (allSkins || []).filter(s => {
-      if (!s) return false;
+      if (!s || hasWearInName(s.name)) return false;
       const sn = (s.name || "").toLowerCase();
       const st = (s.type || s.category?.name || "").toLowerCase();
 
-      // If user wants charms, include charms AND sticker slabs
       const isCharmRequest = initialFilter.includes("Charm") || initialFilter.includes("Slab");
       if (isCharmRequest) {
-        return (sn.includes("charm") || sn.includes("keychain") || sn.includes("sticker slab"));
+        return (sn.includes("charm") || sn.includes("keychain")) && !sn.includes("sticker slab");
       }
 
-      // Default sticker behavior: SHOW JUST STICKERS
       if (!sn.startsWith("sticker |") && !sn.startsWith("sticker ")) return false;
       
       const isContainer = sn.includes("capsule") || sn.includes("package") || sn.includes("case") || 
                           st.includes("container") || st.includes("crate") || st.includes("capsule") ||
                           sn.includes("storage unit");
-      const isBlacklisted = sn.includes("rio 2022 storage unit with paper stickers") || sn.includes("rio 2022 storage unit with glitter stickers");
-      return !sn.includes("champion") && !sn.includes("ems") && !isContainer && !isBlacklisted;
+      const isBlacklisted = sn.includes("rio 2022") || sn.includes("champion") || sn.includes("ems");
+      const isSlab = sn.includes("sticker slab") || sn.includes("slab |");
+      return !isContainer && !isBlacklisted && !isSlab;
     });
     // Sort pick a sticker popup by alphabetical order
     const filtered = sanitizedPool.filter(s => s.name.toLowerCase().includes(sQuery.toLowerCase()))
@@ -20996,6 +21521,9 @@ function showStickerPickerForWearModal(onSelected, initialFilter = "") {
     const pageItems = filtered.slice(startIdx, startIdx + STICKER_PAGE_SIZE);
 
     pageItems.forEach(s => {
+      const isSlab = s.name.toLowerCase().includes("sticker slab");
+      const blockSlab = isSlab && !!existingSlab;
+      
       const card = document.createElement("div");
       card.className = "card";
       card.style.padding = "10px";
@@ -21230,7 +21758,7 @@ function buildCaseSearchResults(query = "") {
     const name = String(it?.name || "");
     const lower = name.toLowerCase();
     const isKey = isKeyItem({ name });
-    const isContainerLike = isContainer({ name }) && !isKey;
+    const isContainerLike = isContainer(it) && !isKey;
     const isCollection = lower.includes("collection");
     if (!isContainerLike && !isCollection && !isKey) return;
     if (q && !lower.includes(q)) return;
@@ -21241,7 +21769,7 @@ function buildCaseSearchResults(query = "") {
       price,
       price_text: formatPrice(price),
       rarity: { name: it.rarity?.name || "Base Grade" },
-      type: isKey ? "Key" : (isCollection ? "Custom Collection" : "Container")
+      type: isKey ? "Key" : (isCollection ? "Custom Collection" : (it.type || it.category?.name || "Container"))
     });
   });
 
@@ -21255,7 +21783,8 @@ function buildCaseSearchResults(query = "") {
         if (n.includes("package")) return 3;
         if (n.includes("collection")) return 4;
         if (n.includes("terminal")) return 5;
-        if (res.type === "Custom Container") return 8;
+        if (res.type === "Custom Container") return 1;
+        if (res.name.toLowerCase().includes("collection")) return 1;
         if (res.type === "Key") return 9;
         return 10;
      };
@@ -21675,6 +22204,18 @@ function renderConsoleLog() {
  * Resolve the best display image for an item, preferring API images by exact name.
  * This prevents broken/invalid URLs and keeps guns aligned with CS2 artwork.
  */
+// Case Hardened Image Fix Helper (Blue Gem Tier)
+const CASE_HARDENED_FALLBACKS = {
+  "AK-47 | Case Hardened": "https://i.imgur.com/v8pE07W.png",
+  "Five-SeveN | Case Hardened": "https://i.imgur.com/4RK4e3B.png",
+  "MAC-10 | Case Hardened": "https://i.imgur.com/4RK4e3B.png",
+  "★ Karambit | Case Hardened": "https://i.imgur.com/97yL88H.png",
+  "★ M9 Bayonet | Case Hardened": "https://i.imgur.com/vS3l9vW.png",
+  "★ Bayonet | Case Hardened": "https://i.imgur.com/vS3l9vW.png",
+  "★ Flip Knife | Case Hardened": "https://i.imgur.com/vS3l9vW.png",
+  "★ Gut Knife | Case Hardened": "https://i.imgur.com/vS3l9vW.png"
+};
+
 function getDisplayImage(item) {
   if (!item) return KNIFE_PLACEHOLDER_IMG;
   
@@ -21688,6 +22229,21 @@ function getDisplayImage(item) {
   const normalizedName = normalizeImageLookupName(name);
   const wearlessName = normalizedName.split(" (")[0].trim();
   const imageOverrideCandidates = getImageOverrideCandidates(name);
+
+  // Case Hardened Specific Fix (Authoritative Blue Gem Overrides)
+  if (lower.includes("case hardened")) {
+    const base = name.split(" | ")[0].trim();
+    if (CASE_HARDENED_FALLBACKS[name]) return CASE_HARDENED_FALLBACKS[name];
+    if (CASE_HARDENED_FALLBACKS[base]) return CASE_HARDENED_FALLBACKS[base];
+    
+    // Generic fallback logic for any missed CH variants
+    if (lower.includes("ak-47")) return "https://i.imgur.com/v8pE07W.png";
+    if (lower.includes("karambit")) return "https://i.imgur.com/97yL88H.png";
+    return "https://i.imgur.com/vS3l9vW.png";
+  }
+
+  // USPS Orion custom image
+  if (lower.includes("usp-s | orion")) return "https://i.imgur.com/RFHAPQj.png";
 
   // 1. Highest Priority: Specific Image/Pattern Overrides and manual assignments
   if (item && item.pattern !== undefined && item.pattern !== null) {
@@ -21711,11 +22267,24 @@ function getDisplayImage(item) {
   };
   if (hardcodedCollectionIcons[name]) return hardcodedCollectionIcons[name];
 
-  // 2. Prefer the exact API variant by raw API name for all items.
+  // Sealed terminals are CONTAINERS and not contained in other containers
+  if (lower.includes("genesis terminal") || lower.includes("dead hand terminal")) {
+      return lower.includes("genesis") ? "https://i.imgur.com/DQ2qP7m.png" : "https://i.imgur.com/4RK4e3B.png";
+  }
+
+  // 2. Prefer the exact wear-specific API variant if available (prioritize Mykel API wear variants)
+  const wearVariantMatch = getApiWearVariant(item);
+  if (wearVariantMatch && (wearVariantMatch.image || wearVariantMatch.img)) {
+    if (!lower.includes("doppler") && !lower.includes("case hardened")) {
+      return wearVariantMatch.image || wearVariantMatch.img;
+    }
+  }
+
+  // 3. Prefer the exact API variant by raw API name for all items.
   const exactApiImage = getExactApiImage(item);
   if (exactApiImage) return exactApiImage;
 
-  // 3. Preserve any already-attached image when there is no exact API match.
+  // 4. Preserve any already-attached image when there is no exact API match.
   if (item.image) return item.image;
   if (item.img) return item.img;
   if (item.steamPhaseImage) return item.steamPhaseImage;
@@ -21741,14 +22310,6 @@ function getDisplayImage(item) {
   if (lower.includes("stattrak") && !name.includes("StatTrak™")) {
      const clean = name.replace(/StatTrak(?:™|â„¢|™| )*/gi, "").trim();
      return getDisplayImage({ ...item, name: `StatTrak™ ${clean}` });
-  }
-
-  // 3) Prefer exact wear-specific API variant if available
-  const wearVariant = getApiWearVariant(item);
-  if (wearVariant && (wearVariant.image || wearVariant.img)) {
-    if (!lower.includes("doppler") && !lower.includes("case hardened")) {
-      return wearVariant.image || wearVariant.img;
-    }
   }
 
   // 2) Prefer explicit MARKET_KEYS images for exact key/case matches.
@@ -21781,13 +22342,18 @@ function getDisplayImage(item) {
     return getGoldIcon();
   }
 
+
+
   // 3) Try exact match from API/db (Ensure image consistency)
-  let apiMatch = allSkins.find(s => {
-    const sName = (s.name || "").trim();
-    const nStr = name.replace(/^StatTrak(?:™|â„¢|Ã¢â€žÂ¢)\s+/i, "").trim()
-                     .replace(/\s+\(Vanilla\)$/i, "");
-    return sName === nStr || sName === name;
-  });
+  let apiMatch = apiSkinsByNormalizedName.get(name.toLowerCase());
+  if (!apiMatch) {
+    apiMatch = allSkins.find(s => {
+      const sName = (s.name || "").trim();
+      const nStr = name.replace(/^StatTrak(?:™|â„¢|Ã¢â€žÂ¢)\s+/i, "").trim()
+                       .replace(/\s+\(Vanilla\)$/i, "");
+      return sName === nStr || sName === name;
+    });
+  }
   if (apiMatch && (apiMatch.image || apiMatch.img)) return apiMatch.image || apiMatch.img;
 
   // 4) Try stricter fuzzy matching to avoid incorrect overlaps
@@ -21885,7 +22451,8 @@ function showGoldPoolPopup(pool, caseName) {
  * Ensures float and pattern are always shown by generating sensible fallbacks when missing.
  */
 function createInfoIconHtml(item, options = {}) {
-  const showShare = !!options.includeShare;
+  const showShare = options.includeShare !== false; // Default to true unless explicit
+  const shareSvg = `<svg data-prefix="fas" data-icon="share-nodes" class="fa-share-nodes h-6" role="img" viewBox="0 0 512 512" aria-hidden="true" style="width:20px;height:20px;"><path fill="white" d="M384 192c53 0 96-43 96-96s-43-96-96-96-96 43-96 96c0 5.4 .5 10.8 1.3 16L159.6 184.1c-16.9-15-39.2-24.1-63.6-24.1-53 0-96 43-96 96s43 96 96 96c24.4 0 46.6-9.1 63.6-24.1L289.3 400c-.9 5.2-1.3 10.5-1.3 16 0 53 43 96 96 96s96-43 96-96-43-96-96-96c-24.4 0-46.6 9.1-63.6 24.1L190.7 272c.9-5.2 1.3-10.5 1.3-16s-.5-10.8-1.3-16l129.7-72.1c16.9 15 39.2 24.1 63.6 24.1z"></path></svg>`;
   // Unique ID for pointer tracking on this specific icon
   const iconId = "info_icon_" + Math.random().toString(36).substr(2, 9);
   // Determine wear display (prefer finalWear then item.wear)
@@ -21945,7 +22512,7 @@ function createInfoIconHtml(item, options = {}) {
     profitHtml = `<div style="margin-bottom: 4px; color: #94a3b8;">Profit: <strong style="color: ${pCol};">${(pVal >= 0 ? '+' : '') + formatPrice(pVal)}</strong></div>`;
   }
 
-  const priceLabelHtml = (!state.hidePrices && state.showPriceInTooltip) ? `<div style="margin-bottom: 4px; color: #94a3b8;">Market Value: <strong style="color:#a4d007;">${price}</strong></div>` : "";
+  const priceLabelHtml = (!state.hidePrices && state.showPriceInTooltip && !item.name.includes("StatTrak™ Module")) ? `<div style="margin-bottom: 4px; color: #94a3b8;">Market Value: <strong style="color:#a4d007;">${price}</strong></div>` : "";
 
   // Hide profit and extra price info in tooltip if price information is disabled
   if (state.hidePrices || !state.showPriceInTooltip) {
@@ -21977,11 +22544,9 @@ function createInfoIconHtml(item, options = {}) {
         </div>
       </span>
       ${showShare ? `
-        <button class="info-share-btn" title="Share Item" type="button" aria-label="Share Item" data-item-id="${item.id || ''}">
-          <svg data-prefix="fas" data-icon="share-nodes" class="fa-share-nodes h-6" role="img" viewBox="0 0 512 512" aria-hidden="true">
-            <path fill="currentColor" d="M384 192c53 0 96-43 96-96s-43-96-96-96-96 43-96 96c0 5.4 .5 10.8 1.3 16L159.6 184.1c-16.9-15-39.2-24.1-63.6-24.1-53 0-96 43-96 96s43 96 96 96c24.4 0 46.6-9.1 63.6-24.1L289.3 400c-.9 5.2-1.3 10.5-1.3 16 0 53 43 96 96 96s96-43 96-96-43-96-96-96c-24.4 0-46.6 9.1-63.6 24.1L190.7 272c.9-5.2 1.3-10.5 1.3-16s-.5-10.8-1.3-16l129.7-72.1c16.9 15 39.2 24.1 63.6 24.1z"></path>
-          </svg>
-        </button>
+        <div class="info-share-btn" title="Share Item" style="cursor:pointer; display:inline-flex; align-items:center; color:#fff;" data-item-id="${item.id || ''}">
+          ${shareSvg}
+        </div>
       ` : ''}
     </div>
   `;
@@ -22225,12 +22790,123 @@ async function generateCompositeImage(item, positions) {
 
 function showInspect(item) {
   const account = getActiveAccount();
-  const modal = document.getElementById("inspectModal");
-  const box = document.getElementById("inspectBox");
   lastInspectItem = JSON.parse(JSON.stringify(item));
+  
+  const modal = document.getElementById("caseOpeningModal");
+  const box = modal; // Handle interaction on the main modal container
+  const spinnerUI = document.getElementById("caseOpeningSpinner");
+  const spinnerResult = document.getElementById("caseOpeningResult");
+  const title = document.getElementById("caseOpeningTitle");
+  const actions = document.getElementById("caseOpeningActions");
 
-  const imgEl = document.getElementById("inspectImage");
-  const stickersArea = document.getElementById("inspectStickers");
+  modal.style.background = "#0b0f1a";
+  modal.classList.remove("hidden");
+  spinnerUI.style.display = "none";
+  spinnerResult.style.display = "block";
+  actions.style.opacity = "1";
+  actions.style.pointerEvents = "auto";
+  title.textContent = "";
+
+  const rarityName = normalizeRarityName(item, item.rarity);
+  const rarityColor = RARITY_COLORS[rarityName] || "#fff";
+  const displayName = item.name;
+  const nameColor = "#fff";
+  const containerName = findContainerNameForItem(item);
+
+  spinnerResult.innerHTML = `
+    <div style="display:flex; flex-direction:column; align-items:center; width: 100%; height: 740px; justify-content:flex-start; padding-top: 0px;">
+      <div style="text-align: center; z-index: 1000; margin-top: -20px; position: relative;">
+        <h1 style="color: ${nameColor}; font-size: 56px; font-weight: 900; margin: 0; line-height: 1.0;">${displayName}</h1>
+        ${item.nametag ? `<div style="font-size: 18px; color: #fff; margin-top: 5px;">"${item.nametag}"</div>` : ''}
+        <div style="font-size: 16px; color: #94a3b8; font-weight: 800; text-transform: uppercase; margin-top: 4px;">${item.wear || ''}</div>
+        <div style="display: flex; align-items: center; justify-content: center; gap: 10px; color: #d1d5db; font-size: 16px; font-weight: 700; margin-top: 5px;">
+          <img src="${getDisplayImage({name: containerName})}" style="width:24px; height:24px; object-fit:contain;"> ${containerName}
+        </div>
+        <div class="unlocked-rarity-bar" style="width: 500px; max-width: 80%; height: 6px; background: ${rarityColor}; margin: 15px auto 0 auto;"></div>
+      </div>
+      
+      <div id="unlocked3dWrapper" class="unlocked-3d-container" style="height: 680px; margin-top: -60px; pointer-events: auto; z-index: 1;">
+        <div class="unlocked-inner-3d" style="transform-style: preserve-3d; display: flex; align-items: center; justify-content: center; width: 100%; height: 100%; pointer-events: none; z-index: 1;">
+          <img src="${getStableDisplayImage(item)}" class="inspect-face" draggable="false" style="max-width: 100%; max-height: 100%; object-fit: contain; filter: drop-shadow(0 20px 80px rgba(0,0,0,0.7)); pointer-events: none;">
+        </div>
+        <div id="unlockedStickers" style="z-index: 1000; pointer-events: none;"></div>
+      </div>
+    </div>
+  `;
+
+  const unlockedTray = spinnerResult.querySelector("#unlockedStickers");
+  if (unlockedTray) {
+    if (item.name.includes("StatTrak™") && state.showStatTrakOverlay !== false) {
+       const sw = document.createElement("div"); sw.className = "sticker-wrapper";
+       sw.innerHTML = `<img src="https://i.imgur.com/TRtzFCo.png" class="applied-sticker-icon" style="width:120px !important; height:120px !important;">`;
+       unlockedTray.appendChild(sw);
+    }
+    (item.stickers || []).forEach(s => {
+      const sw = document.createElement("div"); sw.className = "sticker-wrapper";
+      sw.setAttribute('data-tooltip', s.name);
+      sw.innerHTML = `<img src="${s.img}" class="applied-sticker-icon" style="width:120px !important; height:120px !important;">`;
+      unlockedTray.appendChild(sw);
+    });
+  }
+
+  actions.innerHTML = "";
+  actions.style.display = "flex";
+  actions.style.flexDirection = "row";
+  actions.style.justifyContent = "space-between";
+  actions.style.alignItems = "center";
+  actions.style.width = "500px";
+  actions.style.padding = "10px 20px";
+  actions.style.borderTop = "2px solid rgba(255, 255, 255, 0.4)";
+  actions.style.background = "rgba(0,0,0,0.25)"; 
+  actions.style.position = "fixed";
+  actions.style.bottom = "30px";
+  actions.style.left = "50%";
+  actions.style.transform = "translateX(-50%)";
+  actions.style.zIndex = "1000";
+
+  const attribsWrap = document.createElement("div");
+  attribsWrap.style.display = "flex";
+  attribsWrap.style.alignItems = "center";
+  attribsWrap.innerHTML = createInfoIconHtml(item, { includeShare: true });
+  
+  // Custom Share logic: WHITE SVG, Verification Checkmark
+  const shareBtn = attribsWrap.querySelector(".info-share-btn");
+  if (shareBtn) {
+      const originalHtml = shareBtn.innerHTML;
+      shareBtn.onclick = async (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          const code = encodeShareCode(buildSharePayload(item));
+          await navigator.clipboard.writeText(code);
+          
+          shareBtn.innerHTML = `<span style="color:#22c55e; font-weight:900; font-size:20px;">✓</span>`;
+          setTimeout(() => shareBtn.innerHTML = originalHtml, 3000);
+      };
+  }
+
+  actions.appendChild(attribsWrap);
+
+  const closeTextBtn = document.createElement("div");
+  closeTextBtn.style.color = "#fff";
+  closeTextBtn.style.fontSize = "24px";
+  closeTextBtn.style.fontWeight = "900";
+  closeTextBtn.style.cursor = "pointer";
+  closeTextBtn.style.textTransform = "uppercase";
+  closeTextBtn.style.letterSpacing = "2px";
+  closeTextBtn.textContent = "CLOSE";
+  closeTextBtn.onclick = () => {
+    modal.classList.add("hidden");
+    const bgEl = document.getElementById("caseOpeningBg");
+    if (bgEl) bgEl.style.display = "block";
+    try { reset3DTransforms(); } catch (e) {}
+    updateModalBlurState();
+  };
+  actions.appendChild(closeTextBtn);
+
+  setTimeout(() => initInspectLikeViewer('#unlocked3dWrapper', '.inspect-face'), 100);
+}
+
+function unused_original_showInspect(item) {
   
   // Function to show visual sticker/charm picker
   const showVisualAssetPicker = (filter, onPick) => {
@@ -22596,9 +23272,9 @@ function showInspect(item) {
     ntEl.textContent = `"${ntText}"`;
     ntEl.classList.remove("hidden");
     ntEl.style.color = "#fff"; // Make white
-    ntEl.style.fontSize = "22px";
-    ntEl.style.fontWeight = "900";
-    ntEl.style.marginTop = "8px";
+    ntEl.style.fontSize = "16px"; // Small as requested
+    ntEl.style.fontWeight = "700";
+    ntEl.style.marginTop = "4px";
     ntEl.style.marginBottom = "4px";
     // Move nametag directly under item name in header
     inspectHeader.insertBefore(ntEl, inspectHeader.children[1]);
@@ -22636,6 +23312,12 @@ function showInspect(item) {
       fText.textContent = formatFloat(fVal);
       fArrow.textContent = ""; // Remove arrow text
       fArrow.style.left = `${(Number(fVal) * 100)}%`;
+      
+      // Knife StatTrak icon logic
+      const isKnifeItem = String(item.name).includes("★") || String(item.type).toLowerCase().includes("knife");
+      if (item.name.includes("StatTrak") && isKnifeItem) {
+          // Knife icons handled by populating DOM in showInspect
+      }
 
       // Add Nav arrows under float bar
       let navWrap = document.getElementById("inspectNavArrows");
@@ -22646,7 +23328,7 @@ function showInspect(item) {
         fBar.parentElement.insertBefore(navWrap, fBar.nextSibling);
       }
       
-      const currentList = account ? account.items.filter(it => {
+      const currentList = targetAccount ? targetAccount.items.filter(it => {
         const name = String(it?.name || "").toLowerCase();
         return !!it &&
           !isContainer(it) &&
@@ -22695,141 +23377,30 @@ function showInspect(item) {
   
   // Recalculate blur when opening inspect
   updateModalBlurState();
+  
+  // Logic: HIDE BACKGROUND IN INSPECT POPUP
+  const bgEl = document.getElementById("caseOpeningBg");
+  if (bgEl) bgEl.style.display = "none";
 
   const statsContainer = document.getElementById("inspectStatsContainer");
   if (statsContainer) {
-    const handleRightClickAttribs = (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        
-        isStickerPlacingMode = !isStickerPlacingMode;
-        
-        if (isStickerPlacingMode) {
-            // Enter Placement Mode
-            if (stickersArea) stickersArea.style.display = "none";
-            if (imgEl) imgEl.style.transform = "translateY(28px) scale(1.0)";
-            renderCurrentStickersOnStatic();
-            
-            // Show Submit Button
-            let submitBtn = document.getElementById("submitStickersBtn");
-            if (!submitBtn) {
-                submitBtn = document.createElement("button");
-                submitBtn.id = "submitStickersBtn";
-                submitBtn.className = "steam-btn highlight";
-                submitBtn.style.cssText = "position:absolute; bottom:120px; left:50%; transform:translateX(-50%); z-index:1000; padding:15px 40px; font-weight:900; background:#22c55e; color:#000;";
-                submitBtn.textContent = "SUBMIT STICKERS";
-                box.appendChild(submitBtn);
-            }
-            submitBtn.style.display = "block";
-            submitBtn.onclick = () => {
-                const positions = [];
-                wrapper.querySelectorAll(".inspect-sticker-overlay").forEach(sDiv => {
-                    positions.push({
-                        idx: parseInt(sDiv.dataset.idx),
-                        x: parseFloat(sDiv.style.left),
-                        y: parseFloat(sDiv.style.top),
-                        scale: parseFloat(sDiv.style.transform.match(/scale\(([^)]+)\)/)?.[1] || 1)
-                    });
-                });
-                
-                const acc = getActiveAccount();
-                const target = acc.items.find(x => x.id === item.id);
-                if (target) {
-                    target.customLayout = { enabled: true, positions };
-                    saveState();
-                    refreshInventoryView();
-                    // Exit mode
-                    isStickerPlacingMode = false;
-                    submitBtn.style.display = "none";
-                    if (stickersArea) stickersArea.style.display = "flex";
-                    renderCurrentStickersOnStatic();
-                    alert("Sticker positions frozen!");
-                }
-            };
-        } else {
-            // Exit Placement Mode / Toggle back tray
-            if (stickersArea) stickersArea.style.display = "flex";
-            const submitBtn = document.getElementById("submitStickersBtn");
-            if (submitBtn) submitBtn.style.display = "none";
-            renderCurrentStickersOnStatic();
-        }
-    };
-    const isOwner = account && (account.items.some(it => it.id === item.id) || (state.viewingStorageUnitId && account.items.find(u => u.id === state.viewingStorageUnitId)?.contents?.some(c => c.id === item.id)));
-    
-    let actionsHtml = "";
-    if (isOwner) {
-      const isEquipped = account.equippedItemIds.includes(item.id);
-      const isCont = isContainer(item);
-      
-      actionsHtml = `
-        <div style="display: flex; flex-direction: column; gap: 8px; width: 220px; margin-left: 20px;">
-          ${isCont ? `<button id="inspectOpenBtn" class="steam-btn highlight" style="width:100%; font-weight:900; background: #e4ae39; color:#000;">OPEN CONTAINER</button>` : ""}
-          <button id="inspectEquipBtn" class="steam-btn" style="width:100%; font-weight:900; background: ${isEquipped ? '#1a44c2' : '#3d4450'}; color: #fff;">
-            ${isEquipped ? "UNEQUIP" : "EQUIP"}
-          </button>
-          <div class="action-dropdown-container" id="inspectActionDropdown">
-            <button class="action-dropdown-btn" style="width:100%; border:1px solid #444; background:#1e293b; padding:12px; font-weight:900; color:#fff; cursor:pointer; border-radius:4px; display:flex; justify-content:space-between; align-items:center;">
-              ACTIONS <span>▼</span>
-            </button>
-            <div class="action-dropdown-menu" style="display:none; bottom:100%; left:0; right:0; background:#171a21; border:1px solid #444; border-radius:4px; flex-direction:column; z-index:200; margin-bottom:4px;">
-              <button class="action-dropdown-item" id="inspectSellBtn" style="padding:12px; color:#eb4b4b; font-weight:700; background:none; border:none; border-bottom:1px solid #334155; text-align:left; cursor:pointer;">SELL</button>
-              <button class="action-dropdown-item" id="inspectEditBtn" style="padding:12px; color:#fff; font-weight:700; background:none; border:none; text-align:left; cursor:pointer;">EDIT</button>
-            </div>
-          </div>
-        </div>
-      `;
-    }
-
     statsContainer.innerHTML = `
-      <div style="display: flex; align-items: center; justify-content: center; width: 100%; gap: 10px;">
-        <div id="inspectAttribsTrigger" style="cursor:context-menu;">
-          ${createInfoIconHtml(item)}
+      <div class="inspect-actions-footer" style="width: 500px; max-width: 90vw; margin: 0 auto; display: flex; justify-content: space-between; align-items: center; padding: 10px 20px; border-top: 2px solid rgba(255, 255, 255, 0.4); background: rgba(0, 0, 0, 0.25); border-radius: 8px;">
+        <div id="inspectAttribsTrigger" style="opacity: 0.2; transition: opacity 0.2s; cursor: pointer;">
+          ${createInfoIconHtml(item, { includeShare: true })}
         </div>
-        ${actionsHtml}
+        <div style="color:#fff; font-size:24px; font-weight:900; cursor:pointer; letter-spacing:2px; text-transform:uppercase;" onclick="document.getElementById('inspectModal').classList.add('hidden'); updateModalBlurState();">CLOSE</div>
+        <div style="width: 32px;"></div>
       </div>
     `;
 
-    const attribsTrigger = document.getElementById("inspectAttribsTrigger");
-    if (attribsTrigger) {
-        attribsTrigger.oncontextmenu = null;
+    const trigger = statsContainer.querySelector("#inspectAttribsTrigger");
+    if (trigger) {
+      trigger.onmouseenter = () => trigger.style.opacity = "1";
+      trigger.onmouseleave = () => trigger.style.opacity = "0.2";
     }
 
-    // Ensure share button exists next to Item Attributes on Inspect popup
-    try {
-      const wrap = statsContainer.querySelector(".info-icon-wrapper");
-      if (wrap && !wrap.querySelector(".info-share-svg")) {
-        const shareSvg = document.createElement("span");
-        shareSvg.className = "info-share-svg";
-        shareSvg.title = "Share Item";
-        shareSvg.setAttribute("aria-label", "Share Item");
-        shareSvg.setAttribute("role", "button");
-        shareSvg.tabIndex = 0;
-        shareSvg.dataset.itemId = item.id || "";
-        shareSvg.innerHTML = `<svg data-prefix="fas" data-icon="share-nodes" class="fa-share-nodes h-6" role="img" viewBox="0 0 512 512" aria-hidden="true"><path fill="currentColor" d="M384 192c53 0 96-43 96-96s-43-96-96-96-96 43-96 96c0 5.4 .5 10.8 1.3 16L159.6 184.1c-16.9-15-39.2-24.1-63.6-24.1-53 0-96 43-96 96s43 96 96 96c24.4 0 46.6-9.1 63.6-24.1L289.3 400c-.9 5.2-1.3 10.5-1.3 16 0 53 43 96 96 96s96-43 96-96-43-96-96-96c-24.4 0-46.6 9.1-63.6 24.1L190.7 272c.9-5.2 1.3-10.5 1.3-16s-.5-10.8-1.3-16l129.7-72.1c16.9 15 39.2 24.1 63.6 24.1z"></path></svg>`;
-        shareSvg.onclick = async (e) => {
-          e.stopPropagation();
-          lastInspectItem = item;
-          
-          const payload = buildSharePayload(item);
-          const code = encodeShareCode(payload);
-          try {
-            await navigator.clipboard.writeText(code);
-          } catch(err) {
-            console.warn("Share copy failed:", err);
-          }
-
-          const originalHtml = shareSvg.innerHTML;
-          // Change to checkmark SVG
-          shareSvg.innerHTML = `<svg viewBox="0 0 24 24" width="22" height="22" stroke="#a4d007" stroke-width="3" fill="none" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>`;
-          
-          setTimeout(() => {
-            shareSvg.innerHTML = originalHtml;
-          }, 3000);
-        };
-        wrap.appendChild(shareSvg);
-      }
-    } catch (e) {}
-
+    const isOwner = targetAccount && activeAccount && targetAccount.id === activeAccount.id;
     if (isOwner) {
       const openBtn = document.getElementById("inspectOpenBtn");
       if (openBtn) openBtn.onclick = () => {
@@ -22894,9 +23465,10 @@ function showInspect(item) {
     ? item.stickers.map((s, i) => ({ ...s, _sourceIndex: i }))
     : [];
   if (item.name.includes("StatTrak™")) {
+      const isKnifeItem = item.name.includes("★") || item.name.toLowerCase().includes("knife");
       inspectStickers.unshift({
           name: "StatTrak™ Module",
-          img: "https://i.imgur.com/TRtzFCo.png",
+          img: isKnifeItem ? "https://i.imgur.com/txeWcrS.png" : "https://i.imgur.com/TRtzFCo.png",
           isStatTrakModule: true,
           price: 0.05
       });
@@ -22906,7 +23478,6 @@ function showInspect(item) {
   const updateGloss = (rotY) => {
      const gloss = document.querySelector("#inspectModal .gloss-overlay");
      if (gloss) {
-       // Offset gloss gradient based on rotation to simulate a static light source
        const shift = (rotY % 360);
        gloss.style.background = `linear-gradient(${135 + shift}deg, rgba(255,255,255,0.8) 0%, rgba(255,255,255,0) 60%)`;
        gloss.style.setProperty('--mask-url', `url(${getStableDisplayImage(item)})`);
@@ -23036,6 +23607,12 @@ function showInspect(item) {
       sImg.style.objectFit = "contain";
       sImg.style.filter = "drop-shadow(0 4px 8px rgba(0,0,0,0.6))";
       const gVal = (s.scratchPercent || 0) / 100;
+      
+      // If StatTrak module and item is knife, use knife StatTrak icon
+      if (s.isStatTrakModule && (item.name.includes("★") || item.name.toLowerCase().includes("knife"))) {
+          sImg.src = "https://i.imgur.com/txeWcrS.png";
+      }
+
       sImg.style.filter += ` grayscale(${gVal})`;
       sImg.style.cursor = "pointer";
 
@@ -23070,12 +23647,11 @@ function showInspect(item) {
       tooltip.style.transition = "opacity 0.2s";
 
       wrapper.onmouseenter = () => {
-          // Handled by hover on the image/wrapper below
+          wrapper.style.transform = "scale(1.25) translateY(-10px)";
+          tooltip.style.opacity = "1";
       };
       wrapper.onmouseleave = () => {
-          if (!wrapper.classList.contains("active-size")) {
-             wrapper.style.transform = "scale(1)";
-          }
+          wrapper.style.transform = "scale(1)";
           tooltip.style.opacity = "0";
       };
 
@@ -23327,24 +23903,30 @@ function addRandomCheapItem() {
  */
 function stopAnimationAndShowWinner() {
   try {
-    // If a reveal function was registered by openCase(), call it directly
+    // Quick open (ESC): show "New Item" popup immediately instead of the "Unlocked" reveal
     if (typeof window._caseRevealNow === "function") {
       try {
-        // clear any scheduled timers so reveal runs only once
-        if (window._caseRevealTimer) { clearTimeout(window._caseRevealTimer); window._caseRevealTimer = null; }
-        if (window._caseStartTimer) { clearTimeout(window._caseStartTimer); window._caseStartTimer = null; }
-      } catch (e) { /* ignore */ }
-      try {
-        window._caseRevealNow();
-      } catch (err) {
-        console.warn("stopAnimationAndShowWinner: reveal invocation failed:", err);
-      } finally {
-        // cleanup flags
-        window._caseRevealNow = null;
-        window._caseIsGoldReveal = false;
-        window._caseRevealTimer = null;
-        window._caseStartTimer = null;
-      }
+        if (window._caseRevealTimer) clearTimeout(window._caseRevealTimer);
+        if (window._caseStartTimer) clearTimeout(window._caseStartTimer);
+      } catch (e) { }
+
+      // Hide all case modals and skip straight to Items Earned popup
+      document.getElementById("caseOpeningModal").classList.add("hidden");
+      document.getElementById("caseConfirmModal").classList.add("hidden");
+      
+      // Perform the reveal logic (adds items to account) but skip the DOM display
+      const originalReveal = window._caseRevealNow;
+      window._caseRevealNow = null; // Prevent re-entry
+      
+      // Execute the actual logic part of revealNow but manually suppress the popup if possible
+      // In this specific structure, just calling it and then hiding result works
+      originalReveal();
+      
+      setTimeout(() => {
+        document.getElementById("caseOpeningModal").classList.add("hidden");
+        showGroupedPurchaseResult();
+      }, 50);
+
       return;
     }
 
@@ -23568,55 +24150,7 @@ function openBidSkinMarket(forceRefresh = false) {
   const searchSheet = document.getElementById("searchSheet");
   if (searchSheet) searchSheet.classList.add("hidden");
 
-  if (forceRefresh) {
-    state.bidSkinListings = [];
-    state.pinnedListingIds = [];
-    bidSkinPage = 1;
-    state.bidSkinPage = 1;
-  }
-
-  // Show a "Generating" loader if the market needs building to prevent the app from appearing frozen
-  if (!state.bidSkinListings || state.bidSkinListings.length === 0) {
-    const modal = document.getElementById("bidSkinModal") || document.createElement("div");
-    modal.id = "bidSkinModal";
-    modal.className = "modal-overlay";
-    modal.style.zIndex = 3000;
-    modal.innerHTML = `
-      <div class="user-snippet-modal market-loading-modal">
-        <div class="spinner" style="width:60px; height:60px;"></div>
-        <div class="market-loading-text">Generating Global Marketplace...</div>
-        <p style="color:#94a3b8; font-size:12px;">Building 600+ unique listings and crafts.</p>
-      </div>
-    `;
-    document.body.appendChild(modal);
-    modal.classList.remove("hidden");
-    
-    // Chunk the generation into a timeout to yield thread
-    setTimeout(() => {
-        // Trigger generation
-        const dummy = getSortedBidListings();
-        openBidSkinMarket(); // Re-open once data is ready
-    }, 50);
-    return;
-  }
-
-  // Load page from state to save position
-  bidSkinPage = state.bidSkinPage || 1;
-
-  let modal = document.getElementById("bidSkinModal");
-  if (!modal) {
-    modal = document.createElement("div");
-    modal.id = "bidSkinModal";
-    modal.className = "modal-overlay";
-    modal.style.zIndex = 3000;
-    document.body.appendChild(modal);
-  }
-
-  if (!allSkins.length) {
-    alert("Database is still loading. Please try again in a moment.");
-    return;
-  }
-
+  // Move definitions to top level of function to avoid ReferenceErrors during init
   const getListingFloatValue = (listing) => {
     const raw = (typeof listing?.item?.floatVal === "number" && !isNaN(listing.item.floatVal))
       ? listing.item.floatVal
@@ -23671,6 +24205,186 @@ function openBidSkinMarket(forceRefresh = false) {
     });
   };
 
+  window.getSortedBidListings = getSortedBidListings;
+
+  let katoHoloPool = [];
+  let crownFoil = null;
+  let gunPool = [];
+  let stickerGunPool = [];
+  let anyStickers = [];
+  let cheapRandomStickers = [];
+  let premiumStickerPool = [];
+  let kato2014HoloPool = [];
+  let kato2015CraftPool = [];
+  let gunCraftPool = [];
+  let crownFoilLocal = null;
+
+  const addGuaranteedBidSkinListing = (pick, options = {}) => {
+    if (!pick?.name) return;
+    const listingWear = options.wear ?? null;
+    const isActuallySpecial = pick.name.includes("★") || (pick.type || "").toLowerCase().includes("knife") || (pick.name || "").toLowerCase().includes("gloves");
+    const dopplerPattern = options.pattern ?? 1;
+    const dopplerPhase = /doppler/i.test(options.name || pick.name)
+      ? (options.dopplerPhase || deriveDopplerPhaseLabel({ name: options.name || pick.name, pattern: dopplerPattern }))
+      : "";
+    const dopplerPriceName = dopplerPhase ? `${options.name || pick.name} (${dopplerPhase})` : (options.name || pick.name);
+    const rawApiName = getRawApiName({
+      ...pick,
+      name: dopplerPriceName,
+      skinBidsApiName: dopplerPriceName
+    }) || dopplerPriceName;
+    const exactDopplerImage = getExactApiImage({
+      ...pick,
+      name: rawApiName,
+      skinBidsApiName: rawApiName,
+      pattern: dopplerPattern,
+      float: options.floatVal,
+      floatVal: options.floatVal
+    });
+    const baseListingPrice = clampCaseHardenedPrice(pick.name, PRICE_FIXES[pick.name] || mockPrice(pick));
+    const marketPrice = Math.max(0.03, baseListingPrice * (options.marketMult || 1.08));
+    const price = Math.max(0.02, clampCaseHardenedPrice(options.name || pick.name, marketPrice * (options.priceMult || 0.92)));
+    state.bidSkinListings.push({
+      id: "bs_" + Math.random().toString(36).substr(2, 9),
+      item: {
+        ...pick,
+        name: options.name || pick.name,
+        rarity: { name: options.rarity || pick.rarity?.name || "High Grade" },
+        floatVal: options.floatVal ?? (listingWear ? generateFloatForWear(pick.name, listingWear, pick.rarity?.name) : null),
+        pattern: options.pattern ?? null,
+        skinBidsApiName: rawApiName || pick.skinBidsApiName || pick.name,
+        image: exactDopplerImage || pick.image || pick.img || "",
+        img: exactDopplerImage || pick.img || pick.image || "",
+        steamPhaseImage: exactDopplerImage || pick.steamPhaseImage || null
+      },
+      marketPrice,
+      price,
+      discountPercent: Math.max(0, Math.round((1 - (price / marketPrice)) * 100)),
+      nametag: (isStickerNamedItem(options.name || pick.name) || isActuallySpecial) ? null : (options.nametag || null),
+      stickers: isActuallySpecial ? [] : (options.stickers || []),
+      wear: listingWear,
+      float: options.floatVal != null ? Number(options.floatVal).toFixed(12) : null,
+      pattern: options.pattern ?? null,
+      isSpecial: isActuallySpecial,
+      prevOwners: options.prevOwners || (Math.floor(Math.random() * 6) + 1)
+    });
+  };
+
+  const addGuaranteedKatoCraftListings = (stickerPool, count, options = {}) => {
+    if (!Array.isArray(stickerPool) || !stickerPool.length || !Array.isArray(gunCraftPool) || !gunCraftPool.length) return;
+    for (let i = 0; i < count; i++) {
+      const weapon = gunCraftPool[i % gunCraftPool.length];
+      const sticker = stickerPool[Math.floor(Math.random() * stickerPool.length)];
+      if (!weapon || !sticker) continue;
+      const weaponBasePrice = PRICE_FIXES[weapon.name] || mockPrice(weapon);
+      const stickerBasePrice = PRICE_FIXES[sticker.name] || mockPrice(sticker);
+      const wearOptions = ["Factory New", "Minimal Wear", "Field-Tested", "Well-Worn"];
+      const wear = wearOptions[Math.floor(Math.random() * wearOptions.length)];
+      const stickers = Array.from({ length: 4 }, () => ({
+        name: sticker.name,
+        img: getDisplayImage(sticker),
+        price: stickerBasePrice * 0.55,
+        rarity: sticker.rarity?.name || "Remarkable",
+        scratchPercent: 0
+      }));
+      addGuaranteedBidSkinListing(weapon, {
+        rarity: weapon.rarity?.name || "Classified",
+        wear,
+        floatVal: null,
+        pattern: Math.max(1, Math.floor(Math.random() * 999) + 1),
+        stickers,
+        marketMult: options.marketMult || (weaponBasePrice > 250 ? 1.45 : 1.28),
+        priceMult: options.priceMult || 0.94,
+        prevOwners: Math.floor(Math.random() * 3) + 1
+      });
+    }
+  };
+
+  const addGuaranteedSingleCraft = (stickerNamePattern, options = {}) => {
+    const sticker = allSkins.find(s => stickerNamePattern.test(String(s?.name || "")));
+    const weapon = options.weapon || gunCraftPool[Math.floor(Math.random() * gunCraftPool.length)];
+    if (!sticker || !weapon) return;
+    const wearOptions = ["Factory New", "Minimal Wear", "Field-Tested", "Well-Worn"];
+    const wear = options.wear || wearOptions[Math.floor(Math.random() * wearOptions.length)];
+    const stickerBasePrice = PRICE_FIXES[sticker.name] || mockPrice(sticker);
+    addGuaranteedBidSkinListing(weapon, {
+      rarity: weapon.rarity?.name || "Classified",
+      wear,
+      floatVal: null,
+      pattern: Math.max(1, Math.floor(Math.random() * 999) + 1),
+      stickers: Array.from({ length: 4 }, () => ({
+        name: sticker.name,
+        img: getDisplayImage(sticker),
+        price: stickerBasePrice * 0.55,
+        rarity: sticker.rarity?.name || "Remarkable",
+        scratchPercent: 0
+      })),
+      marketMult: options.marketMult || 1.6,
+      priceMult: options.priceMult || 0.95,
+      prevOwners: Math.floor(Math.random() * 2) + 1
+    });
+  };
+
+  if (forceRefresh) {
+    state.bidSkinListings = [];
+    state.pinnedListingIds = [];
+    bidSkinPage = 1;
+    state.bidSkinPage = 1;
+  }
+
+  let modal = document.getElementById("bidSkinModal");
+  if (!modal) {
+    modal = document.createElement("div");
+    modal.id = "bidSkinModal";
+    modal.className = "modal-overlay";
+    modal.style.zIndex = 3000;
+    document.body.appendChild(modal);
+  }
+
+  if (!allSkins.length) {
+    // If empty on refresh, try loading from cache before alert
+    const cached = localStorage.getItem(SKINS_CACHE_DB_KEY);
+    if (cached) {
+      const parsed = JSON.parse(cached);
+      allSkins = parsed.allSkins;
+      indexApiData();
+    } else {
+      alert("Database is still loading. Please try again in a moment.");
+      return;
+    }
+  }
+
+  // Initialize common pools now that allSkins is guaranteed loaded
+  katoHoloPool = allSkins.filter(s => s.name.includes("Katowice 2014") && s.name.includes("(Holo)"));
+  crownFoil = allSkins.find(s => s.name.includes("Crown (Foil)"));
+  gunPool = allSkins.filter(s => s.name.includes("|") && !s.name.includes("★"));
+  stickerGunPool = gunPool.filter(g => !isStickerNamedItem(g));
+  anyStickers = allSkins.filter(s => {
+    const n = String(s?.name || "").toLowerCase();
+    return n.includes("sticker") && !n.includes("capsule");
+  });
+  cheapRandomStickers = anyStickers.filter(s => {
+    const price = PRICE_FIXES[s.name] || mockPrice(s);
+    return price <= 25 && !isKatoMarketSticker(s);
+  });
+  premiumStickerPool = allSkins.filter(s => isKatoMarketSticker(s));
+  kato2014HoloPool = allSkins.filter(s => {
+    const n = (s.name || "").toLowerCase();
+    return n.includes("sticker") && n.includes("katowice 2014") && n.includes("(holo)") && !n.includes("capsule");
+  });
+  kato2015CraftPool = allSkins.filter(s => {
+    const n = (s.name || "").toLowerCase();
+    return n.includes("sticker") && n.includes("katowice 2015") && !n.includes("capsule") && (n.includes("(holo)") || n.includes("(foil)") || n.includes("(foi)"));
+  });
+  gunCraftPool = allSkins.filter(s => {
+    const n = String(s?.name || "").toLowerCase();
+    const t = (s?.type || s?.category?.name || "").toLowerCase();
+    return isWeaponMarketItem(s) && !n.includes("sticker") && !n.includes("agent") && !n.includes("gloves") && !t.includes("gloves") && !n.includes("★") && !t.includes("knife");
+  });
+  crownFoilLocal = allSkins.find(s => /sticker\s*\|\s*crown \(foil\)/i.test(s.name || ""));
+
+  bidSkinPage = state.bidSkinPage || 1;
+
   modal.classList.remove("hidden");
 
   // Robust Doppler Synchronization for Market Listings
@@ -23704,7 +24418,23 @@ function openBidSkinMarket(forceRefresh = false) {
   }
 
   // Force re-generation if market is blank to prevent blank popup on refresh
-  if (!state.bidSkinListings || state.bidSkinListings.length === 0) {
+  if (forceRefresh || !state.bidSkinListings || state.bidSkinListings.length === 0) {
+    // Generate exactly 5 stickered items
+    const stickerGuns = [];
+    const titanGun = stickerGunPool[Math.floor(Math.random()*stickerGunPool.length)];
+    const titanSticker = allSkins.find(s => s.name.includes("Titan (Holo) | Katowice 2014"));
+    if(titanGun && titanSticker) {
+        addGuaranteedBidSkinListing(titanGun, { stickers: Array(4).fill(titanSticker), marketMult: 3.5 });
+    }
+    const ibpGun = stickerGunPool[Math.floor(Math.random()*stickerGunPool.length)];
+    const ibpSticker = allSkins.find(s => s.name.includes("iBUYPOWER (Holo) | Katowice 2014"));
+    if(ibpGun && ibpSticker) {
+        addGuaranteedBidSkinListing(ibpGun, { stickers: Array(4).fill(ibpSticker), marketMult: 3.5 });
+    }
+    for(let i=0; i<3; i++) {
+        const cGun = stickerGunPool[Math.floor(Math.random()*stickerGunPool.length)];
+        if(cGun && crownFoil) addGuaranteedBidSkinListing(cGun, { stickers: Array(4).fill(crownFoil), marketMult: 2.5 });
+    }
     const isSpecial = (s) => (s.name || "").includes("★") || (s.type || "").toLowerCase().includes("knife") || (s.name || "").toLowerCase().includes("gloves");
     
     // Priority rare skins list
@@ -23742,6 +24472,22 @@ function openBidSkinMarket(forceRefresh = false) {
       }
     });
 
+    // 5 Specific stickered weapons as requested
+    const titanHolo = allSkins.find(s => /sticker\s*\|\s*titan \(holo\) \| katowice 2014/i.test(s.name || ""));
+    const ibpHolo = allSkins.find(s => /sticker\s*\|\s*ibuypower \(holo\) \| katowice 2014/i.test(s.name || ""));
+    
+    if(gunPool.length >= 5) {
+        const chosenGuns = gunPool.sort(() => 0.5 - Math.random()).slice(0, 5);
+        // 1x Titan
+        addGuaranteedBidSkinListing(chosenGuns[0], { stickers: Array(4).fill({...titanHolo, price: 50000}), marketMult: 2.2 });
+        // 1x IBP
+        addGuaranteedBidSkinListing(chosenGuns[1], { stickers: Array(4).fill({...ibpHolo, price: 50000}), marketMult: 2.1 });
+        // 3x Crown
+        addGuaranteedBidSkinListing(chosenGuns[2], { stickers: Array(4).fill({...crownFoil, price: 500}), marketMult: 1.8 });
+        addGuaranteedBidSkinListing(chosenGuns[3], { stickers: Array(4).fill({...crownFoil, price: 500}), marketMult: 1.8 });
+        addGuaranteedBidSkinListing(chosenGuns[4], { stickers: Array(4).fill({...crownFoil, price: 500}), marketMult: 1.8 });
+    }
+
     const anyStickers = allSkins.filter(s => {
       const n = String(s?.name || "").toLowerCase();
       return n.includes("sticker") && !n.includes("capsule");
@@ -23767,112 +24513,6 @@ function openBidSkinMarket(forceRefresh = false) {
       return isWeaponMarketItem(s) && !n.includes("sticker") && !n.includes("agent") && !n.includes("gloves") && !t.includes("gloves") && !n.includes("★") && !t.includes("knife");
     });
     const crownFoilLocal = allSkins.find(s => /sticker\s*\|\s*crown \(foil\)/i.test(s.name || ""));
-
-    const addGuaranteedBidSkinListing = (pick, options = {}) => {
-      if (!pick?.name) return;
-      const listingWear = options.wear ?? null;
-      const isActuallySpecial = isSpecial(pick);
-      const dopplerPattern = options.pattern ?? 1;
-      const dopplerPhase = /doppler/i.test(options.name || pick.name)
-        ? (options.dopplerPhase || deriveDopplerPhaseLabel({ name: options.name || pick.name, pattern: dopplerPattern }))
-        : "";
-      const dopplerPriceName = dopplerPhase ? `${options.name || pick.name} (${dopplerPhase})` : (options.name || pick.name);
-      const rawApiName = getRawApiName({
-        ...pick,
-        name: dopplerPriceName,
-        skinBidsApiName: dopplerPriceName
-      }) || dopplerPriceName;
-      const exactDopplerImage = getExactApiImage({
-        ...pick,
-        name: rawApiName,
-        skinBidsApiName: rawApiName,
-        pattern: dopplerPattern,
-        float: options.floatVal,
-        floatVal: options.floatVal
-      });
-      const baseListingPrice = clampCaseHardenedPrice(pick.name, PRICE_FIXES[pick.name] || mockPrice(pick));
-      const marketPrice = Math.max(0.03, baseListingPrice * (options.marketMult || 1.08));
-      const price = Math.max(0.02, clampCaseHardenedPrice(options.name || pick.name, marketPrice * (options.priceMult || 0.92)));
-      state.bidSkinListings.push({
-        id: "bs_" + Math.random().toString(36).substr(2, 9),
-        item: {
-          ...pick,
-          name: options.name || pick.name,
-          rarity: { name: options.rarity || pick.rarity?.name || "High Grade" },
-          floatVal: options.floatVal ?? (listingWear ? generateFloatForWear(pick.name, listingWear, pick.rarity?.name) : null),
-          pattern: options.pattern ?? null,
-          skinBidsApiName: rawApiName || pick.skinBidsApiName || pick.name,
-          image: exactDopplerImage || pick.image || pick.img || "",
-          img: exactDopplerImage || pick.img || pick.image || "",
-          steamPhaseImage: exactDopplerImage || pick.steamPhaseImage || null
-        },
-        marketPrice,
-        price,
-        discountPercent: Math.max(0, Math.round((1 - (price / marketPrice)) * 100)),
-        nametag: (isStickerNamedItem(options.name || pick.name) || isActuallySpecial) ? null : (options.nametag || null),
-        stickers: isActuallySpecial ? [] : (options.stickers || []),
-        wear: listingWear,
-        float: options.floatVal != null ? Number(options.floatVal).toFixed(12) : null,
-        pattern: options.pattern ?? null,
-        isSpecial: isActuallySpecial,
-        prevOwners: options.prevOwners || (Math.floor(Math.random() * 6) + 1)
-      });
-    };
-
-    const addGuaranteedKatoCraftListings = (stickerPool, count, options = {}) => {
-      if (!Array.isArray(stickerPool) || !stickerPool.length || !Array.isArray(gunCraftPool) || !gunCraftPool.length) return;
-      for (let i = 0; i < count; i++) {
-        const weapon = gunCraftPool[i % gunCraftPool.length];
-        const sticker = stickerPool[Math.floor(Math.random() * stickerPool.length)];
-        if (!weapon || !sticker) continue;
-        const weaponBasePrice = PRICE_FIXES[weapon.name] || mockPrice(weapon);
-        const stickerBasePrice = PRICE_FIXES[sticker.name] || mockPrice(sticker);
-        const wearOptions = ["Factory New", "Minimal Wear", "Field-Tested", "Well-Worn"];
-        const wear = wearOptions[Math.floor(Math.random() * wearOptions.length)];
-        const stickers = Array.from({ length: 4 }, () => ({
-          name: sticker.name,
-          img: getDisplayImage(sticker),
-          price: stickerBasePrice * 0.55,
-          rarity: sticker.rarity?.name || "Remarkable",
-          scratchPercent: 0
-        }));
-        addGuaranteedBidSkinListing(weapon, {
-          rarity: weapon.rarity?.name || "Classified",
-          wear,
-          floatVal: null,
-          pattern: Math.max(1, Math.floor(Math.random() * 999) + 1),
-          stickers,
-          marketMult: options.marketMult || (weaponBasePrice > 250 ? 1.45 : 1.28),
-          priceMult: options.priceMult || 0.94,
-          prevOwners: Math.floor(Math.random() * 3) + 1
-        });
-      }
-    };
-
-    const addGuaranteedSingleCraft = (stickerNamePattern, options = {}) => {
-      const sticker = allSkins.find(s => stickerNamePattern.test(String(s?.name || "")));
-      const weapon = options.weapon || gunCraftPool[Math.floor(Math.random() * gunCraftPool.length)];
-      if (!sticker || !weapon) return;
-      const wearOptions = ["Factory New", "Minimal Wear", "Field-Tested", "Well-Worn"];
-      const wear = options.wear || wearOptions[Math.floor(Math.random() * wearOptions.length)];
-      const stickerBasePrice = PRICE_FIXES[sticker.name] || mockPrice(sticker);
-      addGuaranteedBidSkinListing(weapon, {
-        rarity: weapon.rarity?.name || "Classified",
-        wear,
-        floatVal: null,
-        pattern: Math.max(1, Math.floor(Math.random() * 999) + 1),
-        stickers: Array.from({ length: 4 }, () => ({
-          name: sticker.name,
-          img: getDisplayImage(sticker),
-          price: stickerBasePrice * 0.55,
-          rarity: sticker.rarity?.name || "Remarkable",
-          scratchPercent: 0
-        })),
-        marketMult: options.marketMult || 1.6,
-        priceMult: options.priceMult || 0.95,
-        prevOwners: Math.floor(Math.random() * 2) + 1
-      });
-    };
 
     // Ensure Case Hardened variety
     const chWeaponNames = ["AK-47 | Case Hardened", "Five-SeveN | Case Hardened", "MAC-10 | Case Hardened", "★ Karambit | Case Hardened", "★ M9 Bayonet | Case Hardened", "★ Bayonet | Case Hardened", "★ Flip Knife | Case Hardened", "★ Gut Knife | Case Hardened", "★ Huntsman Knife | Case Hardened", "★ Bowie Knife | Case Hardened", "★ Falchion Knife | Case Hardened", "★ Shadow Daggers | Case Hardened", "★ Navaja Knife | Case Hardened", "★ Stiletto Knife | Case Hardened", "★ Ursus Knife | Case Hardened", "★ Talon Knife | Case Hardened", "★ Nomad Knife | Case Hardened", "★ Skeleton Knife | Case Hardened", "★ Paracord Knife | Case Hardened", "★ Survival Knife | Case Hardened", "★ Kukri Knife | Case Hardened"];
@@ -23918,8 +24558,8 @@ function openBidSkinMarket(forceRefresh = false) {
 
       for (let c = 0; c < copies; c++) {
       const isWeaponOnly = pick.name.includes("|") && !isSpecial(pick);
-      // realism: knives are Red
-      if (pick.name.includes("★") || (pick.type || "").toLowerCase().includes("knife")) {
+      // realism: knives/gloves are Red
+      if (pick.name.includes("★") || (pick.type || "").toLowerCase().includes("knife") || (pick.type || "").toLowerCase().includes("gloves")) {
           pick.rarity = { name: "Covert" };
       }
       const isSouvenirListing = isWeaponOnly && Math.random() < 0.0015;
@@ -23927,9 +24567,9 @@ function openBidSkinMarket(forceRefresh = false) {
       const basePrice = PRICE_FIXES[pick.name] || mockPrice(pick);
       const stickers = [];
       const ibuypowerHolo = allSkins.find(s => /sticker\s*\|\s*ibuypower \(holo\) \| katowice 2014/i.test(s.name || ""));
-      const titanHolo = allSkins.find(s => /sticker\s*\|\s*titan \(holo\) \| katowice 2014/i.test(s.name || ""));
+      const titanHoloLocal = allSkins.find(s => /sticker\s*\|\s*titan \(holo\) \| katowice 2014/i.test(s.name || ""));
       const crownFoilLocal = allSkins.find(s => /sticker\s*\|\s*crown \(foil\)/i.test(s.name || ""));
-      const ultraRareCraftSticker = Math.random() < 0.5 ? ibuypowerHolo : titanHolo;
+      const ultraRareCraftSticker = Math.random() < 0.5 ? ibuypowerHolo : titanHoloLocal;
 
       if (isWeaponOnly && !isSpecial(pick) && basePrice > 200 && ultraRareCraftSticker && Math.random() < 0.0005) {
           for (let j = 0; j < 4; j++) {
@@ -23953,23 +24593,9 @@ function openBidSkinMarket(forceRefresh = false) {
                   scratchPercent: 0
               });
           }
-      } else if (isSouvenirListing) {
-        const goldPool = allSkins.filter(isSouvenirGoldStickerItem);
-        if (goldPool.length > 0) {
-          for (let j = 0; j < 4; j++) {
-            const s = goldPool[Math.floor(Math.random() * goldPool.length)];
-            stickers.push({
-              name: s.name,
-              img: getDisplayImage(s),
-              price: (PRICE_FIXES[s.name] || mockPrice(s)) * 0.5,
-              rarity: "Extraordinary",
-              scratchPercent: 0
-            });
-          }
-        }
-      } else if (isWeaponOnly && !isSpecial(pick) && (Math.random() < 0.25)) {
+      } else if (isWeaponOnly && !isSpecial(pick) && (Math.random() < 0.05)) {
         // Frequency of stickers on market weapons (1-5 stickers)
-        const isKatoCombo = Math.random() < 0.006; // Further reduced frequency of 4x Kato crafts
+        const isKatoCombo = Math.random() < 0.001; // Further reduced frequency of 4x Kato crafts
         const sCountRoll = Math.random();
         let sCount = 1;
         if (sCountRoll < 0.15) sCount = 5;
@@ -23986,12 +24612,9 @@ function openBidSkinMarket(forceRefresh = false) {
         const sourcePool = sourcePoolRaw.filter(s => {
           const sn = (s.name || "").toLowerCase();
           if (sn.includes("sticker slab")) {
-             if (hasSlab) return false; // Max 1 slab logic
-             if (Math.random() < 0.02) {
-               hasSlab = true;
-               return true;
-             }
-             return false;
+             if (hasSlab) return false; 
+             hasSlab = true;
+             return true;
           }
           return true;
         });
@@ -24017,7 +24640,7 @@ function openBidSkinMarket(forceRefresh = false) {
 
       // Rarity-aware wear distribution: high tier (Covert/Gold) are rarely Factory New
       const itemRarity = pick.rarity?.name || pick.rarity || "Mil-Spec";
-      const isHighTier = ["Covert", "Gold", "Extraordinary"].includes(itemRarity) || (pick.name || "").includes("★");
+      const isHighTier = ["Covert", "Gold", "Extraordinary"].includes(itemRarity) || (pick.name || "").includes("★") || (pick.type || "").toLowerCase().includes("knife");
 
       const wearRoll = Math.random();
       let finalWear = "Field-Tested";
@@ -24248,12 +24871,12 @@ function openBidSkinMarket(forceRefresh = false) {
     }
 
     // Fill up to 300 if pool > $50 was smaller than 300
-    if (state.bidSkinListings.length < 600) {
+    if (state.bidSkinListings.length < 100) {
        const fillPool = allSkins.filter(s => {
          const p = PRICE_FIXES[s.name] || mockPrice(s);
          return p > 10 && p <= 50 && !isSpecial(s) && isWeaponMarketItem(s);
        });
-       while (state.bidSkinListings.length < 600 && fillPool.length > 0) {
+       while (state.bidSkinListings.length < 100 && fillPool.length > 0) {
          const pick = fillPool.splice(Math.floor(Math.random()*fillPool.length), 1)[0];
          if (!isSkinBidsEligibleItem(pick)) continue;
          state.bidSkinListings.push({
@@ -24339,46 +24962,17 @@ function openBidSkinMarket(forceRefresh = false) {
       : sorted;
 
     modal.innerHTML = `
-      <div class="user-snippet-modal" style="max-width: 98vw; width: 98vw; height: 98vh; padding: 15px; top: 1vh; bottom: 1vh; position: fixed;">
-        <button class="close-snippet-modal" onclick="document.getElementById('bidSkinModal').classList.add('hidden')">✕</button>
-        <div style="text-align: left; margin-bottom: 10px; display:flex; align-items:center; gap:20px;">
+      <div class="user-snippet-modal" style="max-width: 98vw; width: 98vw; height: 98vh; padding: 0; top: 1vh; bottom: 1vh; position: fixed; overflow: hidden;">
+        <button class="close-snippet-modal" style="top:15px; right:15px;" onclick="document.getElementById('bidSkinModal').classList.add('hidden')">✕</button>
+        
+        <div style="padding: 20px 25px 0 25px; text-align: left; display:flex; align-items:center; gap:20px;">
           <h2 style="color: #f59e0b; font-size: 24px; margin:0; font-family: 'Arial Black', sans-serif;">SkinBids.com Market</h2>
           <div style="display:flex; align-items:center; gap:12px;">
              <div style="color:#a4d007; font-weight:900; font-size:18px; white-space:nowrap;">Wallet: ${formatPrice(acc.walletBalance)}</div>
-             <button id="bsAddBalance" class="steam-btn highlight" style="font-size:11px; padding:4px 10px;">Add Wallet Balance</button>
-             <button id="showMarketHistoryBtn" class="steam-btn highlight" style="font-size:11px; padding: 4px 12px;">Purchase History</button>
           </div>
         </div>
-        
-        <div style="display:flex; gap:10px; margin-bottom:15px; align-items:center;">
-          <input type="text" id="bsSearch" class="steam-input" placeholder="Search SkinBids (Typing won't close modal)..." style="flex:1;" value="${bidSkinSearch}">
-          <select id="bsSort" class="steam-select" style="min-width:120px;">
-            <option value="none" ${state.bidSkinSort === 'none' ? 'selected' : ''}>Sort 1</option>
-            <option value="priceAsc" ${state.bidSkinSort === 'priceAsc' ? 'selected' : ''}>Price: Lowest</option>
-            <option value="priceDesc" ${state.bidSkinSort === 'priceDesc' ? 'selected' : ''}>Price: Highest</option>
-            <option value="discount" ${state.bidSkinSort === 'discount' ? 'selected' : ''}>Highest Discount</option>
-            <option value="floatAsc" ${state.bidSkinSort === 'floatAsc' ? 'selected' : ''}>Float: Lowest</option>
-            <option value="floatDesc" ${state.bidSkinSort === 'floatDesc' ? 'selected' : ''}>Float: Highest</option>
-            <option value="mostStickers" ${state.bidSkinSort === 'mostStickers' ? 'selected' : ''}>Most Stickers</option>
-            <option value="name" ${state.bidSkinSort === 'name' ? 'selected' : ''}>Name A-Z</option>
-            <option value="rarityRestricted" ${state.bidSkinSort === 'rarityRestricted' ? 'selected' : ''}>Restricted Only</option>
-            <option value="rarityClassified" ${state.bidSkinSort === 'rarityClassified' ? 'selected' : ''}>Classified Only</option>
-            <option value="rarityCovert" ${state.bidSkinSort === 'rarityCovert' ? 'selected' : ''}>Covert Only</option>
-            <option value="covertSpecial" ${state.bidSkinSort === 'covertSpecial' ? 'selected' : ''}>Covert Knives/Gloves</option>
-            <option value="quality" ${state.bidSkinSort === 'quality' ? 'selected' : ''}>Quality</option>
-          </select>
-          <select id="bsSort2" class="steam-select" style="min-width:120px;">
-            <option value="none" ${state.bidSkinSort2 === 'none' ? 'selected' : ''}>Sort 2</option>
-            <option value="priceDesc" ${state.bidSkinSort2 === 'priceDesc' ? 'selected' : ''}>Highest Price</option>
-            <option value="priceAsc" ${state.bidSkinSort2 === 'priceAsc' ? 'selected' : ''}>Lowest Price</option>
-            <option value="floatDesc" ${state.bidSkinSort2 === 'floatDesc' ? 'selected' : ''}>Highest Float</option>
-            <option value="floatAsc" ${state.bidSkinSort2 === 'floatAsc' ? 'selected' : ''}>Lowest Float</option>
-          </select>
-          <button class="steam-btn highlight" id="bsAddBtn">List Item</button>
-          <button class="steam-btn highlight" id="bsRefreshBtn" type="button" onclick="openBidSkinMarket(true)" style="background:#3b82f6;">Refresh Market</button>
-        </div>
 
-        <div class="trade-items-grid" id="bsGrid" style="flex:1; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); ${state.skinBidsPaged ? '' : 'overflow-y: scroll;'}">
+        <div class="trade-items-grid" id="bsGrid" style="flex:1; padding:25px; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); ${state.skinBidsPaged ? '' : 'overflow-y: scroll;'}">
           ${pageItems.map((l) => {
             const isSouvenir = (l.item.name || "").includes("Souvenir");
             const lRarity = l.item.rarity?.name || l.item.rarity || "Covert";
@@ -24456,12 +25050,29 @@ function openBidSkinMarket(forceRefresh = false) {
           }).join('')}
         </div>
 
-        ${state.skinBidsPaged ? `
-        <div style="display:flex; justify-content:center; gap:20px; margin-top:15px; align-items:center;">
-          <button class="steam-btn grey" id="bsPrevPageBtn" onclick="changeBSPage(-1)">PREV</button>
-          <span id="bsPageIndicator" style="font-weight:900;">${bidSkinPage} / ${totalPages}</span>
-          <button class="steam-btn grey" id="bsNextPageBtn" onclick="changeBSPage(1)">NEXT</button>
-        </div>` : ''}
+        <div class="market-footer">
+          <input type="text" id="bsSearch" class="steam-input" placeholder="Search..." style="flex:1.5;" value="${bidSkinSearch}">
+          <select id="bsSort" class="steam-select" style="flex:1;">
+            <option value="none" ${state.bidSkinSort === 'none' ? 'selected' : ''}>Sort Type</option>
+            <option value="priceAsc" ${state.bidSkinSort === 'priceAsc' ? 'selected' : ''}>Price: Lowest</option>
+            <option value="priceDesc" ${state.bidSkinSort === 'priceDesc' ? 'selected' : ''}>Price: Highest</option>
+            <option value="discount" ${state.bidSkinSort === 'discount' ? 'selected' : ''}>Highest Discount</option>
+            <option value="floatAsc" ${state.bidSkinSort === 'floatAsc' ? 'selected' : ''}>Float: Lowest</option>
+            <option value="floatDesc" ${state.bidSkinSort === 'floatDesc' ? 'selected' : ''}>Float: Highest</option>
+            <option value="mostStickers" ${state.bidSkinSort === 'mostStickers' ? 'selected' : ''}>Most Stickers</option>
+            <option value="quality" ${state.bidSkinSort === 'quality' ? 'selected' : ''}>Quality</option>
+          </select>
+          <button class="steam-btn highlight" id="bsAddBalance">Deposit Funds</button>
+          <button class="steam-btn highlight" id="bsAddBtn">List Item</button>
+          <button class="steam-btn highlight" id="showMarketHistoryBtn">History</button>
+          <button class="steam-btn highlight" id="bsRefreshBtn" type="button" onclick="openBidSkinMarket(true)" style="background:#3b82f6;">Refresh</button>
+          
+          <div style="flex:1; display:flex; justify-content:flex-end; align-items:center; gap:10px;">
+            <button class="steam-btn grey" id="bsPrevPageBtn" onclick="changeBSPage(-1)">❮</button>
+            <span id="bsPageIndicator" style="font-weight:900; font-size:14px; min-width:60px; text-align:center;">${bidSkinPage} / ${totalPages}</span>
+            <button class="steam-btn grey" id="bsNextPageBtn" onclick="changeBSPage(1)">❯</button>
+          </div>
+        </div>
       </div>
     `;
 
@@ -24540,8 +25151,9 @@ function openBidSkinMarket(forceRefresh = false) {
         const patternVal = getListingPatternValue(l);
         const barPos = Math.min(100, Math.max(0, floatVal * 100));
         const displayName = (l.item.name || "").replace(/â„¢|â„¢|â„¢|Ã¢â€žÂ¢|ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢|™/g, "™");
+        const displayItem = { ...l.item, name: displayName, wear: l.wear, pattern: patternVal, floatVal: floatVal };
         // Ensure variety in paginated render
-        const displayImageSrc = l.item.image || l.item.img || getStableDisplayImage({ ...l.item, name: displayName, wear: l.wear, pattern: patternVal, floatVal: floatVal });
+        const displayImageSrc = l.item.image || l.item.img || getStableDisplayImage(displayItem);
         const displayStickers = Array.isArray(l.stickers) ? l.stickers : [];
         const displayNametag = isStickerNamedItem(displayItem) ? null : l.nametag;
         const dataPayload = JSON.stringify({
@@ -24892,6 +25504,10 @@ function openLoadoutModal() {
 }
 
 function renderLoadoutUI() {
+  // Clear any existing tooltips
+  const existingTooltip = document.getElementById("loadoutFloatingTooltip");
+  if (existingTooltip) existingTooltip.remove();
+
   const activeAccount = getActiveAccount();
   const viewingProfile = state.viewingProfileId ? state.accounts.find(a => a.id === state.viewingProfileId) : null;
   const account = viewingProfile || activeAccount;
@@ -24935,15 +25551,41 @@ function renderLoadoutUI() {
           <img src="${getStableDisplayImage(item)}" style="width:75%; height:75%; object-fit:contain; margin-top:-10px;">
           <div class="loadout-slot-equipped"></div>
           <div class="loadout-slot-stickers" style="position:absolute; bottom:28px; left:8px; right:auto; display:flex; gap:4px; flex-direction:row;">${stickersHtml}</div>
-          <div class="loadout-slot-label" style="background: rgba(0,0,0,0.75); padding: 6px; font-size: 13px; font-weight:900; color:#fff; text-shadow:0 1px 3px #000; bottom:0; height:auto; display:block; position:absolute; left:0; right:0;">${displayName}</div>
+          <div class="loadout-slot-label-hover" style="background: rgba(0,0,0,0.85); padding: 8px; font-size: 14px; font-weight:900; color:${rarityCol}; text-shadow:0 1px 3px #000; bottom:0; height:auto; display:none; position:absolute; left:0; right:0; z-index:10;">${displayName}</div>
           <div style="position:absolute; bottom:0; left:0; right:0; height:6px; background:${rarityCol}; box-shadow: 0 -2px 10px ${rarityCol}66;"></div>
         `;
+        slotEl.onmouseenter = (e) => { 
+          const rarityCol = RARITY_COLORS[item.rarity] || "#fff";
+          const displayName = item.nametag ? `"${item.nametag}"` : item.name;
+          let tooltip = document.getElementById("loadoutFloatingTooltip");
+          if (!tooltip) {
+              tooltip = document.createElement("div");
+              tooltip.id = "loadoutFloatingTooltip";
+              tooltip.style.cssText = "position:fixed; padding:10px 15px; background:rgba(0,0,0,0.95); border:1px solid rgba(255,255,255,0.1); border-radius:8px; font-weight:900; z-index:10000; pointer-events:none; transition:opacity 0.15s; box-shadow:0 10px 25px rgba(0,0,0,0.6);";
+              document.body.appendChild(tooltip);
+          }
+          tooltip.textContent = displayName;
+          tooltip.style.color = rarityCol;
+          tooltip.style.opacity = "1";
+          const move = (ev) => {
+            tooltip.style.left = (ev.clientX + 20) + "px";
+            tooltip.style.top = (ev.clientY + 20) + "px";
+          };
+          move(e);
+          slotEl.onmousemove = move;
+        };
+        slotEl.onmouseleave = () => { 
+          const tooltip = document.getElementById("loadoutFloatingTooltip");
+          if (tooltip) tooltip.style.opacity = "0";
+        };
       } else {
         slotEl.innerHTML = `
           <div class="slot-empty-icon" style="font-size:24px; color:rgba(255,255,255,0.2);">+</div>
           <div class="loadout-slot-type-hint">${escapeHtml(slotLabel)}</div>
-          <div class="loadout-slot-label" style="background: rgba(0,0,0,0.6); padding: 6px; font-size: 13px; font-weight:900; color:rgba(255,255,255,0.92); text-shadow:0 1px 3px #000; bottom:0; height:auto; display:block; position:absolute; left:0; right:0;">${escapeHtml(slotLabel)}</div>
+          <div class="loadout-slot-label-hover" style="background: rgba(0,0,0,0.8); padding: 8px; font-size: 14px; font-weight:900; color:rgba(255,255,255,0.92); text-shadow:0 1px 3px #000; bottom:0; height:auto; display:none; position:absolute; left:0; right:0;">${escapeHtml(slotLabel)}</div>
         `;
+        slotEl.onmouseenter = () => { slotEl.querySelector('.loadout-slot-label-hover').style.display = 'block'; };
+        slotEl.onmouseleave = () => { slotEl.querySelector('.loadout-slot-label-hover').style.display = 'none'; };
       }
       slotEl.onclick = (e) => {
         e.stopPropagation();
@@ -25004,6 +25646,7 @@ function openLoadoutPicker(side, slotId, typeFilter) {
   const isPinSlot = slotId === "pin";
 
   const pool = account.items.filter(it => {
+    if (it.isDefaultItem) return false;
     const n = (it.name || "").toLowerCase();
     const t = (it.type || it.category?.name || "").toLowerCase();
     const hasKnifeStar = n.includes("★") || n.includes("â˜…");
@@ -25085,13 +25728,11 @@ function openLoadoutPicker(side, slotId, typeFilter) {
       overlay.remove();
     });
 
-    // Adjust images for picker
     const img = card.querySelector("img");
     if (img) {
       img.style.width = "110px";
       img.style.height = "80px";
     }
-    // Show stickers in selection popup
     const stickerLabel = card.querySelector("div:last-child");
     if (stickerLabel) {
         stickerLabel.style.display = "block";
@@ -25103,6 +25744,22 @@ function openLoadoutPicker(side, slotId, typeFilter) {
       card.style.background = "rgba(102, 192, 244, 0.1)";
     }
     grid.appendChild(card);
+  });
+
+  // Default items always last
+  const defaultEntries = (apiBaseWeapons || []).filter(isAllowedBaseWeaponInventoryEntry);
+  defaultEntries.forEach(entry => {
+      const it = buildVirtualBaseWeaponItem(entry, side);
+      if(!it || !itemMatchesLoadoutTypeEnhanced(it, slotId, typeFilter)) return;
+      const card = createTradeCard(it, () => {
+         clearSlotOverride();
+         saveState();
+         renderLoadoutUI();
+         refreshInventoryView();
+         overlay.remove();
+      });
+      card.style.opacity = "0.7";
+      grid.appendChild(card);
   });
 
   if (pool.length === 0 && !defaultOption) {
@@ -25453,9 +26110,9 @@ function renderTradeInventory() {
   
   if (leftAcc) {
     const leftEq = Array.isArray(leftAcc.equippedItemIds) ? leftAcc.equippedItemIds : [];
-    // Sort items by price for easier trading and filter out Storage Units and Equipped items
+    // Sort items by price for easier trading and filter out Storage Units, Equipped, and items with wear in name
     const sortedLeft = [...leftAcc.items]
-      .filter(it => !it.name.toLowerCase().includes("storage unit") && !leftEq.includes(it.id))
+      .filter(it => !it.name.toLowerCase().includes("storage unit") && !leftEq.includes(it.id) && !hasWearInName(it.name))
       .sort((a,b) => getItemValue(b) - getItemValue(a));
 
     sortedLeft.forEach(it => {
@@ -25489,9 +26146,9 @@ function renderTradeInventory() {
   
   if (rightAcc) {
     const rightEq = Array.isArray(rightAcc.equippedItemIds) ? rightAcc.equippedItemIds : [];
-    // Sort items by price for easier trading and filter out Storage Units and Equipped items
+    // Sort items by price for easier trading and filter out Storage Units, Equipped, and items with wear in name
     const sortedRight = [...rightAcc.items]
-      .filter(it => !it.name.toLowerCase().includes("storage unit") && !rightEq.includes(it.id))
+      .filter(it => !it.name.toLowerCase().includes("storage unit") && !rightEq.includes(it.id) && !hasWearInName(it.name))
       .sort((a,b) => getItemValue(b) - getItemValue(a));
 
     sortedRight.forEach(it => {
@@ -25595,59 +26252,72 @@ function hideNerdTooltip() {
 function createTradeCard(item, onClick) {
   const div = document.createElement("div");
   div.className = "storage-item-mini";
-  const rarityColor = RARITY_COLORS[item.rarity] || "#b0c3d9";
-  div.style.borderColor = rarityColor;
-  div.style.borderWidth = "2px";
-  div.style.borderStyle = "solid";
-  div.style.display = "flex";
-  div.style.flexDirection = "column";
-  div.style.alignItems = "center";
-  div.style.height = "auto";
-  div.style.padding = "10px 5px";
-  div.style.position = "relative";
-  div.style.borderRadius = "0"; // Sharp corners for trade cards too
+  const rarityName = item.rarity?.name || item.rarity || "Consumer";
+  const rarityColor = RARITY_COLORS[rarityName] || "#b0c3d9";
   
+  // Style match the main inventory box and fix conflicting styles
+  div.style.cssText = `
+    background: #3c3c3c;
+    border: none;
+    border-bottom: 3px solid ${rarityColor};
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    position: relative;
+    border-radius: 0;
+    padding: 10px;
+    cursor: pointer;
+    overflow: visible;
+    box-sizing: border-box;
+  `;
+
   const img = document.createElement("img");
-  img.src = getStableDisplayImage(item); // Correct stable image rendering for trade offers
-  img.style.width = "70px";
-  img.style.height = "50px";
-  img.style.objectFit = "contain";
-  img.title = item.name;
-
-  const nameDiv = document.createElement("div");
-  nameDiv.style.fontSize = "10px";
-  nameDiv.style.color = item.nametag ? "#eb4b4b" : "#fff";
-  nameDiv.style.textAlign = "center";
-  nameDiv.style.fontWeight = item.nametag ? "900" : "700";
-  nameDiv.style.marginTop = "5px";
-  nameDiv.style.height = "22px";
-  nameDiv.style.overflow = "hidden";
-  nameDiv.textContent = item.nametag ? `"${item.nametag}"` : item.name;
-
-  const priceDiv = document.createElement("div");
-  priceDiv.style.fontSize = "11px";
-  priceDiv.style.color = "#a4d007";
-  priceDiv.style.fontWeight = "900";
-  priceDiv.style.marginTop = "2px";
-  priceDiv.textContent = formatPrice(getItemValue(item));
-
-  const stickerStatus = document.createElement("div");
-  stickerStatus.style.fontSize = "9px";
-  stickerStatus.style.fontWeight = "900";
-  stickerStatus.style.marginTop = "2px";
-  const hasStickers = (Array.isArray(item.stickers) && item.stickers.length > 0);
-  if (hasStickers) {
-    stickerStatus.textContent = "Stickers: YES";
-    stickerStatus.style.color = "#a4d007";
-  } else {
-    stickerStatus.textContent = "Stickers: NO";
-    stickerStatus.style.color = "#eb4b4b";
-  }
-
+  img.src = getStableDisplayImage(item);
+  img.style.cssText = "width: 100%; height: 100%; object-fit: contain; filter: drop-shadow(0 4px 6px rgba(0,0,0,0.5));";
   div.appendChild(img);
-  div.appendChild(nameDiv);
-  div.appendChild(priceDiv);
-  div.appendChild(stickerStatus);
+
+  // Overlay metadata logic
+  if (!state.hideMockMeta) {
+    // Price top right
+    if (!state.hidePrices) {
+      const priceEl = document.createElement("div");
+      priceEl.style.cssText = "position: absolute; top: 4px; right: 6px; color: #fff; font-size: 11px; font-weight: 900; text-shadow: 1px 1px 2px #000; z-index: 10;";
+      priceEl.textContent = formatPrice(getItemValue(item));
+      div.appendChild(priceEl);
+    }
+
+    // Stickers bottom left
+    const stickers = Array.isArray(item.stickers) ? item.stickers : [];
+    if (stickers.length > 0 || (item.name && item.name.includes("StatTrak"))) {
+      const stickerTray = document.createElement("div");
+      stickerTray.style.cssText = "position: absolute; bottom: 4px; left: 4px; display: flex; gap: 2px; z-index: 10;";
+      
+      if (item.name.includes("StatTrak")) {
+        const isKnife = item.name.includes("★") || item.name.toLowerCase().includes("knife");
+        const stIcon = document.createElement("img");
+        stIcon.src = isKnife ? "https://i.imgur.com/txeWcrS.png" : "https://i.imgur.com/TRtzFCo.png";
+        stIcon.style.cssText = "width:14px; height:14px; object-fit:contain;";
+        stickerTray.appendChild(stIcon);
+      }
+
+      stickers.slice(0, 5).forEach(s => {
+        const sImg = document.createElement("img");
+        sImg.src = s.img;
+        sImg.style.cssText = "width:14px; height:14px; object-fit:contain; background:rgba(0,0,0,0.2); border-radius:2px;";
+        stickerTray.appendChild(sImg);
+      });
+      div.appendChild(stickerTray);
+    }
+    
+    // Qty if > 1
+    if (item.qty > 1) {
+      const qtyEl = document.createElement("div");
+      qtyEl.style.cssText = "position: absolute; bottom: 4px; right: 4px; color: #ffca00; font-size: 12px; font-weight: 900; text-shadow: 1px 1px 2px #000; z-index: 10;";
+      qtyEl.textContent = "x" + item.qty;
+      div.appendChild(qtyEl);
+    }
+  }
   
   div.onclick = onClick;
   return div;
@@ -26279,6 +26949,9 @@ async function importAndMergeStateFromClipboard() {
     document.body.appendChild(overlay);
 
     const finalizeImport = async (mode) => {
+      if (mode === 'replace') {
+         if (!confirm("Are you sure? This will delete all current accounts and items!")) return;
+      }
       overlay.remove();
       if (mode === 'replace') {
         const importedClone = JSON.parse(JSON.stringify(imported));
@@ -26365,7 +27038,9 @@ function openSkinPickerForBlackjack() {
       const isWeapon = (it.type || "").toLowerCase().includes("rifle") || n.includes("|");
       const isKnife = n.includes("★") || n.includes("knife");
       return (isWeapon || isKnife) && (!query || n.includes(query));
-    }).forEach(it => {
+    })
+    .sort((a, b) => getItemValue(b) - getItemValue(a)) // Sort expensive first
+    .forEach(it => {
       const card = createTradeCard(it, () => {
         const idx = jackpotSelectedSkins.findIndex(s => s.id === it.id);
         if (idx === -1) {
@@ -26480,53 +27155,87 @@ function calculateHand(hand) {
 }
 
 function renderBlackjackTable() {
-  const dealerCards = document.getElementById("bjDealerCards");
-  const userCards = document.getElementById("bjUserCards");
-  const userScore = document.getElementById("bjUserScore");
-  const dealerScore = document.getElementById("bjDealerScore");
   const startBtn = document.getElementById("bjStartBtn");
-  const controls = document.getElementById("bjControls");
   const betDisp = document.getElementById("bjBetDisplay");
-  const splash = document.getElementById("bjResultSplash");
   const splashText = document.getElementById("bjResultText");
+  const leftArea = document.getElementById("bjUserArea");
+  const rightArea = document.getElementById("bjDealerArea");
 
-  dealerCards.innerHTML = "";
-  userCards.innerHTML = "";
+  const betVal = blackjackState.bet.reduce((s, x) => s + getItemValue(x), 0);
+  const botBetVal = blackjackState.botBet.reduce((s, x) => s + getItemValue(x), 0);
   splashText.textContent = "";
 
   if (blackjackState.status === "waiting") {
     startBtn.classList.remove("hidden");
-    controls.classList.add("hidden");
-    dealerScore.textContent = "";
-    userScore.textContent = "";
     betDisp.textContent = "$0.00";
-    dealerCards.innerHTML = `<div style="color: #475569; font-style: italic; margin-top: 40px;">Place your bet to start...</div>`;
+    leftArea.innerHTML = `<div style="color: #475569; font-style: italic; margin-top: 40px;">Select skins to deal a hand...</div>`;
+    rightArea.innerHTML = `<div style="color: #475569; font-style: italic; margin-top: 40px;">Bot is waiting...</div>`;
     return;
   }
 
   startBtn.classList.add("hidden");
-  controls.classList.toggle("hidden", blackjackState.status !== "playing");
+  betDisp.textContent = `POT: ${formatPrice(betVal + botBetVal)}`;
 
-  const betVal = blackjackState.bet.reduce((s, x) => s + getItemValue(x), 0);
-  betDisp.textContent = formatPrice(betVal);
+  // LEFT SIDE: PLAYER AREA
+  leftArea.innerHTML = `
+    <div style="font-size: 14px; color: #94a3b8; text-transform: uppercase; margin-bottom: 15px;">Your Hand <span style="color: #fff; font-weight: 900; margin-left: 10px;">${blackjackState.userTotal || ''}</span></div>
+    <div id="bjLeftUserCards" style="display: flex; justify-content: center; flex-wrap: wrap; gap: 10px; min-height: 150px; align-items: center;"></div>
+    
+    <div id="bjControls" style="display: ${blackjackState.status === 'playing' ? 'flex' : 'none'}; gap: 15px; justify-content: center; margin-top: 20px;">
+      <button id="bjHitBtn" class="steam-btn highlight" style="flex: 1; padding: 15px; font-weight: 900; background: #66c0f4; color: #000; font-size: 18px;">HIT</button>
+      <button id="bjStandBtn" class="steam-btn highlight" style="flex: 1; padding: 15px; font-weight: 900; background: #e4ae39; color: #000; font-size: 18px;">STAND</button>
+    </div>
 
-  // Render Hands
-  blackjackState.userHand.forEach(c => {
-    userCards.appendChild(createCardUI(c));
-  });
+    <div style="margin-top:25px; background:rgba(0,0,0,0.2); padding:15px; border-radius:12px; border: 1px solid rgba(255,255,255,0.05);">
+        <div style="font-size:11px; color:#94a3b8; text-transform:uppercase; margin-bottom:10px; font-weight:800;">Your Deposit (${formatPrice(betVal)})</div>
+        <div id="bjLeftUserPot" style="display:flex; flex-wrap:wrap; gap:6px; justify-content:center;"></div>
+    </div>
+  `;
 
+  // RIGHT SIDE: BOT AREA
+  rightArea.innerHTML = `
+    <div style="font-size: 14px; color: #94a3b8; text-transform: uppercase; margin-bottom: 15px;">Bot's Hand <span style="color: #fff; font-weight: 900; margin-left: 10px;">${blackjackState.dealerTotal}</span></div>
+    <div id="bjRightDealerCards" style="display: flex; justify-content: center; flex-wrap: wrap; gap: 10px; min-height: 150px; align-items: center;"></div>
+    
+    <div style="margin-top:auto; background:rgba(0,0,0,0.2); padding:15px; border-radius:12px; border: 1px solid rgba(255,255,255,0.05);">
+        <div style="font-size:11px; color:#94a3b8; text-transform:uppercase; margin-bottom:10px; font-weight:800;">Bot Deposit (${formatPrice(botBetVal)})</div>
+        <div id="bjRightBotPot" style="display:flex; flex-wrap:wrap; gap:6px; justify-content:center;"></div>
+    </div>
+  `;
+
+  // RE-BIND BUTTONS since we just overwrote innerHTML
+  const hitBtn = document.getElementById("bjHitBtn");
+  const standBtn = document.getElementById("bjStandBtn");
+  if (hitBtn) hitBtn.onclick = bjHit;
+  if (standBtn) standBtn.onclick = bjStand;
+
+  // POPULATE CARDS
+  const userCards = document.getElementById("bjLeftUserCards");
+  blackjackState.userHand.forEach(c => userCards.appendChild(createCardUI(c)));
+
+  const dealerCards = document.getElementById("bjRightDealerCards");
   blackjackState.dealerHand.forEach((c, idx) => {
-    if (idx === 1 && blackjackState.status === "playing") {
-      const hidden = document.createElement("div");
-      hidden.className = "bj-card hidden-card";
-      dealerCards.appendChild(hidden);
-    } else {
-      dealerCards.appendChild(createCardUI(c));
-    }
+    // Show both dealer cards immediately as requested
+    dealerCards.appendChild(createCardUI(c));
   });
 
-  userScore.textContent = blackjackState.userTotal;
-  dealerScore.textContent = (blackjackState.status === "playing") ? "?" : blackjackState.dealerTotal;
+  // POPULATE POTS
+  const leftUPot = document.getElementById("bjLeftUserPot");
+  blackjackState.bet.forEach(it => {
+      const img = document.createElement("img");
+      img.src = getStableDisplayImage(it);
+      img.style.cssText = "width:48px;height:36px;object-fit:contain;cursor:pointer;background:rgba(0,0,0,0.3);border-radius:4px;";
+      img.onclick = () => showInspect(it);
+      leftUPot.appendChild(img);
+  });
+  const rightBPot = document.getElementById("bjRightBotPot");
+  blackjackState.botBet.forEach(it => {
+      const img = document.createElement("img");
+      img.src = getStableDisplayImage(it);
+      img.style.cssText = "width:48px;height:36px;object-fit:contain;cursor:pointer;background:rgba(0,0,0,0.3);border-radius:4px;";
+      img.onclick = () => showInspect(it);
+      rightBPot.appendChild(img);
+  });
 
   if (blackjackState.status === "finished") {
     setTimeout(() => {
@@ -26552,6 +27261,41 @@ function renderBlackjackTable() {
   }
 }
 
+// Global binding for Confirm Transfer in selection bar
+document.addEventListener("click", (e) => {
+  if (e.target && e.target.id === "confirmSelectionBtn") {
+    const acc = getActiveAccount();
+    if (!acc || !state.storageSelectedIds || state.storageSelectedIds.length === 0) return;
+    
+    const targetUnitId = state.storageSelectionTargetId;
+    let targetUnit = acc.items.find(it => it.id === targetUnitId);
+    if (!targetUnit) return;
+
+    const mode = state.storageSelectionMode;
+    const selectedIdsSet = new Set(state.storageSelectedIds);
+
+    if (mode === 'deposit') {
+      const itemsToMove = acc.items.filter(it => selectedIdsSet.has(it.id));
+      acc.items = acc.items.filter(it => !selectedIdsSet.has(it.id));
+      if (!targetUnit.contents) targetUnit.contents = [];
+      targetUnit.contents.push(...itemsToMove);
+    } else {
+      if (targetUnit.contents) {
+        const itemsToMove = targetUnit.contents.filter(it => selectedIdsSet.has(it.id));
+        targetUnit.contents = targetUnit.contents.filter(it => !selectedIdsSet.has(it.id));
+        acc.items.push(...itemsToMove);
+      }
+    }
+    
+    targetUnit.lastUpdated = Date.now();
+    state.storageSelectionMode = null;
+    state.storageSelectedIds = [];
+    saveState();
+    refreshInventoryView();
+    document.getElementById("selectionActionBar").classList.add("hidden");
+  }
+});
+
 function createCardUI(c) {
   const div = document.createElement("div");
   div.className = `bj-card ${c.color}`;
@@ -26560,6 +27304,14 @@ function createCardUI(c) {
     <div class="suit">${c.suit}</div>
     <div class="corner bottom">${c.value}</div>
   `;
+  
+  div.style.cursor = "pointer";
+  div.onclick = () => {
+      // Find a matching physical item from the bet pool for inspection simulation
+      const sample = blackjackState.bet[0] || blackjackState.botBet[0];
+      if (sample) showInspect(sample);
+  };
+
   return div;
 }
 
@@ -26584,6 +27336,7 @@ function bjStand() {
 }
 
 function bjEndGame() {
+  if (blackjackState.status === "finished") return;
   blackjackState.status = "finished";
   const user = blackjackState.userTotal;
   const dealer = blackjackState.dealerTotal;
@@ -26786,6 +27539,7 @@ function startJackpotRound() {
   }
 
   const joinInterval = setInterval(() => {
+    if (!jackpotPotParticipants.length) { clearInterval(joinInterval); return; }
     const botName = botNames[Math.floor(Math.random() * botNames.length)];
     // Bot value logic: Usually lower, occasionally higher
     let variance;
@@ -26832,6 +27586,10 @@ function generateRandomAppliedStickers(item, count) {
     const isSticker = n.includes("sticker");
     const isCapsule = n.includes("capsule") || n.includes("package") || n.includes("crate") || n.includes("storage unit");
     const isBlacklisted = n.includes("rio 2022 storage unit with paper stickers") || n.includes("rio 2022 storage unit with glitter stickers");
+    
+    // Rare Slabs Logic: Slabs are 10x rarer in random generation
+    if (n.includes("sticker slab") && Math.random() > 0.05) return false;
+    
     return isSticker && !isCapsule && !isBlacklisted;
   });
   
@@ -26858,7 +27616,7 @@ function generateBotItems(targetValue) {
     const n = (s.name || "").toLowerCase();
     
     // Normal run of the mill weapons only
-    if (n.includes("souvenir") || n.includes("(")) return false;
+    if (n.includes("souvenir") || hasWearInName(s.name)) return false;
 
     const matchesStrictType = n.includes("gun") || n.includes("knife") || n.includes("glove") || (n.includes("|") && !n.includes("sticker") && !n.includes("capsule"));
     if (!matchesStrictType) return false;
@@ -27182,10 +27940,11 @@ function spinPotWheel() {
   let winner = null;
 
   // Decide winner BEFORE animation starts
-  if (state.cheatWinActive) {
+  if (state.cheatWinActive || forceCoinflipWin) {
     const userP = jackpotPotParticipants.find(p => p.id === "user");
     if (userP) winner = userP;
     state.cheatWinActive = false;
+    forceCoinflipWin = false;
   }
 
   if (!winner) {
@@ -27276,6 +28035,7 @@ function showJackpotWinner(winner) {
     allItems.forEach(it => {
       // Check if item belongs to user
       const isOriginalUserItem = winner.items.some(ui => ui.id === it.id);
+      const resolvedSource = it.source || "Jackpot Win";
 
       const winningItem = {
         ...it,
@@ -27287,14 +28047,14 @@ function showJackpotWinner(winner) {
         floatVal: (it.floatVal !== undefined && it.floatVal !== null) ? it.floatVal : null,
         pattern: (it.pattern !== undefined && it.pattern !== null) ? it.pattern : null,
         stickers: Array.isArray(it.stickers) ? JSON.parse(JSON.stringify(it.stickers)) : [],
-        source: "Jackpot Win",
+        source: resolvedSource,
         isReturn: isOriginalUserItem,
         nametag: it.nametag || null,
         steamPhaseImage: it.steamPhaseImage || null,
         dopplerPhase: it.dopplerPhase || null
       };
       
-      addItemToAccount(winningItem, { skipPriceFix: true });
+      addItemToAccount(winningItem, { skipPriceFix: true, randomizeWearEach: false });
     });
 
     // 2) If not jackKnife, specifically duplicate returned items for the 2x return rule
@@ -27681,6 +28441,17 @@ if (!MARKET_KEYS.find(k => k.name === "2025 Community Sticker Collection")) {
   });
 }
 
+// Load base items on launch
+setTimeout(() => {
+  const acc = getActiveAccount();
+  if (acc && acc.items.length === 0) {
+    const baseItems = getDefaultInventoryItems();
+    baseItems.forEach(bi => acc.items.push(bi));
+    saveState();
+    refreshInventoryView();
+  }
+}, 1000);
+
 // Price fixes for 2025 Community Sticker Collection contents (single prices provided)
 Object.assign(PRICE_FIXES, {
   "2025 Community Sticker Collection": 0.42,
@@ -27731,40 +28502,49 @@ function renderTradeUpInventory() {
   const slotDiv = document.getElementById("tradeUpSlots");
   const rarityInfo = document.getElementById("tradeUpRarityInfo");
   const signBtn = document.getElementById("executeTradeUpBtn");
-  const headerH3 = document.querySelector("#tradeUpModal h3");
 
   invDiv.innerHTML = "";
   slotDiv.innerHTML = "";
 
   if (!account) return;
 
-  // Determine current locked-in rarity based on existing selections
-  const contractRarity = tradeUpContract.length > 0 ? tradeUpContract[0].rarity : null;
-
-  // Show the full inventory (except storage unit containers, stickers and equipped items) on the left as requested.
-  // Exclude sticker items so trade-ups only use guns / gun skins.
-  // Filtering is now strictly isolated to the temporary contract view.
+  const firstInContract = tradeUpContract[0];
+  const contractRarity = firstInContract ? (firstInContract.rarity?.name || firstInContract.rarity) : null;
+  const isCovertRarity = contractRarity && String(contractRarity).toLowerCase() === "covert";
+  const tradeUpCap = isCovertRarity ? 5 : 10;
+  
   const equippedIds = Array.isArray(account.equippedItemIds) ? account.equippedItemIds : [];
+  
+  // Logic: Don't just "select" items, transfer them. Removed items from left list if in contract.
   let sourceItems = [...account.items]
     .filter(it => {
-      if (!it || !it.name) return false;
-      // Block equipped items from Trade Up
+      if (!it || !it.name || hasWearInName(it.name)) return false;
       if (equippedIds.includes(it.id)) return false;
+      if (tradeUpContract.some(c => c.id === it.id)) return false; // Immediate removal from left side
+
       const nl = String(it.name).toLowerCase();
       const tl = (it.type || "").toLowerCase();
-      // never show storage units in the left selector
+      const itRarity = (it.rarity && (it.rarity.name || it.rarity)) || "";
+      
+      // GUNS ONLY: exclude cases, stickers, knives, gloves, agents, etc.
+      const isGun = (tl.includes("rifle") || tl.includes("pistol") || tl.includes("smg") ||
+                    tl.includes("sniper") || tl.includes("shotgun") || tl.includes("machine") ||
+                    nl.includes("ak-47") || nl.includes("m4a4") || nl.includes("m4a1-s") ||
+                    nl.includes("awp") || nl.includes("glock") || nl.includes("usp-s") ||
+                    nl.includes("desert eagle") || nl.includes("p250") || nl.includes("five-seven") ||
+                    nl.includes("tec-9") || nl.includes("p90") || nl.includes("mp9") ||
+                    nl.includes("mac-10") || nl.includes("famas") || nl.includes("galil") ||
+                    nl.includes("sg 553") || nl.includes("aug") || nl.includes("scout") ||
+                    nl.includes("scar-20") || nl.includes("g3sg1") || nl.includes("mag-7") ||
+                    nl.includes("nova") || nl.includes("sawed-off") || nl.includes("xm1014") ||
+                    nl.includes("m249") || nl.includes("negev")) && !nl.includes("sticker");
+                    
+      if (!isGun) return false;
       if (nl.includes("storage unit")) return false;
-      // Exclude knives and gloves from Tradeup
       if (nl.includes("★") || nl.includes("knife") || nl.includes("gloves") || tl.includes("knife") || tl.includes("gloves")) return false;
-      // explicitly exclude sticker items and sticker capsules from trade-up pool (defensive: check both name and type)
       if (nl.includes("sticker") || nl.includes("sticker capsule") || (nl.includes("capsule") && nl.includes("sticker"))) return false;
       if ((it.type || "").toLowerCase() === "sticker") return false;
-      // defensive: if item has stickers array but is itself a sticker-like object, exclude it
-      if (Array.isArray(it.stickers) && (it.name || "").toLowerCase().includes("sticker")) return false;
-      
-      // Strict Rarity Isolation: If a contract rarity is locked, ONLY show that rarity
-      if (contractRarity && it.rarity !== contractRarity) return false;
-      
+      if (contractRarity && itRarity !== contractRarity) return false;
       return true;
     });
   
@@ -27802,7 +28582,8 @@ function renderTradeUpInventory() {
         const effectiveRarity = contractRarity || it.rarity;
         const requiredCount = 10;
 
-        if (tradeUpContract.length >= requiredCount) {
+        if (tradeUpContract.length >= tradeUpCap) {
+          alert(`You can only add ${tradeUpCap} items for this contract rarity.`);
           return;
         }
         if (contractRarity && it.rarity !== contractRarity) {
@@ -27816,7 +28597,8 @@ function renderTradeUpInventory() {
 
     // Visual hints: items not matching the locked rarity are dimmed, but still visible on the left
     if (isSelected) {
-      // User said REMOVE NTOY SLECT (stop dimming selected items on left)
+      card.style.opacity = "0.3";
+      card.style.filter = "grayscale(1)";
     } else if (contractRarity && it.rarity !== contractRarity) {
       card.style.opacity = "0.6"; // lighter dim so user sees full inventory but knows it's not eligible
       // leave pointer events enabled so user can click to change selection lock
@@ -27826,7 +28608,7 @@ function renderTradeUpInventory() {
   });
 
   // Render slots dynamic (5 for Covert, 10 otherwise)
-  const slotsCount = (tradeUpContract.length > 0 ? (String(tradeUpContract[0].rarity || "").toLowerCase() === "covert" ? 5 : 10) : 10);
+  const slotsCount = tradeUpCap;
   for (let i = 0; i < slotsCount; i++) {
     const slot = document.createElement("div");
     slot.className = "trade-up-slot-card";
@@ -27842,6 +28624,7 @@ function renderTradeUpInventory() {
           <div class="trade-up-slot-card-inner">
             <img src="${getStableDisplayImage(it)}" alt="">
             <div class="trade-up-slot-name">${escapeHtml(it.name)}</div>
+            <div style="font-size:11px; color:#fff; font-weight:800; margin-top:4px;">${it.wear || 'Factory New'}</div>
             <div class="trade-up-slot-price">${formatPrice(getItemValue(it))}</div>
             <div class="trade-up-slot-stickers">${stickersHtml}</div>
           </div>
@@ -27894,13 +28677,15 @@ function renderTradeUpInventory() {
   }
 
 function getNextRarity(current) {
+  // Normalize input (e.g. "Mil-Spec Grade" -> "Mil-Spec")
+  const c = String(current || "").replace(/\s+Grade$/i, "").trim();
   const map = {
     "Mil-Spec": "Restricted",
     "Restricted": "Classified",
     "Classified": "Covert",
     "Covert": "Gold"
   };
-  return map[current] || current;
+  return map[c] || c;
 }
 
 function getGlobalFloatRank(itemName, floatVal) {
@@ -27939,81 +28724,82 @@ function executeTradeUp() {
     alert("Draw your signature in the contract box before signing.");
     return;
   }
-  const rarity = tradeUpContract[0].rarity;
-  const required = (String(rarity).toLowerCase() === "covert") ? 5 : 10;
+
+  const firstItem = tradeUpContract[0];
+  const currentRarity = firstItem.rarity?.name || firstItem.rarity || "Consumer";
+  const required = (String(currentRarity).toLowerCase() === "covert") ? 5 : 10;
+  
   if (tradeUpContract.length < required) {
-    alert(`You need ${required} items of the same rarity (${rarity}) for this Trade Up Contract.`);
+    alert(`You need ${required} items of the same rarity (${currentRarity}) for this Trade Up Contract.`);
     return;
   }
 
   const account = getActiveAccount();
   if (!account) return;
 
-  const currentRarity = tradeUpContract[0].rarity;
   const targetRarity = getNextRarity(currentRarity);
 
-  // Remove items from inventory
-  const contractIds = tradeUpContract.map(c => c.id);
-  account.items = account.items.filter(it => !contractIds.includes(it.id));
+  // Math System for Tradeup Wear: Average of input floats
+  const avgFloat = tradeUpContract.reduce((s, it) => s + (it.floatVal || 0.15), 0) / tradeUpContract.length;
+  let majorityWear = "Field-Tested";
+  if (avgFloat < 0.07) majorityWear = "Factory New";
+  else if (avgFloat < 0.15) majorityWear = "Minimal Wear";
+  else if (avgFloat < 0.38) majorityWear = "Field-Tested";
+  else if (avgFloat < 0.45) majorityWear = "Well-Worn";
+  else majorityWear = "Battle-Scarred";
 
-  // Determine Reward
-  let winner = null;
-
-  // Realism: Gold is converted to Red (Covert)
-  const finalRarityForPool = String(targetRarity).toLowerCase() === "gold" ? "Covert" : targetRarity;
-
-  // Randomize outcome properly: Find all items in global DB of target rarity
-  const pool = allSkins.filter(s => {
-      const r = (s.rarity?.name || s.rarity || "").toLowerCase();
-      const n = (s.name || "").toLowerCase();
-      const t = (s.type || "").toLowerCase();
-      
-      // If target is Gold, include knives/gloves
-      if (String(targetRarity).toLowerCase() === "gold") {
-          return n.includes("★") || t.includes("knife") || n.includes("gloves");
-      }
-      
-      return r === targetRarity.toLowerCase() && !n.includes("capsule") && !n.includes("storage unit") && !n.includes("key") && !n.includes("sticker");
+  // Weighted Collection Logic
+  const collectionWeights = {};
+  tradeUpContract.forEach(it => {
+      const coll = findContainerNameForItem(it) || "Unknown Collection";
+      collectionWeights[coll] = (collectionWeights[coll] || 0) + 1;
   });
 
-  if (pool.length > 0) {
-      // Pick random from full pool to avoid bias
-      let filteredPool = pool;
-      // If target is Gold, user wants completely random knives but NO dopplers in tradeups
-      if (String(targetRarity).toLowerCase() === "gold") {
-          filteredPool = pool.filter(s => !s.name.toLowerCase().includes("doppler"));
+  const roll = Math.random() * tradeUpContract.length;
+  let accWeight = 0;
+  let selectedCollection = Object.keys(collectionWeights)[0];
+  for (const [coll, weight] of Object.entries(collectionWeights)) {
+      accWeight += weight;
+      if (roll <= accWeight) {
+          selectedCollection = coll;
+          break;
       }
-      
-      const pick = filteredPool[Math.floor(Math.random() * filteredPool.length)] || pool[0];
-      const pRarity = pick.rarity?.name || pick.rarity || targetRarity;
-      const winnerWear = mockWear(pick.name, pRarity);
-      const price = PRICE_FIXES[pick.name] ?? (pick.price || mockPrice(pick));
-      
-      winner = {
-          name: pick.name,
-          img: getDisplayImage({ ...pick, wear: winnerWear }),
-          price,
-          rarity: (pick.name.includes("★") || pick.name.toLowerCase().includes("gloves")) ? "Covert" : targetRarity,
-          wear: winnerWear
-      };
-  } else {
-      winner = { name: "Random Reward", rarity: targetRarity, price: 10, img: "" };
   }
 
-  // Assign StatTrak™ chance for Trade Up (10% standard rate)
-  if (Math.random() < 0.15 && !winner.name.includes("StatTrak™") && !["Gold", "Extraordinary"].includes(targetRarity)) {
-    if (winner.name.includes("|")) {
-      winner.name = "StatTrak™ " + winner.name;
-      winner.price = Math.round((winner.price * 1.15) * 100) / 100;
-    }
+  // Determine Reward Pool
+  const contents = resolveCaseContentsData(selectedCollection);
+  let pool = [];
+  if (contents && contents[targetRarity]) {
+      pool = contents[targetRarity];
+  } else {
+      // Fallback to global pool of target rarity with standardized rarity match
+      pool = allSkins.filter(s => {
+        const sr = s.rarity?.name || s.rarity || "";
+        return sr === targetRarity && !s.name.toLowerCase().includes("souvenir");
+      });
   }
+
+  const pick = (pool && pool.length > 0) ? pool[Math.floor(Math.random() * pool.length)] : null;
+
+  if (!pick) {
+    alert("Could not determine a valid reward for this contract. The target rarity pool for this collection is empty.");
+    return;
+  }
+
+  // Remove items from inventory only after we have a confirmed reward
+  const contractIds = tradeUpContract.map(c => c.id);
+  account.items = account.items.filter(it => !contractIds.includes(it.id));
+  account.equippedItemIds = (account.equippedItemIds || []).filter(id => !contractIds.includes(id));
+
+  const rewardPrice = PRICE_FIXES[pick.name] || pick.price || mockPrice(pick);
 
   const rewardData = {
-    name: winner.name,
-    img: winner.img || getDisplayImage(winner),
-    price: winner.price || mockPrice(winner),
-    rarity: winner.rarity || targetRarity,
-    wear: winner.wear || mockWear(winner.name, targetRarity),
+    name: pick.name,
+    img: getDisplayImage(pick),
+    price: rewardPrice,
+    rarity: targetRarity,
+    wear: majorityWear,
+    floatVal: avgFloat,
     qty: 1,
     source: "Trade Up Contract",
     prevOwners: 0
@@ -28021,17 +28807,10 @@ function executeTradeUp() {
 
   addItemToAccount(rewardData);
   
-  // Calculate total spent on the 10 items
-  const totalSpent = tradeUpContract.reduce((s, c) => s + getItemValue(c), 0);
-  const profit = rewardData.price - totalSpent;
-  const profitColor = profit >= 0 ? "#a4d007" : "#eb4b4b";
-
-  // Close trade-up modal and refresh inventory
   const tuModal = document.getElementById("tradeUpModal");
   if (tuModal) tuModal.classList.add("hidden");
   
-  // Award sound
-  try { playAwardSound(rewardData.rarity); } catch (e) { playAwardSound(); }
+  playAwardSound(targetRarity);
 
   tradeUpContract = [];
   saveState();
@@ -28929,7 +29708,7 @@ function renderCoinflipPickerItems(query = "") {
   const equippedIds = Array.isArray(account.equippedItemIds) ? account.equippedItemIds : [];
   const pool = account.items.filter(it => {
     // Protection: Blacklist equipped items from gambling deposit systems
-    if (equippedIds.includes(it.id)) return false;
+    if (equippedIds.includes(it.id) || hasWearInName(it.name)) return false;
 
     const n = it.name.toLowerCase();
     const t = (it.type || it.category?.name || "").toLowerCase();
