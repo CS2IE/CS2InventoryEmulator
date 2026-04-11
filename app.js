@@ -1,3 +1,5 @@
+// Advanced CS2 Inventory Manager - Steam UI Replica
+
 const STORAGE_KEY = "cs2_inventory_accounts_v4"; 
 const STORAGE_BACKUP_KEY = `${STORAGE_KEY}_backup`;
 const STORAGE_CHUNK_KEY = `${STORAGE_KEY}_chunked`;
@@ -55,7 +57,7 @@ let state = {
   marketPurchaseHistory: [],
   disableInventoryFloat: true,
   disableInventoryTotal: true,
-  storageNoConfirm: true,
+  storageNoConfirm: false, 
   countStickersInInventoryValue: false,
   dbSortLowestFloat: false,
   realEquip: false,
@@ -65,12 +67,13 @@ let state = {
   hideExperimentalStickers: false,
   showEditSellContext: false,
   showViewContext: false,
-  hideMockMeta: false,
+  hideMockMeta: true,
   coinflipHistory: [],
   bulkSellMode: false,
   bulkSelectedIds: [],
   imageOverrides: {},
   rarityOverrides: {},
+  pairSelectionMode: null, // { type: 'key'|'case', targetItem: {} }
   patternImageOverrides: {}, 
   consoleLog: [],
   seenPurchaseIds: [], 
@@ -505,6 +508,17 @@ function normalizeContainerLookupItemName(name) {
 
 function findContainerNameForItem(item) {
   let containerName = null;
+  const firstColl = (Array.isArray(item?.collections) && item.collections.length > 0) ? item.collections[0] : null;
+  const collectionName = String(
+    item?._resolvedCollection ||
+    (firstColl ? (firstColl.name || firstColl) : null) ||
+    item?.collection?.name ||
+    item?.collection ||
+    ""
+  ).trim();
+  if (collectionName && !/market search/i.test(collectionName)) {
+    return collectionName;
+  }
   try {
     if (item?.source && typeof item.source === "string" && item.source.includes("from ")) {
       containerName = item.source.split("from ")[1];
@@ -542,7 +556,10 @@ function findContainerNameForItem(item) {
     }
   } catch (e) {}
 
-  return (item?.source && typeof item.source === "string") ? item.source : "Inventory";
+  if (item?.source && typeof item.source === "string" && !/market search/i.test(item.source)) {
+    return item.source;
+  }
+  return collectionName || "Inventory";
 }
 
 function getImageOverrideCandidates(name) {
@@ -581,20 +598,17 @@ function getWearName(wear) {
   return "";
 }
 
-/**
- * Robustly unwraps market listings and items to ensure resolvers see consistent properties.
- */
-function getWearImageLookupItem(input) {
-  if (!input || typeof input !== 'object') return input;
-  // Handle wrapped listing objects like { item: {...}, wear: "..." }
-  if (input.item && typeof input.item === 'object' && !Array.isArray(input.item)) {
-    return { ...input.item, wear: input.wear || input.item.wear };
+function getWearImageLookupItem(obj) {
+  if (!obj) return null;
+  // Unwrap listing-style objects { item: {...}, wear: "..." }
+  if (obj.item && typeof obj.item === "object") {
+    return { ...obj.item, wear: obj.wear || obj.item.wear };
   }
-  return input;
+  return obj;
 }
 
-function getRawApiName(input) {
-  const item = getWearImageLookupItem(input);
+function getRawApiName(itemOrName) {
+  const item = getWearImageLookupItem(itemOrName);
   if (!item) return "";
   if (typeof item === "string") return normalizeMarketHashName(item);
   return normalizeMarketHashName(
@@ -606,9 +620,10 @@ function getRawApiName(input) {
   );
 }
 
-function findExactApiItemByName(input) {
-  const item = getWearImageLookupItem(input);
+function findExactApiItemByName(itemOrName) {
+  const item = getWearImageLookupItem(typeof itemOrName === "string" ? { name: itemOrName } : (itemOrName || {}));
   if (!item) return null;
+  
   const rawName = getRawApiName(item);
   if (!rawName) return null;
 
@@ -616,10 +631,21 @@ function findExactApiItemByName(input) {
   
   // Use performance index for instant lookup
   const quickFound = apiSkinsByNormalizedName.get(norm);
-  // Doppler items need specialized phase/paint checks, so bypass quickFound for them
-  if (quickFound && !norm.includes("doppler")) return quickFound;
+  const requestedWear = getWearName(item.wear);
 
-  const wearName = getWearName(item.wear);
+  // If we have a quick match, and it's not a doppler, only return it if we aren't looking for a specific wear
+  // or if the quick found item itself has the matching wear already.
+  if (quickFound && !norm.includes("doppler")) {
+    const foundWear = getWearName(quickFound.wear);
+    const requestedWearLower = requestedWear.toLowerCase();
+    const foundWearLower = foundWear.toLowerCase();
+    
+    if (!requestedWear || norm.includes(requestedWearLower) || requestedWearLower === foundWearLower) {
+      return quickFound;
+    }
+  }
+
+  const wearName = requestedWear;
   const explicitPhase = String(
     item.phase ||
     item.dopplerPhase ||
@@ -684,6 +710,14 @@ function findExactApiItemByName(input) {
 }
 
 function getExactApiImage(itemOrName) {
+  const item = getWearImageLookupItem(typeof itemOrName === "string" ? { name: itemOrName } : (itemOrName || {}));
+  const name = String(item?.name || item?.skinBidsApiName || itemOrName || "").toLowerCase();
+  
+  // User Fix: Prevent generic fallback for Dopplers in exact API resolution
+  if (name.includes("doppler")) {
+    return item?.steamPhaseImage || "";
+  }
+
   const match = findExactApiItemByName(itemOrName);
   return match ? (match.image || match.img || "") : "";
 }
@@ -730,6 +764,264 @@ function isKnifeOrGloveItem(item) {
     type.includes("gloves");
 }
 
+function clonePlain(value) {
+  try {
+    return JSON.parse(JSON.stringify(value));
+  } catch (e) {
+    return value;
+  }
+}
+
+function resolveStickerDisplayImage(sticker) {
+  if (!sticker) return "";
+  const explicit = String(sticker.img || sticker.image || "").trim();
+  if (explicit && explicit !== "undefined") return explicit;
+  const fallbackName = String(sticker.name || "").trim();
+  if (!fallbackName) return "";
+  return getDisplayImage({ name: fallbackName, type: "Sticker" }) || "";
+}
+
+function normalizeAppliedStickerList(stickers, options = {}) {
+  const maxCount = Math.max(0, options.maxCount || 5);
+  const allowSlabs = options.allowSlabs !== false;
+  if (!Array.isArray(stickers) || maxCount === 0) return [];
+  return stickers
+    .filter(Boolean)
+    .map(sticker => {
+      const name = String(sticker.name || "").trim();
+      const lower = name.toLowerCase();
+      if (!name && !sticker.img && !sticker.image) return null;
+      if (!allowSlabs && lower.includes("slab")) return null;
+      const img = resolveStickerDisplayImage(sticker);
+      if (!img) return null;
+      return {
+        ...sticker,
+        name: name || "Sticker",
+        img,
+        image: img,
+        scratchPercent: typeof sticker?.scratchPercent === "number" ? sticker.scratchPercent : 0
+      };
+    })
+    .filter(Boolean)
+    .slice(0, maxCount);
+}
+
+function normalizeAppliedStickerHistoryItems(items) {
+  if (!Array.isArray(items)) return [];
+  return items.map(it => ({
+    ...clonePlain(it),
+    stickers: normalizeAppliedStickerList(it?.stickers || [])
+  }));
+}
+
+function hasBlockingHoverLayer() {
+  const blockingSelectors = [
+    ".modal-overlay:not(.hidden)",
+    "#caseConfirmModal:not(.hidden)",
+    "#caseOpeningModal:not(.hidden)",
+    "#skinPickerModal:not(.hidden)",
+    "#coinflipPickerModal:not(.hidden)",
+    "#gunStickerManagerModal:not(.hidden)",
+    "#stickerModal:not(.hidden)",
+    "#searchSheet:not(.hidden)",
+    "#caseSearchSheet:not(.hidden)"
+  ];
+  return blockingSelectors.some(selector => {
+    const el = document.querySelector(selector);
+    if (!el) return false;
+    const styles = window.getComputedStyle(el);
+    return styles.display !== "none" && styles.visibility !== "hidden" && styles.opacity !== "0";
+  });
+}
+
+function positionInventoryAnchoredPopup(targetEl, popupEl, width = 280) {
+  if (!targetEl || !popupEl) return;
+  const wasHidden = popupEl.classList?.contains("hidden") || window.getComputedStyle(popupEl).display === "none";
+  const prevVisibility = popupEl.style.visibility;
+  const prevDisplay = popupEl.style.display;
+  if (wasHidden) {
+    popupEl.classList.remove("hidden");
+    popupEl.style.visibility = "hidden";
+    popupEl.style.display = "block";
+  }
+  const target = targetEl.closest?.(".inv-item") || targetEl;
+  const rect = target.getBoundingClientRect();
+  const popupRect = popupEl.getBoundingClientRect();
+  const popupWidth = popupRect.width || parseFloat(window.getComputedStyle(popupEl).width) || width;
+  const popupHeight = popupRect.height || popupEl.offsetHeight || 460;
+  let x = rect.right + 10;
+  let y = rect.top;
+  if (x + popupWidth > window.innerWidth) {
+    x = rect.left - popupWidth - 10;
+  }
+  y = Math.max(10, Math.min(y, window.innerHeight - popupHeight - 10));
+  popupEl.style.left = `${x}px`;
+  popupEl.style.top = `${y}px`;
+  if (wasHidden) {
+    popupEl.style.visibility = prevVisibility;
+    popupEl.style.display = prevDisplay;
+    popupEl.classList.add("hidden");
+  }
+}
+
+function scrollInventoryViewportToTop() {
+  [
+    ".inventory-grid-wrapper",
+    ".grid-scroll-limiter",
+    ".grid-scroll-limiter .steam-grid.scroll-mode"
+  ].forEach(selector => {
+    document.querySelectorAll(selector).forEach(el => {
+      el.scrollTop = 0;
+    });
+  });
+  window.scrollTo(0, 0);
+}
+
+function ensureAccountGameHistories(account) {
+  if (!account) return;
+  if (!account.gambleGameHistory || typeof account.gambleGameHistory !== "object") {
+    account.gambleGameHistory = {};
+  }
+  ["jackpot", "dice", "blackjack"].forEach(key => {
+    if (!Array.isArray(account.gambleGameHistory[key])) account.gambleGameHistory[key] = [];
+  });
+  if (!Array.isArray(account.coinflipHistory)) account.coinflipHistory = [];
+}
+
+function recordGameHistory(account, gameKey, entry) {
+  if (!account || !gameKey || !entry) return;
+  ensureAccountGameHistories(account);
+  const target = account.gambleGameHistory[gameKey];
+  if (!Array.isArray(target)) return;
+  target.unshift({
+    id: entry.id || `${gameKey}_${Date.now()}_${Math.random().toString(16).slice(2)}`,
+    finishedAt: entry.finishedAt || Date.now(),
+    result: entry.result || "lost",
+    potValue: entry.potValue || 0,
+    wonItems: normalizeAppliedStickerHistoryItems(entry.wonItems || []),
+    lostItems: normalizeAppliedStickerHistoryItems(entry.lostItems || [])
+  });
+  if (target.length > 100) target.length = 100;
+}
+
+function getGameHistoryEntries(account, gameKey) {
+  if (!account) return [];
+  ensureAccountGameHistories(account);
+  if (gameKey === "coinflip") {
+    return (account.coinflipHistory || []).map(entry => ({
+      id: entry.id,
+      finishedAt: entry.finishedAt || entry.timestamp || Date.now(),
+      result: entry.isTie ? "push" : (entry.userWon ? "won" : "lost"),
+      potValue: entry.totalValue || 0,
+      wonItems: entry.userWon ? normalizeAppliedStickerHistoryItems([...(entry.userItems || []), ...(entry.botItems || [])]) : [],
+      lostItems: (!entry.userWon && !entry.isTie) ? normalizeAppliedStickerHistoryItems(entry.userItems || []) : []
+    }));
+  }
+  return Array.isArray(account.gambleGameHistory?.[gameKey]) ? account.gambleGameHistory[gameKey] : [];
+}
+
+function showGameHistoryModal(gameKey) {
+  const account = getActiveAccount();
+  if (!account) return;
+  const labels = {
+    jackpot: "Jackpot",
+    coinflip: "Coinflip",
+    dice: "Dice",
+    blackjack: "Blackjack"
+  };
+  const overlay = document.createElement("div");
+  overlay.className = "modal-overlay";
+  overlay.style.zIndex = "10000";
+  const allEntries = getGameHistoryEntries(account, gameKey);
+  let activeTab = "lost";
+
+  const render = () => {
+    const filtered = allEntries.filter(entry => activeTab === "won" ? entry.result === "won" : entry.result === "lost");
+    const totalValue = filtered.reduce((sum, entry) => {
+      const list = activeTab === "won" ? (entry.wonItems || []) : (entry.lostItems || []);
+      return sum + list.reduce((inner, item) => inner + getItemValue(item), 0);
+    }, 0);
+
+    overlay.innerHTML = `
+      <div class="user-snippet-modal" style="max-width: 980px; height: 86vh; text-align: left; padding: 24px; display:flex; flex-direction:column; gap:16px;">
+        <button class="close-snippet-modal" id="closeGameHistoryBtn">âœ•</button>
+        <div>
+          <h1 style="font-size:24px; margin:0; color:#66c0f4;">${labels[gameKey] || "Game"} Gambled Items</h1>
+          <div style="font-size:12px; color:#94a3b8; margin-top:6px;">${activeTab === "won" ? "Total Won" : "Total Lost"}: <span style="color:${activeTab === "won" ? "#a4d007" : "#eb4b4b"}; font-weight:900;">${formatPrice(totalValue)}</span></div>
+        </div>
+        <div style="display:flex; gap:10px;">
+          <button id="gameHistoryLostTab" class="steam-btn ${activeTab === "lost" ? "highlight" : "grey"}">Lost</button>
+          <button id="gameHistoryWonTab" class="steam-btn ${activeTab === "won" ? "highlight" : "grey"}">Won</button>
+        </div>
+        <div style="flex:1; overflow-y:auto; background:rgba(0,0,0,0.2); border:1px solid #334155; border-radius:10px; padding:14px;">
+          ${filtered.length === 0 ? `<div style="padding:40px; text-align:center; color:#64748b;">No ${activeTab} items recorded yet.</div>` : filtered.map(entry => {
+            const list = activeTab === "won" ? (entry.wonItems || []) : (entry.lostItems || []);
+            const rowTotal = list.reduce((sum, item) => sum + getItemValue(item), 0);
+            return `
+              <div style="background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.05); border-radius:10px; padding:14px; margin-bottom:12px;">
+                <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:10px;">
+                  <div style="font-size:12px; color:#94a3b8;">${new Date(entry.finishedAt).toLocaleString()}</div>
+                  <div style="font-size:13px; font-weight:900; color:${activeTab === "won" ? "#a4d007" : "#eb4b4b"};">${formatPrice(rowTotal)}</div>
+                </div>
+                <div style="display:flex; flex-wrap:wrap; gap:10px;">
+                  ${list.map(item => {
+                    const payload = JSON.stringify(item).replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+                    return `
+                      <button type="button" onclick="showInspect(${payload})" style="width:120px; background:rgba(0,0,0,0.25); border:1px solid rgba(255,255,255,0.08); border-radius:8px; padding:8px; cursor:pointer;">
+                        <img src="${escapeHtml(getStableDisplayImage(item))}" style="width:100%; height:62px; object-fit:contain;">
+                        <div style="margin-top:6px; font-size:11px; font-weight:800; color:#fff; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${escapeHtml(item.name || "Item")}</div>
+                      </button>
+                    `;
+                  }).join("")}
+                </div>
+              </div>
+            `;
+          }).join("")}
+        </div>
+      </div>
+    `;
+
+    overlay.querySelector("#closeGameHistoryBtn").onclick = () => overlay.remove();
+    overlay.querySelector("#gameHistoryLostTab").onclick = () => {
+      activeTab = "lost";
+      render();
+    };
+    overlay.querySelector("#gameHistoryWonTab").onclick = () => {
+      activeTab = "won";
+      render();
+    };
+  };
+
+  render();
+  document.body.appendChild(overlay);
+}
+
+function ensureGameHistoryButtons() {
+  const configs = [
+    { viewId: "potModeView", btnId: "jackpotHistoryBtn", gameKey: "jackpot" },
+    { viewId: "coinflipModeView", btnId: "coinflipHistoryBtn", gameKey: "coinflip" },
+    { viewId: "diceModeView", btnId: "diceHistoryBtn", gameKey: "dice" },
+    { viewId: "blackjackModeView", btnId: "blackjackHistoryBtn", gameKey: "blackjack" }
+  ];
+  configs.forEach(({ viewId, btnId, gameKey }) => {
+    const view = document.getElementById(viewId);
+    if (!view) return;
+    if (window.getComputedStyle(view).position === "static") {
+      view.style.position = "relative";
+    }
+    let btn = document.getElementById(btnId);
+    if (!btn) {
+      btn = document.createElement("button");
+      btn.id = btnId;
+      btn.className = "steam-btn grey";
+      btn.textContent = "Gambled Items";
+      btn.style.cssText = "position:absolute; left:50%; bottom:12px; transform:translateX(-50%); z-index:25; font-size:11px; font-weight:900; padding:8px 12px;";
+      view.appendChild(btn);
+    }
+    btn.onclick = () => showGameHistoryModal(gameKey);
+  });
+}
+
 function isStickerSlabItem(item) {
   const name = String(item?.name || "").toLowerCase();
   const type = String(item?.type || item?.category?.name || "").toLowerCase();
@@ -751,6 +1043,164 @@ function getItemNameText(item) {
 function getItemTypeText(item) {
   if (typeof item === "string") return "";
   return String(item?.type || item?.category?.name || item?.weapon?.name || "").toLowerCase();
+}
+
+function ensureDefaultItemOverrides(account) {
+  if (!account) return {};
+  if (!account.defaultItemOverrides || typeof account.defaultItemOverrides !== "object") {
+    account.defaultItemOverrides = {};
+  }
+  return account.defaultItemOverrides;
+}
+
+function getDefaultItemOverrideRecord(account, itemOrId, create = false) {
+  const virtualId = typeof itemOrId === "string" ? itemOrId : String(itemOrId?.id || "");
+  if (!account || !isBaseWeaponVirtualId(virtualId)) return null;
+  const bucket = ensureDefaultItemOverrides(account);
+  if (!bucket[virtualId] && create) {
+    bucket[virtualId] = {
+      stickers: [],
+      charm: null,
+      nametag: null,
+      customLayout: null
+    };
+  }
+  const record = bucket[virtualId] || null;
+  if (!record) return null;
+  record.stickers = normalizeAppliedStickerList(record.stickers || [], { maxCount: 5 });
+  if (record.charm) {
+    record.charm = {
+      ...clonePlain(record.charm),
+      img: record.charm.img || record.charm.image || ""
+    };
+  }
+  return record;
+}
+
+function applyDefaultItemOverride(baseItem, account = getActiveAccount()) {
+  if (!baseItem?.isDefaultItem) return baseItem;
+  const record = getDefaultItemOverrideRecord(account, baseItem.id, false);
+  if (!record) return baseItem;
+  return {
+    ...baseItem,
+    nametag: record.nametag || null,
+    stickers: normalizeAppliedStickerList(record.stickers || [], { maxCount: 5 }),
+    charm: record.charm ? clonePlain(record.charm) : null,
+    customLayout: record.customLayout ? clonePlain(record.customLayout) : null
+  };
+}
+
+function getMutableInventoryItemRef(account, id) {
+  if (!account || !id) return null;
+  if (isBaseWeaponVirtualId(id)) {
+    const displayItem = getVirtualDefaultWeaponById(id, account);
+    const record = getDefaultItemOverrideRecord(account, id, true);
+    if (!displayItem || !record) return null;
+    return {
+      item: {
+        ...displayItem,
+        nametag: record.nametag || displayItem.nametag || null,
+        stickers: normalizeAppliedStickerList(record.stickers || [], { maxCount: 5 }),
+        charm: record.charm ? clonePlain(record.charm) : null,
+        customLayout: record.customLayout ? clonePlain(record.customLayout) : null
+      },
+      mutable: record,
+      isDefaultItem: true
+    };
+  }
+  const liveItem = findItemById(account, id);
+  if (!liveItem) return null;
+  return {
+    item: liveItem,
+    mutable: liveItem,
+    isDefaultItem: false
+  };
+}
+
+function isActualStickerItem(item) {
+  if (!item) return false;
+  const name = getItemNameText(item);
+  const type = getItemTypeText(item);
+  if (!name && !type) return false;
+  if (isStickerCapsuleItem(item) || isStickerSlabItem(item)) return false;
+  if (name.startsWith("sticker |") || name.startsWith("sticker ")) return true;
+  if (type === "sticker" || type === "stickers") return true;
+  if (type.includes("sticker") && !type.includes("capsule") && !type.includes("slab")) return true;
+  return false;
+}
+
+function collectAccountInventoryItems(account) {
+  if (!account || !Array.isArray(account.items)) return [];
+  const collected = [];
+  account.items.forEach(it => {
+    if (!it) return;
+    collected.push(it);
+    if (Array.isArray(it.contents)) {
+      it.contents.forEach(child => {
+        if (child) collected.push(child);
+      });
+    }
+  });
+  return collected;
+}
+
+function resolvePreviewCaseNameForItem(item) {
+  if (!item) return "";
+  
+  // Prioritize API collection data for weapons
+  if (item.collection && typeof item.collection === 'object' && item.collection.name) {
+    return item.collection.name;
+  }
+  if (item.collection && typeof item.collection === 'string') {
+    return item.collection;
+  }
+
+  const rawName = String(item?.name || "").split(" (")[0].trim();
+  if (!rawName) return "";
+  if (isKeyItem(item)) {
+    const mapped = KEY_CASE_MAP?.[rawName];
+    if (Array.isArray(mapped) && mapped.length) return mapped[0];
+    const reverse = Object.entries(KEY_CASE_MAP || {}).find(([keyName]) => {
+      const lowerKey = String(keyName || "").toLowerCase().trim();
+      const lowerName = rawName.toLowerCase();
+      return lowerKey === lowerName || lowerKey.includes(lowerName) || lowerName.includes(lowerKey);
+    });
+    if (reverse && Array.isArray(reverse[1]) && reverse[1].length) return reverse[1][0];
+  }
+  return rawName;
+}
+
+function getCanonicalInventoryType(item, fallback = "") {
+  if (!item) return fallback || "";
+  const name = getItemNameText(item);
+  const rawType = String(item?.type || item?.category?.name || item?.weapon?.name || fallback || "").trim();
+  const rawTypeLower = rawType.toLowerCase();
+
+  if (name.includes("storage unit") || rawTypeLower.includes("storage unit")) return "Storage Unit";
+  if ((name.includes("charm") || name.includes("keychain") || rawTypeLower.includes("charm") || rawTypeLower.includes("keychain")) && !name.includes("sticker")) return "Charm";
+  if (isKeyItem(item)) return "Key";
+  if (isStickerCapsuleItem(item)) return "Sticker Capsule";
+  if (isActualStickerItem(item)) return "Sticker";
+  if (isContainer(item)) {
+    const n = name.toLowerCase();
+    if (n.includes("collection")) return "Collection";
+    if (n.includes("package") || n.includes("souvenir")) return "Package";
+    if (n.includes("capsule")) return "Capsule";
+    return "Container";
+  }
+  if (name.includes("gloves") || rawTypeLower.includes("gloves")) return "Gloves";
+  if (name.includes("knife") || name.includes("★") || rawTypeLower.includes("knife")) return "Knife";
+  
+  // Return actual weapon name if available
+  if (item?.weapon?.name) return item.weapon.name;
+  
+  if (name.includes("|")) {
+    const parts = name.split("|");
+    if (parts.length > 0) return parts[0].trim();
+    return "Weapon Skin";
+  }
+  if (rawType && !rawTypeLower.includes("skin")) return rawType;
+  return "Weapon Skin";
 }
 
 function isStickerCapsuleItem(item) {
@@ -786,6 +1236,7 @@ function getSouvenirStickerSearchKeys(containerName) {
 
   pushKey(raw);
   pushKey(raw.replace(/\b(souvenir package|package|collection)\b/gi, " "));
+  pushKey(raw.replace(/\b(esl one|pgl|blast|starseries|iem|challengers|legends|contenders|champions|opening stage|elimination stage|playoff stage|playoffs|quarterfinals|quarter-finals|semifinals|semi-finals|grand final|finals|group stage|stage|capsule|sticker)\b/gi, " "));
 
   const yearMatch = raw.match(/(.+?\b\d{4}\b)/i);
   if (yearMatch) pushKey(yearMatch[1]);
@@ -794,6 +1245,28 @@ function getSouvenirStickerSearchKeys(containerName) {
   eventYearMatches.forEach(pushKey);
 
   return Array.from(keys).sort((a, b) => b.length - a.length);
+}
+
+function getSouvenirStickerLooseTokens(containerName) {
+  const raw = normalizeMarketHashName(containerName || "").toLowerCase();
+  if (!raw) return [];
+
+  const stopWords = new Set([
+    "souvenir", "package", "collection", "the", "and", "for", "with",
+    "esl", "one", "pgl", "blast", "iem", "starseries",
+    "challengers", "legends", "contenders", "champions",
+    "opening", "elimination", "playoff", "playoffs", "stage",
+    "quarterfinals", "quarter", "finals", "semifinals", "semi", "grand",
+    "capsule", "sticker"
+  ]);
+
+  return Array.from(new Set(
+    raw
+      .split(/[^a-z0-9]+/)
+      .map(token => token.trim())
+      .filter(token => token.length >= 4 || /^\d{4}$/.test(token))
+      .filter(token => !stopWords.has(token))
+  ));
 }
 
 function extractSouvenirPackageNameFromSource(source) {
@@ -858,7 +1331,8 @@ function createSouvenirGoldStickerCandidate(candidate, fallbackRarity = "Extraor
 
 function getSouvenirStickerPoolForContainer(containerName) {
   const searchKeys = getSouvenirStickerSearchKeys(containerName);
-  if (!searchKeys.length) {
+  const looseTokens = getSouvenirStickerLooseTokens(containerName);
+  if (!searchKeys.length && !looseTokens.length) {
     return { goldPool: [], regularPool: [] };
   }
 
@@ -875,7 +1349,12 @@ function getSouvenirStickerPoolForContainer(containerName) {
     if (!rawName || !/sticker/i.test(rawName) || /capsule|slab/i.test(rawName)) return;
 
     const normalizedName = normalizeMarketHashName(rawName).toLowerCase();
-    if (!searchKeys.some(key => normalizedName.includes(key))) return;
+    const exactMatch = searchKeys.some(key => normalizedName.includes(key));
+    const tokenMatch = looseTokens.length > 0 && looseTokens.every(token => normalizedName.includes(token));
+    const yearMatch = looseTokens.some(token => /^\d{4}$/.test(token) && normalizedName.includes(token));
+    const nonYearTokenMatches = looseTokens.filter(token => !/^\d{4}$/.test(token) && normalizedName.includes(token));
+    const relaxedMatch = yearMatch && nonYearTokenMatches.length > 0;
+    if (!exactMatch && !tokenMatch && !relaxedMatch) return;
 
     let resolved = (typeof candidate === "string")
       ? allSkins.find(entry => normalizeMarketHashName(entry?.name || entry?.market_hash_name || entry?.hash_name || "").toLowerCase() === normalizedName)
@@ -905,7 +1384,12 @@ function getSouvenirStickerPoolForContainer(containerName) {
 
   Object.entries(CASE_CONTENTS_DB || {}).forEach(([caseName, groups]) => {
     const normalizedCaseName = normalizeMarketHashName(caseName).toLowerCase();
-    if (!searchKeys.some(key => normalizedCaseName.includes(key))) return;
+    const exactCaseMatch = searchKeys.some(key => normalizedCaseName.includes(key));
+    const tokenCaseMatch = looseTokens.length > 0 && looseTokens.every(token => normalizedCaseName.includes(token));
+    const yearCaseMatch = looseTokens.some(token => /^\d{4}$/.test(token) && normalizedCaseName.includes(token));
+    const nonYearCaseTokenMatches = looseTokens.filter(token => !/^\d{4}$/.test(token) && normalizedCaseName.includes(token));
+    const relaxedCaseMatch = yearCaseMatch && nonYearCaseTokenMatches.length > 0;
+    if (!exactCaseMatch && !tokenCaseMatch && !relaxedCaseMatch) return;
 
     Object.entries(groups || {}).forEach(([rarityKey, items]) => {
       if (!Array.isArray(items)) return;
@@ -937,27 +1421,6 @@ function getSouvenirStickerPoolForContainer(containerName) {
 }
 
 function buildSouvenirStickersForContainer(containerName, count = 4, priceMultiplier = 1) {
-  const query = containerName.toLowerCase();
-  const stickerPool = allSkins.filter(s => {
-      const sn = s.name.toLowerCase();
-      return sn.includes("sticker") && sn.includes("(gold)") && query.split(/\s+/).some(word => word.length > 2 && sn.includes(word));
-  });
-
-  if (stickerPool.length > 0) {
-      const picks = [];
-      for(let i=0; i<count; i++) {
-          const s = stickerPool[Math.floor(Math.random()*stickerPool.length)];
-          picks.push({
-            name: s.name,
-            img: getDisplayImage(s),
-            price: (PRICE_FIXES[s.name] || mockPrice(s)) * 0.5,
-            rarity: "Extraordinary",
-            scratchPercent: 0
-          });
-      }
-      return picks;
-  }
-
   const { goldPool, regularPool } = getSouvenirStickerPoolForContainer(containerName);
   if (!goldPool.length && !regularPool.length) return [];
 
@@ -971,7 +1434,7 @@ function buildSouvenirStickersForContainer(containerName, count = 4, priceMultip
   const uniqueGoldPool = [...goldPool];
   const uniqueRegularPool = [...regularPool];
   const stickers = [];
-  const goldCount = regularPool.length > 0 ? Math.min(count, goldPool.length) : count;
+  const goldCount = goldPool.length >= count ? count : Math.min(1, goldPool.length);
 
   for (let i = 0; i < goldCount; i++) {
     const sticker = takeRandomSticker(goldPool, uniqueGoldPool);
@@ -1001,7 +1464,7 @@ function buildSouvenirStickersForContainer(containerName, count = 4, priceMultip
     });
   }
 
-  const fallbackPool = goldPool.length ? goldPool : regularPool;
+  const fallbackPool = regularPool.length ? regularPool : goldPool;
   while (stickers.length < count && fallbackPool.length > 0) {
     const sticker = fallbackPool[Math.floor(Math.random() * fallbackPool.length)];
     if (!sticker) break;
@@ -1018,6 +1481,35 @@ function buildSouvenirStickersForContainer(containerName, count = 4, priceMultip
   }
 
   return stickers;
+}
+
+function sanitizeSouvenirWeaponStickers(stickers, count = 4) {
+  if (!Array.isArray(stickers)) return [];
+
+  const seen = new Set();
+  const sanitized = [];
+  for (const sticker of stickers) {
+    const stickerName = String(sticker?.name || sticker?.market_hash_name || "").trim();
+    if (!stickerName) continue;
+
+    const normalizedName = stickerName.toLowerCase();
+    if (!normalizedName.includes("sticker")) continue;
+    if (normalizedName.includes("slab")) continue;
+
+    const dedupeKey = `${stickerName}|${sticker?.img || ""}`;
+    if (seen.has(dedupeKey)) continue;
+    seen.add(dedupeKey);
+
+    sanitized.push({
+      ...sticker,
+      name: stickerName,
+      scratchPercent: typeof sticker?.scratchPercent === "number" ? sticker.scratchPercent : 0
+    });
+
+    if (sanitized.length >= count) break;
+  }
+
+  return sanitized;
 }
 
 const API_CONTAINER_ALIASES = {
@@ -1067,47 +1559,39 @@ function normalizeApiContainerName(name) {
 }
 
 function indexApiData() {
+  // Performance Fix: Always rebuild indices if empty, but use efficient Maps
   apiCratesByName = new Map();
   apiSkinVariantsByName = new Map();
+  apiSkinsByNormalizedName = new Map();
 
   if (!apiAllItems || typeof apiAllItems !== "object" || Array.isArray(apiAllItems)) {
     apiAllItems = {};
   }
 
-  apiSkins = Array.isArray(apiSkins) ? apiSkins.filter(Boolean) : [];
-  apiCrates = Array.isArray(apiCrates) ? apiCrates.filter(Boolean) : [];
-  apiSkinVariants = Array.isArray(apiSkinVariants) ? apiSkinVariants.filter(Boolean) : [];
-  apiBaseWeapons = Array.isArray(apiBaseWeapons) ? apiBaseWeapons.filter(Boolean) : [];
-
-  allSkins.filter(Boolean).forEach(item => {
-    if (item?.id && !apiAllItems[item.id]) apiAllItems[item.id] = item;
-  });
-  apiSkins.forEach(item => {
-    if (item?.id && !apiAllItems[item.id]) apiAllItems[item.id] = item;
-  });
-  apiCrates.forEach(item => {
-    if (item?.id && !apiAllItems[item.id]) apiAllItems[item.id] = item;
-  });
-  apiSkinVariants.forEach(item => {
-    if (item?.id && !apiAllItems[item.id]) apiAllItems[item.id] = item;
-  });
-  apiBaseWeapons.forEach(item => {
-    if (item?.id && !apiAllItems[item.id]) apiAllItems[item.id] = item;
+  // Pre-index the massive allSkins array by normalized name for O(1) lookups
+  allSkins.forEach(s => {
+    if (!s) return;
+    const norm = normalizeMarketHashName(s.name || s.hash_name || "").toLowerCase();
+    if (!apiSkinsByNormalizedName.has(norm)) {
+      apiSkinsByNormalizedName.set(norm, s);
+    }
   });
 
   apiCrates.forEach(crate => {
-    getApiLookupKeys(crate?.name || crate?.market_hash_name || "").forEach(key => {
+    if (!crate) return;
+    getApiLookupKeys(crate.name || crate.market_hash_name || "").forEach(key => {
       if (!apiCratesByName.has(key)) apiCratesByName.set(key, crate);
     });
   });
 
   apiSkinVariants.forEach(variant => {
-    const wearName = getWearName(variant?.wear);
+    if (!variant) return;
+    const wearName = getWearName(variant.wear);
     const lookupNames = [
-      variant?.market_hash_name,
-      variant?.name,
-      wearName && variant?.name ? `${normalizeImageLookupName(variant.name)} (${wearName})` : "",
-      wearName && variant?.skin_id ? `${variant.skin_id}::${wearName}` : ""
+      variant.market_hash_name,
+      variant.name,
+      wearName && variant.name ? `${normalizeImageLookupName(variant.name)} (${wearName})` : "",
+      wearName && variant.skin_id ? `${variant.skin_id}::${wearName}` : ""
     ].filter(Boolean);
     lookupNames.forEach(name => {
       getApiLookupKeys(name).forEach(key => {
@@ -1126,27 +1610,20 @@ function findApiCrateByName(caseName) {
   return null;
 }
 
-function getResolvedWearVariantImage(input) {
-  const item = getWearImageLookupItem(input);
-  if (!item) return "";
-  const lowerName = String(item.name || "").toLowerCase();
-  if (lowerName.includes("doppler")) return ""; // Exclude Dopplers
-
-  const variant = getApiWearVariant(input);
-  return variant?.image || variant?.img || "";
-}
-
-function getApiWearVariant(input) {
-  const item = getWearImageLookupItem(input);
+function getApiWearVariant(itemOrListing) {
+  const item = getWearImageLookupItem(itemOrListing);
   if (!item) return null;
+  
   const wearName = getWearName(item.wear);
   if (!wearName) return null;
 
+  const rawName = item.skinBidsApiName || item.name || item.market_hash_name || "";
+  const baseNameNoWear = normalizeImageLookupName(rawName);
+
   const exactCandidates = [
+    `${baseNameNoWear} (${wearName})`,
     item.market_hash_name,
     item.skinBidsApiName,
-    item.name ? `${normalizeImageLookupName(item.name)} (${wearName})` : "",
-    item.name ? `${String(item.name).replace(/\s+\((Factory New|Minimal Wear|Field-Tested|Well-Worn|Battle-Scarred)\)$/i, "").trim()} (${wearName})` : "",
     item.skin_id ? `${item.skin_id}::${wearName}` : ""
   ].filter(Boolean);
 
@@ -1157,22 +1634,25 @@ function getApiWearVariant(input) {
     }
   }
 
-  const normalizedBaseName = normalizeImageLookupName(item.skinBidsApiName || item.name || "").toLowerCase();
-  return apiSkinVariants.find(variant => {
+  const normalizedBaseRequested = baseNameNoWear.toLowerCase();
+  const fallbackMatch = apiSkinVariants.find(variant => {
     const variantWear = getWearName(variant?.wear);
     if (!variantWear || variantWear.toLowerCase() !== wearName.toLowerCase()) return false;
-    const variantBaseName = normalizeImageLookupName(variant?.name || variant?.market_hash_name || "").toLowerCase();
-    return variantBaseName === normalizedBaseName;
-  }) || null;
+    const vName = variant?.name || variant?.market_hash_name || "";
+    return normalizeImageLookupName(vName).toLowerCase() === normalizedBaseRequested;
+  });
+
+  if (fallbackMatch) return fallbackMatch;
+
+  return apiSkinVariantsByName.get(`${normalizedBaseRequested} (${wearName.toLowerCase()})`) || null;
 }
 
-function syncItemWearImage(input) {
-  const item = getWearImageLookupItem(input);
-  if (!item || typeof item !== "object") return input;
+function syncItemWearImage(item) {
+  if (!item || typeof item !== "object") return item;
   const lowerName = String(item.name || "").toLowerCase();
-
-  // Exclude Dopplers from generic wear path as they use phase logic
-  if (lowerName.includes("doppler")) return input;
+  
+  // User Fix: Doppler items MUST NOT be synced with generic API images to avoid losing phase-specific visuals from Steam
+  if (lowerName.includes("doppler")) return item;
 
   const typeText = String(item.type || item.category?.name || item.weapon?.name || "").toLowerCase();
   const isCaseHardened = lowerName.includes("case hardened");
@@ -1188,17 +1668,17 @@ function syncItemWearImage(input) {
     !lowerName.includes("graffiti") &&
     !lowerName.includes("agent") &&
     !lowerName.includes("storage unit");
+  if (!isWeaponLike) return item;
 
-  if (!isWeaponLike) return input;
-
-  const exactApiImage = getExactApiImage(input);
+  const exactApiImage = getExactApiImage(item);
   if (exactApiImage) {
     item.image = exactApiImage;
     item.img = exactApiImage;
-    return input;
+    return item;
   }
 
-  const resolvedImage = getResolvedWearVariantImage(input);
+  const wearVariant = getApiWearVariant(item);
+  const resolvedImage = wearVariant?.image || wearVariant?.img || "";
   if (resolvedImage) {
     item.image = resolvedImage;
     item.img = resolvedImage;
@@ -1209,7 +1689,7 @@ function syncItemWearImage(input) {
       item.img = baseImage;
     }
   }
-  return input;
+  return item;
 }
 
 const BASE_WEAPON_ID_PREFIX = "default::";
@@ -1279,11 +1759,11 @@ const DEFAULT_LOADOUT_BASE_NAMES = {
     gloves: "__DEFAULT_T_GLOVES__",
     knife: "__DEFAULT_T_KNIFE__",
     p_starting: "Glock-18",
-    p_other1: "Dual Berettas",
-    p_other2: "P250",
+    p_other1: "R8 Revolver",
+    p_other2: "P2000",
     p_other3: "Tec-9",
     p_other4: "Desert Eagle",
-    mid1: "Nova",
+    mid1: "XM1014",
     mid2: "Sawed-Off",
     mid3: "MAC-10",
     mid4: "MP5-SD",
@@ -1366,7 +1846,7 @@ function getVirtualBaseWeaponDisplayName(entry, teamKey) {
   return rawName;
 }
 
-function buildVirtualBaseWeaponItem(entry, teamKey = null) {
+function buildVirtualBaseWeaponItem(entry, teamKey = null, account = getActiveAccount()) {
   if (!entry) return null;
   const canonicalTeamKey = teamKey || getBaseWeaponCanonicalTeamKey(entry);
   const defaultCategory = isBaseWeaponKnifeEntry(entry) ? "knife" : (isBaseWeaponGlove(entry) ? "gloves" : "weapon");
@@ -1395,7 +1875,7 @@ function buildVirtualBaseWeaponItem(entry, teamKey = null) {
     else finalImg = "https://i.imgur.com/qFc71qZ.png";
   }
 
-  return {
+  return applyDefaultItemOverride({
     id: `${BASE_WEAPON_ID_PREFIX}${canonicalTeamKey}::${entry.id}`,
     baseWeaponId: entry.id,
     name: displayName,
@@ -1414,7 +1894,7 @@ function buildVirtualBaseWeaponItem(entry, teamKey = null) {
     nametag: null,
     stickers: [],
     contents: []
-  };
+  }, account);
 }
 
 function getAllowedBaseWeaponEntries() {
@@ -1423,7 +1903,7 @@ function getAllowedBaseWeaponEntries() {
     : [];
 }
 
-function getVirtualDefaultWeaponById(id) {
+function getVirtualDefaultWeaponById(id, account = getActiveAccount()) {
   const text = String(id || "");
   if (!isBaseWeaponVirtualId(text)) return null;
   const payload = text.slice(BASE_WEAPON_ID_PREFIX.length);
@@ -1432,7 +1912,7 @@ function getVirtualDefaultWeaponById(id) {
   const [teamKey, ...rest] = parts;
   const baseWeaponId = rest.join("::");
   const entry = (apiBaseWeapons || []).find(item => String(item?.id || "") === baseWeaponId);
-  return entry ? buildVirtualBaseWeaponItem(entry, teamKey) : null;
+  return entry ? buildVirtualBaseWeaponItem(entry, teamKey, account) : null;
 }
 
 function findBaseWeaponEntryByName(name) {
@@ -1461,7 +1941,7 @@ function getDefaultLoadoutItemForSlot(side, slotId) {
   } else {
     entry = findBaseWeaponEntryByName(target);
   }
-  return entry ? buildVirtualBaseWeaponItem(entry, getBaseWeaponCanonicalTeamKey(entry) === "shared" ? "shared" : side) : null;
+  return entry ? buildVirtualBaseWeaponItem(entry, getBaseWeaponCanonicalTeamKey(entry) === "shared" ? "shared" : side, getActiveAccount()) : null;
 }
 
 function getEffectiveLoadoutItemForSlot(side, slotId, account = getActiveAccount()) {
@@ -1476,7 +1956,7 @@ function getEffectiveLoadoutItemForSlot(side, slotId, account = getActiveAccount
 function getDefaultInventoryItems() {
   if (!areDefaultWeaponsEnabled()) return [];
   return getAllowedBaseWeaponEntries()
-    .map(entry => buildVirtualBaseWeaponItem(entry))
+    .map(entry => buildVirtualBaseWeaponItem(entry, null, getActiveAccount()))
     .filter(Boolean)
     .sort((a, b) => {
       // Sort T and CT knife together at the top (or bottom, depending on usage)
@@ -1494,24 +1974,29 @@ function getDefaultInventoryItems() {
 function buildCaseContentsFromApi(crate) {
   if (!crate) return null;
   const grouped = {};
+  const crateNameLower = String(crate?.name || crate?.market_hash_name || "").toLowerCase();
+  const isSouvenirOrCollectionContainer = crateNameLower.includes("souvenir") || crateNameLower.includes("package") || crateNameLower.includes("collection");
   const canonicalizeCaseRarityName = (rarityName) => {
     const raw = String(rarityName || "").trim();
     const normalized = normalizeVisualCaseRarityKey(raw);
-    if (normalized === "base grade") return "Base Grade";
-    if (normalized === "consumer") return "Consumer";
-    if (normalized === "industrial") return "Industrial";
-    if (normalized === "mil-spec") return "Mil-Spec";
-    if (normalized === "restricted") return "Restricted";
-    if (normalized === "classified") return "Classified";
-    if (normalized === "covert") return "Covert";
-    if (normalized === "gold" || /rare special/i.test(raw)) return "Gold";
-
     const lower = raw.toLowerCase();
+
+    if (normalized === "base grade" || lower === "base grade") return "Base Grade";
+    if (normalized === "consumer" || lower === "consumer") return "Consumer";
+    if (normalized === "industrial" || lower === "industrial") return "Industrial";
+    if (normalized === "mil-spec" || lower === "mil-spec") return "Mil-Spec";
+    if (normalized === "restricted" || lower === "restricted") return "Restricted";
+    if (normalized === "classified" || lower === "classified") return "Classified";
+    if (normalized === "covert" || lower === "covert") return "Covert";
+    if (normalized === "gold" || lower === "gold" || /rare special/i.test(raw)) return "Gold";
+
     if (lower === "high grade") return "High Grade";
     if (lower === "remarkable") return "Remarkable";
     if (lower === "exotic") return "Exotic";
     if (lower === "extraordinary") return "Extraordinary";
-    return raw;
+    
+    // Capitalize first letter as fallback
+    return raw.charAt(0).toUpperCase() + raw.slice(1);
   };
   const findExactCaseSkin = (entry) => {
     const rawName = entry?.name || entry?.market_hash_name || "";
@@ -1568,18 +2053,36 @@ function buildCaseContentsFromApi(crate) {
   };
 
   pushItems(crate.contains, null);
-  pushItems(crate.contains_rare, "Gold");
+  pushItems(crate.contains_rare, isSouvenirOrCollectionContainer ? null : "Gold");
 
   return Object.keys(grouped).length ? grouped : null;
 }
 
 function resolveCaseContentsData(caseName) {
   const rawName = String(caseName || "").replace(/^Souvenir\s+/i, "").trim();
+  
+  // 1. Try to find an item in allSkins that matches this name and has contains/contains_rare
+  const matchedItem = allSkins.find(s => {
+    const sName = (s.name || "").trim();
+    return sName === caseName || sName === rawName || (s.contains && s.name === caseName);
+  });
+  if (matchedItem && (matchedItem.contains || matchedItem.contains_rare)) {
+    const contents = buildCaseContentsFromApi(matchedItem);
+    if (contents) return contents;
+  }
+
+  // 2. Try the indexed API crates
   const apiCrate = findApiCrateByName(caseName);
   const apiContents = buildCaseContentsFromApi(apiCrate);
   if (apiContents) return apiContents;
+  
+  // 3. Fallback to hardcoded DB with fuzzy matching
   if (CASE_CONTENTS_DB[rawName]) return CASE_CONTENTS_DB[rawName];
-  return CASE_CONTENTS_DB[caseName] || null;
+  if (CASE_CONTENTS_DB[caseName]) return CASE_CONTENTS_DB[caseName];
+  
+  const searchName = rawName.toLowerCase();
+  const foundKey = Object.keys(CASE_CONTENTS_DB).find(k => k.toLowerCase() === searchName || k.toLowerCase().includes(searchName));
+  return foundKey ? CASE_CONTENTS_DB[foundKey] : null;
 }
 
 /**
@@ -1636,6 +2139,7 @@ function normalizeState() {
   if (state.betterKarambitImages === undefined) state.betterKarambitImages = false;
   if (state.disablePagination === undefined) state.disablePagination = true; 
   if (state.seenPurchaseIds === undefined) state.seenPurchaseIds = [];
+  if (state.inspectBlurDisabled === undefined) state.inspectBlurDisabled = false;
   if (state.twoClickSidebar === undefined) state.twoClickSidebar = true;
   if (state.pureRandomOdds === undefined) state.pureRandomOdds = true;
   if (state.cs2InvColor === undefined) state.cs2InvColor = true;
@@ -1724,6 +2228,7 @@ function normalizeState() {
     acc.items = acc.items.filter(it => !isBlockedInventoryItem(it));
     acc.items.forEach(it => {
         if (it && it.floatRank === undefined) it.floatRank = 0;
+        if (it) it.type = getCanonicalInventoryType(it, it.type || "");
         if (it && Array.isArray(it.contents)) {
           it.contents = it.contents.filter(child => !isBlockedInventoryItem(child));
         }
@@ -1747,11 +2252,20 @@ function normalizeState() {
     if (typeof acc.diceProfit !== "number") acc.diceProfit = 0;
     if (!acc.openedCaseCounts) acc.openedCaseCounts = {};
     if (!acc.transactions) acc.transactions = [];
-
-    // Purge GitHub image links
+    ensureAccountGameHistories(acc);
+    ensureDefaultItemOverrides(acc);
+    Object.values(acc.defaultItemOverrides).forEach(record => {
+      if (!record || typeof record !== "object") return;
+      record.stickers = normalizeAppliedStickerList(record.stickers || [], { maxCount: 5 });
+      if (record.charm) {
+        record.charm = {
+          ...clonePlain(record.charm),
+          img: record.charm.img || record.charm.image || ""
+        };
+      }
+    });
 
     acc.items.forEach(it => {
-      if (it.img && it.img.includes("raw.githubusercontent.com")) it.img = "";
       if (!it.id) it.id = "it_" + Date.now() + "_" + Math.random().toString(16).slice(2);
       if (it.source && String(it.source).toLowerCase().includes("added")) it.source = "Purchased";
       if (it && shouldForceNoWearItem(it)) {
@@ -1764,7 +2278,7 @@ function normalizeState() {
       if (it.contents) {
         it.contents.forEach(child => {
           if (child && !child.id) child.id = "it_" + Date.now() + "_" + Math.random().toString(16).slice(2);
-          if (child && child.img && child.img.includes("raw.githubusercontent.com")) child.img = "";
+          if (child) child.type = getCanonicalInventoryType(child, child.type || "");
           if (child && shouldForceNoWearItem(child)) {
             child.wear = null;
             child.floatVal = null;
@@ -1899,17 +2413,14 @@ async function saveStateToDB() {
         idbSuccess = await saveToIDB(STORAGE_KEY, snapshotObj);
       } catch(e) {}
 
-      // ONLY write to slow synchronous localStorage if the save is significantly different or every ~30 seconds
+      // Performance Optimization: Save to synchronous storage on every dirty cycle
+      // (Debounce in saveState ensures this doesn't happen too frequently)
       const now = Date.now();
-      const shouldSaveToHardStorage = !window._lastHardSave || (now - window._lastHardSave > 30000);
-      
-      if (shouldSaveToHardStorage) {
-          window._lastHardSave = now;
-          try {
-            writeStringWithFallback(STORAGE_KEY, snapshotStr);
-            writeStringWithFallback(STORAGE_REFRESH_SAFE_KEY, JSON.stringify(buildRefreshSafeSnapshotObject()));
-          } catch(e) {}
-      }
+      window._lastHardSave = now;
+      try {
+        writeStringWithFallback(STORAGE_KEY, snapshotStr);
+        writeStringWithFallback(STORAGE_REFRESH_SAFE_KEY, JSON.stringify(buildRefreshSafeSnapshotObject()));
+      } catch(e) {}
 
       // Keep window.name and sessionStorage updated for tab-refresh protection (fast)
       try {
@@ -2337,10 +2848,6 @@ const REVOLVER_CONTENT = {
   "Classified": [
     { name: "AK-47 | Point Disarray", img: "", price: 71.13 },
     { name: "G3SG1 | The Executioner", img: "", price: 40.29 }
-  ],
-  "Terminal": [
-    { name: "Sealed Genesis Terminal", img: "https://i.imgur.com/DQ2qP7m.png", price: 3.00 },
-    { name: "Sealed Dead Hand Terminal", img: "https://i.imgur.com/4RK4e3B.png", price: 7.00 }
   ],
   "Restricted": [
     { name: "P90 | Shapewood", img: "", price: 30.80 },
@@ -3750,6 +4257,8 @@ PRICE_FIXES = {
   "AK-47 | Midnight Laminate": 20.78,
   "Desert Eagle | Mint Fan": 1.64,
   "FAMAS | Yeti Camo": 3.77,
+  "M4A1-S | Wild Lily": 2743.00,
+  "AK-47 | Wild Lotus": 9500.00,
   "P90 | Reef Grief": 1.40,
   "P2000 | Royal Baroque": 2.02,
   "MP9 | Cobalt Paisley": 1.59,
@@ -4848,21 +5357,36 @@ document.addEventListener("DOMContentLoaded", async () => {
   console.log("App initializing...");
   await loadStateFromDB();
   
-  // Ensure base items appear immediately on startup without requiring user action
-  try {
-    const acc = getActiveAccount();
-    if (acc) {
+  // User requested: show base items on page startup
+  // Ensure we check and add base weapons immediately as the very first thing
+  (function ensureBaseItemsOnStartup() {
+    try {
+      let acc = getActiveAccount();
+      if (!acc && state.accounts.length > 0) {
+          state.activeAccountId = state.accounts[0].id;
+          acc = getActiveAccount();
+      }
+      if (!acc) {
+          acc = createAccount("Main Inventory");
+      }
+      
       const baseItems = getDefaultInventoryItems();
+      let addedAny = false;
       baseItems.forEach(bi => {
-        if (!acc.items.some(it => it.id === bi.id)) {
+        // Double check against name/isDefaultItem since IDs might rotate between sessions
+        if (!acc.items.some(it => it.id === bi.id || (it.isDefaultItem && it.name === bi.name))) {
           acc.items.push(bi);
+          addedAny = true;
         }
       });
-      refreshInventoryView();
+      if (addedAny) {
+        saveState();
+        refreshInventoryView();
+      }
+    } catch (e) {
+      console.warn("Base items startup sync failed:", e);
     }
-  } catch (e) {
-    console.warn("Base items startup sync failed:", e);
-  }
+  })();
   applyTabTitle();
   
   // Default to Everything tab on launch
@@ -5580,6 +6104,9 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   renderAccountSelect();
   attachUIHandlers();
+  document.addEventListener("dragstart", (e) => e.preventDefault(), true);
+  document.addEventListener("dragover", (e) => e.preventDefault(), true);
+  document.addEventListener("drop", (e) => e.preventDefault(), true);
 
   // Set default category to Category (Random)
   initSearchSidebar();
@@ -6207,9 +6734,40 @@ function isSkinBidsEligibleItem(item) {
   return isWeaponMarketItem(item);
 }
 
+function sanitizeSkinBidsListingStickers(itemOrListing, stickers) {
+  const listingItem = itemOrListing?.item || itemOrListing;
+  if (!listingItem || isStickerNamedItem(listingItem)) return [];
+  if (!Array.isArray(stickers)) return [];
+
+  let slabCount = 0;
+  const sanitized = [];
+  for (const sticker of stickers) {
+    const stickerName = String(sticker?.name || "").trim();
+    if (!stickerName) continue;
+    const stickerLower = stickerName.toLowerCase();
+    const isSlab = stickerLower.includes("slab");
+    if (!stickerLower.includes("sticker") && !isSlab) continue;
+    if (isSlab) {
+      if (slabCount >= 1) continue;
+      slabCount++;
+    }
+    sanitized.push({
+      ...sticker,
+      name: stickerName,
+      scratchPercent: typeof sticker?.scratchPercent === "number" ? sticker.scratchPercent : 0
+    });
+    if (sanitized.length >= 4) break;
+  }
+  return sanitized;
+}
+
 function getSkinBidsDisplayStickers(listing) {
   if (!listing || isStickerNamedItem(listing.item)) return [];
-  return Array.isArray(listing.stickers) ? listing.stickers : [];
+  return sanitizeSkinBidsListingStickers(listing, listing.stickers);
+}
+
+function getSkinBidsListingStickerValue(listing) {
+  return getSkinBidsDisplayStickers(listing).reduce((sum, sticker) => sum + (sticker?.price || 0), 0);
 }
 
 function getSkinBidsListingRarity(listing) {
@@ -6515,8 +7073,15 @@ function extractExplicitDopplerPhase(name) {
 
 function getUniqueFloatForItem(item, usedFloats) {
   if (!item || !item.wear) return null;
-
-  const fallbackBase = generateFloatForWear(item.name, item.wear || "Factory New", item.rarity);
+  const existingFloat = Number(item.floatVal);
+  if (Number.isFinite(existingFloat) && existingFloat > 0 && existingFloat < 1) {
+    const fixedExisting = Number(existingFloat.toFixed(12));
+    usedFloats.add(fixedExisting.toFixed(12));
+    return fixedExisting;
+  }
+  const fallbackBase = Number.isFinite(existingFloat) && existingFloat > 0
+    ? existingFloat
+    : generateFloatForWear(item.name, item.wear || "Factory New", item.rarity);
   if (typeof fallbackBase !== "number" || Number.isNaN(fallbackBase)) return null;
 
   const idSeed = String(item.id || item.name || "");
@@ -6587,6 +7152,9 @@ const BETTER_KARAMBIT_IMAGES = {
 
 function getBetterKarambitImage(itemOrName) {
   if (!state?.betterKarambitImages) return "";
+  const item = getWearImageLookupItem(itemOrName);
+  // Don't override high quality specific images (like marketplace steamstatic links)
+  if (item && item.image && item.image.includes('steamstatic')) return "";
   const rawName = typeof itemOrName === "string"
     ? String(itemOrName || "").trim()
     : String(itemOrName?.name || itemOrName?.hash_name || "").trim();
@@ -7106,7 +7674,13 @@ function createAccount(name) {
     hasGambledJackpot: false,
     hasGambledDice: false,
     openedCaseCounts: {},
-    transactions: []
+    transactions: [],
+    defaultItemOverrides: {},
+    gambleGameHistory: {
+      jackpot: [],
+      dice: [],
+      blackjack: []
+    }
   };
   state.accounts.push(account);
   state.activeAccountId = id;
@@ -7136,19 +7710,7 @@ function handleContextMenu(e, item) {
   if (!account || !item) return;
 
   const target = e.currentTarget.closest(".inv-item") || e.currentTarget;
-  const rect = target.getBoundingClientRect();
-  
-  let x = rect.right + 10; 
-  let y = rect.top;
-  
-  if (x + 320 > window.innerWidth) {
-     x = rect.left - 330;
-  }
-  
-  y = Math.max(10, Math.min(y, window.innerHeight - 480));
-  
-  menu.style.left = x + "px";
-  menu.style.top = y + "px";
+  positionInventoryAnchoredPopup(target, menu, 320);
 
   // Handle storage unit items right-click context
   if (state.viewingStorageUnitId || state.storageSelectionMode) {
@@ -7171,8 +7733,6 @@ function handleContextMenu(e, item) {
     btnInspect.onclick = () => { menu.classList.add("hidden"); showInspect(item); };
 
     menu.classList.remove("hidden");
-    menu.style.left = e.clientX + "px";
-    menu.style.top = e.clientY + "px";
     setTimeout(() => document.addEventListener("click", () => menu.classList.add("hidden"), {once:true}), 10);
     return;
   }
@@ -7186,9 +7746,10 @@ function handleContextMenu(e, item) {
     const btnSticker = document.getElementById("ctxSticker");
     const btnSell = document.getElementById("ctxSell");
 
-    // Allow Inspect and View visible
+    const showView = !!state.showViewContext;
+
     btnInspect.classList.remove("hidden");
-    btnView.classList.remove("hidden");
+    btnView.classList.toggle("hidden", !showView);
     
     const btnGetKey = document.getElementById("ctxGetKey");
     const btnGetCase = document.getElementById("ctxGetCase");
@@ -7316,8 +7877,6 @@ function handleContextMenu(e, item) {
     // Move Favorite under Equip as requested
     menu.insertBefore(btnEquip, btnView.nextSibling);
     menu.insertBefore(btnFavorite, btnEquip.nextSibling);
-    // Place Edit Nametag under Apply Sticker as requested
-    menu.insertBefore(btnEditNametag, btnSticker.nextSibling);
   } catch (err) { console.warn(err); }
 
   // Remove Inspect button for Cases and Keys as requested
@@ -7389,76 +7948,23 @@ function handleContextMenu(e, item) {
 
   if (isCont) {
     const isCapsuleLocal = isStickerCapsuleItem(item);
-    const requiredKeys = getRequiredKeysForCase(item);
-    const hasKey = requiredKeys.length === 0 || accountHasItemName(account, requiredKeys);
-
-    const ctxGetKeyBtn = document.getElementById("ctxGetKey");
-
-    if (hasKey || requiredKeys.length === 0) {
-      if (ctxGetKeyBtn) ctxGetKeyBtn.classList.add("hidden");
-      btnOpen.textContent = isCapsuleLocal ? "Open Capsule" : "Open Container";
-      btnOpen.style.color = "";
-      btnOpen.onclick = () => {
-        menu.classList.add("hidden");
-        showCaseConfirmForCaseName(item.name, null, item.id);
-      };
-    } else {
-      btnOpen.classList.remove("hidden");
-      btnOpen.textContent = isCapsuleLocal ? "Open Capsule" : "Open Container";
-      btnOpen.style.color = ""; 
-
-      if (ctxGetKeyBtn) {
-        ctxGetKeyBtn.classList.remove("hidden");
-        ctxGetKeyBtn.style.fontSize = "20px";
-        ctxGetKeyBtn.style.fontWeight = "800";
-        ctxGetKeyBtn.style.color = "#66c0f4";
-        ctxGetKeyBtn.onclick = () => {
-          menu.classList.add("hidden");
-          const keyName = requiredKeys[0];
-          const keyData = MARKET_KEYS.find(k => k.name === keyName) || allSkins.find(s => s.name === keyName);
-          if (keyData) {
-            promptWearSelection(keyData, keyData.price || 2.50, (wear, qty, finalPrice, isCustom, extra = {}) => {
-              addItemToAccount({
-                name: keyData.name,
-                img: keyData.image || keyData.img,
-                price: finalPrice,
-                rarity: "Base Grade",
-                qty: qty,
-                isCustomPrice: isCustom,
-                source: "Purchased",
-                nametag: extra.nametag || null
-              });
-              // Do not show the container confirmation automatically after key purchase
-            }, { confirmMode: "purchase" });
-          } else {
-            alert(`Key "${keyName}" not found in database.`);
-          }
-        };
+    btnOpen.classList.remove("hidden");
+    btnOpen.textContent = isCapsuleLocal ? "Open Capsule" : "Open Container";
+    btnOpen.style.color = "";
+    btnOpen.onclick = () => {
+      menu.classList.add("hidden");
+      const required = getRequiredKeysForCase(item);
+      if (required.length > 0) {
+          state.pairSelectionMode = { type: 'key_for_case', targetItem: item };
+          state.inventoryTab = "everything";
+          document.getElementById("filterInput").value = "";
+          state.currentPage = 1;
+          refreshInventoryView();
+          setTimeout(scrollInventoryViewportToTop, 0);
       } else {
-        btnOpen.textContent = "Get Key...";
-        btnOpen.style.color = "#66c0f4";
-        btnOpen.onclick = () => {
-          menu.classList.add("hidden");
-          const keyName = requiredKeys[0];
-          const keyData = MARKET_KEYS.find(k => k.name === keyName) || allSkins.find(s => s.name === keyName);
-          if (keyData) {
-            promptWearSelection(keyData, keyData.price || 2.50, (wear, qty, finalPrice, isCustom) => {
-              addItemToAccount({
-                name: keyData.name,
-                img: keyData.image || keyData.img,
-                price: finalPrice,
-                rarity: "Base Grade",
-                qty: qty,
-                isCustomPrice: isCustom,
-                source: "Purchased"
-              });
-            });
-          } else {
-            alert(`Key "${keyName}" not found in database.`);
-          }
-        };
+          showCaseConfirmForCaseName(item.name, null, item.id);
       }
-    }
+    };
   }
   const btnEquip = document.getElementById("ctxEquip");
   const btnFavorite = document.getElementById("ctxFavorite");
@@ -7495,7 +8001,19 @@ function handleContextMenu(e, item) {
       btnSticker.classList.add("hidden");
   }
   
-
+  const isWeaponOrKnife = isGun || isKnife || isGloves;
+  if (btnEditNametag) {
+    // User requested: show edit nametag on right click modal even when "Show Edit/Sell in Context Menu" is turned off
+    if (isWeaponOrKnife && !isDefaultItem) {
+      btnEditNametag.classList.remove("hidden");
+      btnEditNametag.onclick = () => {
+        menu.classList.add("hidden");
+        showNametagModal(item.id);
+      };
+    } else {
+      btnEditNametag.classList.add("hidden");
+    }
+  }
 
   if (btnSell) {
     btnSell.classList.toggle("hidden", isDefaultItem || !showEditSell);
@@ -7511,7 +8029,6 @@ function handleContextMenu(e, item) {
   // Make "View" behave the same as clicking/double-clicking an inventory item:
   // select the item, update state, refresh grid UI and show the details sidebar/modal.
   if (btnView) {
-    btnView.classList.remove("hidden");
     btnView.onclick = () => {
       menu.classList.add("hidden");
       // Select item in state so details panel reflects the chosen item
@@ -7596,87 +8113,13 @@ function handleContextMenu(e, item) {
     btnOpen.textContent = "Open Container";
     btnOpen.onclick = () => {
       menu.classList.add("hidden");
-      const accountForKey = getActiveAccount();
-      const baseKeyName = (item.name || "").split(' (')[0].trim();
-
-      let mappedCases = [];
-      if (KEY_CASE_MAP[baseKeyName]) {
-        mappedCases = KEY_CASE_MAP[baseKeyName];
-      } else {
-        const foundKey = Object.keys(KEY_CASE_MAP).find(k => {
-          if (!k) return false;
-          const lk = k.toLowerCase();
-          const lb = baseKeyName.toLowerCase();
-          return lk === lb || lk.includes(lb) || lb.includes(lk);
-        });
-        if (foundKey) mappedCases = KEY_CASE_MAP[foundKey] || [];
-      }
-
-      let ownedCase = null;
-      if (mappedCases.length > 0 && accountForKey) {
-        ownedCase = accountForKey.items.find(it => {
-          const itName = (it.name || "").toLowerCase();
-          if (baseKeyName.toLowerCase() === "cs:go case key" && itName.includes("cs:go weapon case")) return true;
-          return mappedCases.some(cn => itName.includes(cn.toLowerCase()));
-        });
-      }
-
-      if (ownedCase) {
-        showCaseConfirmForCaseName(ownedCase.name, item.id);
-        return;
-      }
-
-      // If user does not own the case, DO NOT auto-create or auto-open a case for a key.
-      // Instead, prompt the user to purchase the case (no temporary case creation).
-      if (mappedCases.length > 0) {
-        const caseName = mappedCases[0];
-        // Offer to buy the case rather than creating a temporary instance and opening it with only a key
-        const want = confirm(`You don't own "${caseName}". Buy the case now to use this key?`);
-        if (want) {
-          const caseData = MARKET_KEYS.find(k => k.name === caseName) || allSkins.find(s => s.name === caseName);
-          const price = (caseData && caseData.price) ? caseData.price : (PRICE_FIXES[caseName] || mockPrice({ name: caseName }));
-          promptWearSelection(caseData || { name: caseName, img: getDisplayImage({ name: caseName }) }, price, (wear, qty, finalPrice, isCustom) => {
-            addItemToAccount({ name: caseName, img: caseData?.image || caseData?.img || getDisplayImage({ name: caseName }), price: finalPrice, rarity: "Base Grade", qty, isCustomPrice: isCustom, source: "Purchased" });
-            // Do NOT automatically open the case after buying a case from a key: user must explicitly open the case via the case item.
-          }, { confirmMode: "purchase" });
-        }
-        return;
-      }
-
-      let reverseCase = null;
-      try {
-        for (const [keyName, caseList] of Object.entries(KEY_CASE_MAP)) {
-          if (!keyName) continue;
-          if (keyName.toLowerCase().includes(baseKeyName.toLowerCase()) || baseKeyName.toLowerCase().includes(keyName.toLowerCase())) {
-            reverseCase = caseList && caseList.length ? caseList[0] : null;
-            if (reverseCase) break;
-          }
-        }
-        if (!reverseCase) {
-          const firstEntry = Object.values(KEY_CASE_MAP).find(arr => Array.isArray(arr) && arr.length > 0);
-          if (firstEntry) reverseCase = firstEntry[0];
-        }
-      } catch (e) {
-        reverseCase = null;
-      }
-
-      if (reverseCase) {
-        showCaseConfirmForCaseName(reverseCase, item.id);
-      } else {
-        const firstAvailableCase = Object.keys(CASE_CONTENTS_DB)[0];
-        showCaseConfirmForCaseName(firstAvailableCase || "Fracture Case", item.id);
-      }
+      state.pairSelectionMode = { type: 'case_for_key', targetItem: item };
+      state.inventoryTab = "everything";
+      document.getElementById("filterInput").value = "";
+      state.currentPage = 1;
+      refreshInventoryView();
+      setTimeout(scrollInventoryViewportToTop, 0);
     };
-  } else if (isCont && hasKey) {
-    btnOpen.classList.remove("hidden");
-    // Show Unlock Container confirmation modal instead of instantly opening the case from the context menu
-    btnOpen.onclick = () => {
-      menu.classList.add("hidden");
-      // Present the Unlock Container confirmation/inspect UI for this case name
-      showCaseConfirmForCaseName(item.name);
-    };
-  } else {
-    btnOpen.classList.add("hidden");
   }
 
   if (isEquippable && !isDefaultItem) {
@@ -7742,20 +8185,6 @@ function handleContextMenu(e, item) {
     btnSticker.classList.add("hidden");
   }
 
-  // Moved Edit Nametag under Apply Sticker as requested
-  if (btnEditNametag) {
-    const isWeaponOrKnife = isGun || isKnife || isGloves;
-    if ((isWeaponOrKnife && !isDefaultItem && showEditSell) || isStorage) {
-      btnEditNametag.classList.remove("hidden");
-      btnEditNametag.onclick = () => {
-        menu.classList.add("hidden");
-        showNametagModal(item.id);
-      };
-    } else {
-      btnEditNametag.classList.add("hidden");
-    }
-  }
-
   if (btnSell && !isDefaultItem) {
     btnSell.onclick = () => {
       menu.classList.add("hidden");
@@ -7776,21 +8205,9 @@ function handleContextMenu(e, item) {
     // silent fallback - do not block menu if check fails
   }
 
-  // Position
+  // Position aligned like Stats for Nerds (on the right)
   menu.classList.remove("hidden");
-  const mWidth = menu.offsetWidth;
-  const mHeight = menu.offsetHeight;
-  x = e.clientX;
-  y = e.clientY;
-
-  if (x + mWidth > window.innerWidth) x -= mWidth;
-  if (y + mHeight > window.innerHeight) y -= mHeight;
-  
-  // Ensure menu is never cutoff by the top of the browser screen
-  y = Math.max(10, y);
-
-  menu.style.left = x + "px";
-  menu.style.top = y + "px";
+  positionInventoryAnchoredPopup(target, menu, 320);
 
   const closeMenu = () => {
     menu.classList.add("hidden");
@@ -7805,133 +8222,53 @@ function handleContextMenu(e, item) {
  * - Selecting any listed case will close the picker and open the Unlock Container confirmation for that case,
  *   passing the original key id so openCase flow can consume the key if needed.
  */
-function showKeyCasePicker(keyItem) {
-  try {
-    const baseKeyName = String(keyItem?.name || "").split(' (')[0].trim();
-    let mappedCases = Array.isArray(KEY_CASE_MAP?.[baseKeyName]) ? KEY_CASE_MAP[baseKeyName].slice() : [];
-    if (!mappedCases.length) {
-      const foundKey = Object.keys(KEY_CASE_MAP || {}).find(k =>
-        k && (k.toLowerCase().includes(baseKeyName.toLowerCase()) || baseKeyName.toLowerCase().includes(k.toLowerCase()))
-      );
-      if (foundKey) mappedCases = (KEY_CASE_MAP[foundKey] || []).slice();
-    }
-    const directCase = mappedCases[0] || Object.keys(CASE_CONTENTS_DB || {})[0] || "Fracture Case";
-    showCaseConfirmForCaseName(directCase, keyItem?.id || null);
-    return;
-  } catch (quickPickErr) {
-    console.warn("showKeyCasePicker quick pick failed:", quickPickErr);
+function showKeyCasePickerInInventory(sourceItem) {
+  const account = getActiveAccount();
+  if (!account) return;
+
+  const isKey = isKeyItem(sourceItem);
+  const baseName = sourceItem.name.split(' (')[0].trim();
+  
+  const overlay = document.createElement("div");
+  overlay.className = "modal-overlay";
+  overlay.style.zIndex = "5000";
+  overlay.innerHTML = `
+    <div class="user-snippet-modal" style="max-width: 1000px; height: 90vh; padding: 25px; text-align: left;">
+      <button class="close-snippet-modal" id="closeInvPicker">✕</button>
+      <h2 style="margin-bottom: 20px;">Select ${isKey ? 'Container' : 'Key'}</h2>
+      <div id="invPickerGrid" class="trade-items-grid" style="flex: 1; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));"></div>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+
+  const grid = overlay.querySelector("#invPickerGrid");
+  let candidates = [];
+
+  if (isKey) {
+    const mapped = KEY_CASE_MAP[baseName] || [];
+    candidates = account.items.filter(it => !it.isDefaultItem && isContainer(it) && mapped.some(cn => it.name.startsWith(cn)));
+  } else {
+    const reqKeys = getRequiredKeysForCase(sourceItem);
+    candidates = account.items.filter(it => !it.isDefaultItem && isKeyItem(it) && reqKeys.some(kn => it.name.startsWith(kn)));
   }
 
-  try {
-    const account = getActiveAccount();
-    const baseKeyName = (keyItem.name || "").split(' (')[0].trim();
-    // Resolve mapped cases robustly
-    let mappedCases = [];
-    if (KEY_CASE_MAP[baseKeyName]) {
-      mappedCases = KEY_CASE_MAP[baseKeyName].slice();
-    } else {
-      const foundKey = Object.keys(KEY_CASE_MAP).find(k => {
-        if (!k) return false;
-        const lk = k.toLowerCase();
-        const lb = baseKeyName.toLowerCase();
-        return lk === lb || lk.includes(lb) || lb.includes(lk);
-      });
-      if (foundKey) mappedCases = (KEY_CASE_MAP[foundKey] || []).slice();
-    }
-
-    // Build candidate list: owned matching cases first, then DB-known mapped cases, then fallback first DB case
-    const owned = [];
-    const candidates = new Set();
-
-    if (account && Array.isArray(account.items)) {
-      mappedCases.forEach(cn => {
-        const ownedCount = account.items.filter(it => (it.name || "").split(' (')[0].trim() === cn).length;
-        if (ownedCount > 0) {
-          owned.push({ name: cn, ownedCount });
-          candidates.add(cn);
-        }
-      });
-    }
-
-    mappedCases.forEach(cn => candidates.add(cn));
-    // Fallbacks: try reverse lookups if none found
-    if (candidates.size === 0) {
-      for (const [k, list] of Object.entries(KEY_CASE_MAP)) {
-        if (k.toLowerCase().includes(baseKeyName.toLowerCase()) || baseKeyName.toLowerCase().includes(k.toLowerCase())) {
-          list.forEach(cn => candidates.add(cn));
-        }
-      }
-    }
-    // If still empty, use first case in DB as fallback
-    if (candidates.size === 0) {
-      const first = Object.keys(CASE_CONTENTS_DB || {})[0];
-      if (first) candidates.add(first);
-    }
-
-    // Create ephemeral picker overlay DOM (non-destructive)
-    const overlay = document.createElement("div");
-    overlay.className = "modal-overlay";
-    overlay.style.zIndex = 6000;
-    overlay.innerHTML = `
-      <div class="user-snippet-modal" style="max-width:640px; padding:20px; text-align:left;">
-        <button class="close-snippet-modal" id="__keyPickerClose">✕</button>
-        <h2 style="margin-bottom:8px;">Choose a case to use with <span style="color:#a4d007;font-weight:800;">${escapeHtml(keyItem.name)}</span></h2>
-        <p style="color:#94a3b8; margin-bottom:12px;">Select one of the compatible containers below. If you own a matching case it will appear first.</p>
-        <div id="__keyPickerList" style="display:grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap:12px; max-height:360px; overflow:auto; padding:4px;"></div>
-        <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:12px;">
-          <button id="__keyPickerCancel" class="steam-btn grey">Cancel</button>
-        </div>
-      </div>
-    `;
-    document.body.appendChild(overlay);
-
-    const listEl = overlay.querySelector("#__keyPickerList");
-    const closeBtn = overlay.querySelector("#__keyPickerClose");
-    const cancelBtn = overlay.querySelector("#__keyPickerCancel");
-
-    const pushCard = (caseName, ownedCount) => {
-      const card = document.createElement("div");
-      card.className = "card";
-      const displayImg = getDisplayImage({ name: caseName });
-      const price = PRICE_FIXES[caseName] !== undefined ? PRICE_FIXES[caseName] : mockPrice({ name: caseName });
-      card.innerHTML = `
-        <img src="${displayImg}" style="width:100%; height:120px; object-fit:contain; background: rgba(0,0,0,0.05); border-radius:8px;">
-        <div style="margin-top:8px; font-weight:800; color:#fff; font-size:14px;">${escapeHtml(caseName)}</div>
-        <div style="color:#94a3b8; font-size:12px; margin-top:6px;">${ownedCount ? ownedCount + " owned" : "Not owned"}</div>
-        <div class="price-related" style="color:#a4d007; font-weight:800; margin-top:6px;">${formatPrice(price)}</div>
-      `;
-      card.style.cursor = "pointer";
-      card.onclick = (e) => {
-        e.stopPropagation();
-        // remove overlay and open the chosen case confirm, passing the key id so open consumes the key if available
+  if (candidates.length === 0) {
+    grid.innerHTML = `<div style="grid-column: 1/-1; padding: 40px; text-align: center; color: #475569;">You don't own any matching items.</div>`;
+  } else {
+    candidates.forEach(it => {
+      const card = createTradeCard(it, () => {
         overlay.remove();
-        showCaseConfirmForCaseName(caseName, keyItem.id);
-      };
-      listEl.appendChild(card);
-    };
-
-    // Owned-first ordering
-    const added = new Set();
-    owned.forEach(o => {
-      pushCard(o.name, o.ownedCount);
-      added.add(o.name);
+        if (isKey) {
+          showCaseConfirmForCaseName(it.name, sourceItem.id);
+        } else {
+          showCaseConfirmForCaseName(sourceItem.name, it.id);
+        }
+      });
+      grid.appendChild(card);
     });
-    Array.from(candidates).forEach(cn => {
-      if (!added.has(cn)) pushCard(cn, 0);
-    });
-
-    closeBtn.onclick = cancelBtn.onclick = () => overlay.remove();
-
-    // Clicking outside closes picker
-    overlay.addEventListener("click", (ev) => {
-      if (ev.target === overlay) overlay.remove();
-    });
-  } catch (err) {
-    console.warn("showKeyCasePicker failed:", err);
-    // Fallback to previous behavior if anything goes wrong
-    const fallbackCase = Object.keys(CASE_CONTENTS_DB || {})[0] || "Fracture Case";
-    showCaseConfirmForCaseName(fallbackCase, keyItem.id);
   }
+
+  overlay.querySelector("#closeInvPicker").onclick = () => overlay.remove();
 }
 
 // Helper defined at top-level to ensure it's available for all handlers
@@ -8210,6 +8547,7 @@ function attachUIHandlers() {
     newAcc.diceWagered = acc.diceWagered || 0;
     newAcc.diceProfit = acc.diceProfit || 0;
     newAcc.openedCaseCounts = JSON.parse(JSON.stringify(acc.openedCaseCounts || {}));
+    newAcc.defaultItemOverrides = JSON.parse(JSON.stringify(acc.defaultItemOverrides || {}));
 
     // Re-map equipped IDs: equip same logical items in the new account by mapping old ids -> new ids
     newAcc.equippedItemIds = [];
@@ -8308,10 +8646,14 @@ function attachUIHandlers() {
     if (caseSearchSheet) caseSearchSheet.classList.add("hidden");
     if (searchTitle) searchTitle.textContent = "CS2 Market Search";
     
-    // Always default to All category when opening market search
     state.searchCategory = "";
+    searchResults = [];
+    searchPage = 1;
+    selectedSearchItem = null;
     initSearchSidebar();
-    searchByCategory(""); 
+    searchInput.value = "";
+    updateSearchStatus("Start searching to find items");
+    updateSearchDisplay();
     
     searchSheet.classList.remove("hidden");
     searchInput.focus();
@@ -8775,6 +9117,11 @@ function attachUIHandlers() {
         const stSelect = document.getElementById("editMarketStatTrak");
         const blueGemSelect = document.getElementById("editMarketBlueGem");
         const souvSelect = document.getElementById("editMarketSouvenir");
+        const nametagHistoryRaw = document.getElementById("editMarketNametagHistory")?.value || "";
+        const nametagHistory = nametagHistoryRaw
+          .split(",")
+          .map(part => part.trim())
+          .filter(Boolean);
         const wantsStatTrak = !!(stSelect && stSelect.value === "yes" && !/sticker/i.test(name));
         const wantsBlueGem = !!(blueGemSelect && blueGemSelect.value === "yes");
         const wantsSouvenir = !!(souvSelect && souvSelect.value === "yes");
@@ -8788,7 +9135,7 @@ function attachUIHandlers() {
            if (currentStickers.length === 0) {
               const souvenirSource = selectedSearchItem.source || selectedSearchItem.raw?.source || "";
               const packageName = extractSouvenirPackageNameFromSource(souvenirSource);
-              const newStickers = buildSouvenirStickersForContainer(packageName, 4, 0.5);
+              const newStickers = sanitizeSouvenirWeaponStickers(buildSouvenirStickersForContainer(packageName, 4, 0.5));
               if (newStickers.length > 0) {
                 selectedSearchItem.stickers = newStickers;
                 if (selectedSearchItem.raw) selectedSearchItem.raw.stickers = newStickers;
@@ -8822,11 +9169,38 @@ function attachUIHandlers() {
           if (!isNaN(qtyVal) && qtyVal > 0) selectedSearchItem.qty = qtyVal;
           if (rarityName) selectedSearchItem.rarity = { name: rarityName };
           if (!isNaN(floatVal)) selectedSearchItem.floatVal = floatVal;
+          selectedSearchItem.nametagHistory = [...nametagHistory];
           selectedSearchItem.floatRank = floatRank;
           selectedSearchItem.originalName = finalName;
+          if (selectedSearchItem.raw) {
+            selectedSearchItem.raw.name = finalName;
+            if (img) {
+              selectedSearchItem.raw.img = img;
+              selectedSearchItem.raw.image = img;
+            }
+            if (!isNaN(adjustedPriceVal)) selectedSearchItem.raw.price = adjustedPriceVal;
+            if (wearVal) selectedSearchItem.raw.wear = wearVal;
+            if (!isNaN(floatVal)) selectedSearchItem.raw.floatVal = floatVal;
+            selectedSearchItem.raw.nametagHistory = [...nametagHistory];
+            selectedSearchItem.raw.floatRank = floatRank;
+          }
           if (!canUseStickers) {
             selectedSearchItem.stickers = [];
             if (selectedSearchItem.raw) selectedSearchItem.raw.stickers = [];
+            selectedSearchItem.charm = null;
+          } else {
+             if (selectedSearchItem.stickers) {
+                 // Remove any duplicate slabs
+                 let hasSlab = false;
+                 selectedSearchItem.stickers = selectedSearchItem.stickers.filter(s => {
+                    if (!s) return false;
+                    if (s.name.toLowerCase().includes("sticker slab")) {
+                        if (hasSlab) return false;
+                        hasSlab = true;
+                    }
+                    return true;
+                 });
+             }
           }
           syncItemWearImage(selectedSearchItem);
           if (selectedSearchItem.raw) syncItemWearImage(selectedSearchItem.raw);
@@ -8880,6 +9254,7 @@ function attachUIHandlers() {
                   if (!isNaN(adjustedPriceVal)) it.price = adjustedPriceVal;
                   if (wearVal) it.wear = wearVal;
                   if (!isNaN(floatVal)) it.floatVal = floatVal;
+                  it.nametagHistory = [...nametagHistory];
                   if (rarityName) it.rarity = rarityName;
                   it.floatRank = floatRank;
                   if (!isNaN(prevOwnersVal)) it.prevOwners = prevOwnersVal;
@@ -9552,6 +9927,16 @@ function attachUIHandlers() {
     pureRandomToggle.checked = !!state.pureRandomOdds;
     pureRandomToggle.addEventListener("change", (e) => {
       state.pureRandomOdds = e.target.checked;
+      saveState();
+    });
+  }
+
+  const inspectBlurToggle = document.getElementById("disableInspectBlurToggle");
+  if (inspectBlurToggle) {
+    inspectBlurToggle.checked = !!state.inspectBlurDisabled;
+    inspectBlurToggle.addEventListener("change", (e) => {
+      state.inspectBlurDisabled = !!e.target.checked;
+      applyInspectBlurSetting();
       saveState();
     });
   }
@@ -10433,11 +10818,16 @@ function attachUIHandlers() {
     };
 
     overlay.querySelector("#confirmCounterBtn").onclick = () => {
+      const oldUserVal = offer.userItems.reduce((s,x)=>s+getItemValue(x), 0);
+      const newUserVal = tempUserItems.reduce((s,x)=>s+getItemValue(x), 0);
+
       offer.userItems = [...tempUserItems];
       offer.botItems = [...tempBotItems];
       
-      // User requested: "if user counetrs bot trade and rmoves their iutems make source say Scammed trade please"
-      offer.botItems.forEach(bi => bi.source = "Scammed trade");
+      // User requested: if user counters bot trade and removes items mark as scam
+      if (newUserVal < oldUserVal || tempUserItems.length < offer.userItems.length) {
+          offer.botItems.forEach(bi => bi.source = "Scammed trade");
+      }
       
       marketAddTargetHandler = null;
       overlay.remove();
@@ -10547,9 +10937,9 @@ function attachUIHandlers() {
       const grouped = groupItems(items);
       grouped.forEach(g => {
         const it = g.item;
-        // Re-use createTradeCard logic for visual consistency across trading systems
-        const card = createTradeCard({ ...it, qty: g.count }, () => showInspect(it));
-        // Re-apply specific bot-offer size and layout constraints
+        const card = createTradeCard({ ...it, qty: g.count }, () => {
+            showInspect({ ...it, collection: it.collection || it.source || "Bot Trade" });
+        });
         card.style.width = "100%";
         card.style.height = "auto";
         card.style.padding = "10px";
@@ -10626,9 +11016,11 @@ function attachUIHandlers() {
             document.getElementById("botTradeGrid").innerHTML = "<div style='grid-column:1/-1; padding:40px; color:#475569;'>Add items to the Tradable Items box above to see bot offers.</div>";
           }
         });
-        // Increased item size for Tradable Items Box
-        card.style.transform = "scale(1.15)";
-        card.style.margin = "10px";
+        card.style.transform = "none";
+        card.style.margin = "2px";
+        card.style.width = "92px";
+        card.style.height = "72px";
+        card.style.padding = "6px";
         card.title = "Click to remove";
         grid.appendChild(card);
         totalTradableValue += getItemValue(item);
@@ -10673,6 +11065,7 @@ function attachUIHandlers() {
       // User requested: don't show equipped items on Select Tradable Items
       const equippedSet = new Set(account.equippedItemIds || []);
       const pool = account.items.filter(it => {
+        if (it.isDefaultItem) return false;
         if (equippedSet.has(it.id)) return false;
         const n = it.name.toLowerCase();
         const t = (it.type || "").toLowerCase();
@@ -10994,10 +11387,12 @@ function attachUIHandlers() {
   const diceView = document.getElementById("diceModeView");
   const potView = document.getElementById("potModeView");
   const coinflipView = document.getElementById("coinflipModeView");
+  const blackjackView = document.getElementById("blackjackModeView");
+  ensureGameHistoryButtons();
 
   const hideAllJackpotViews = () => {
-    [potView, coinflipView, diceView].forEach(v => v.classList.add("hidden"));
-    [tabPot, tabCoinflip, tabDice].forEach(t => t.className = "steam-btn grey");
+    [potView, coinflipView, diceView, blackjackView].forEach(v => v && v.classList.add("hidden"));
+    [tabPot, tabCoinflip, tabBlackjack, tabDice].forEach(t => { if (t) t.className = "steam-btn grey"; });
   };
 
   tabPot.onclick = () => {
@@ -11390,7 +11785,8 @@ function attachUIHandlers() {
     showStickerPickerForWearModal((s) => {
       const acc = getActiveAccount();
       if (!acc || !directApplyTargetId) return;
-      const gun = acc.items.find(it => it.id === directApplyTargetId);
+      const gunRef = getMutableInventoryItemRef(acc, directApplyTargetId);
+      const gun = gunRef?.mutable;
       if (!gun) return;
 
       // Deduct funds if not in walletless mode
@@ -11458,6 +11854,16 @@ function attachUIHandlers() {
 
   // Name tag modal
   document.getElementById("saveNametagBtn").addEventListener("click", saveNametag);
+  document.getElementById("sellFromNametagBtn").onclick = () => {
+    const acc = getActiveAccount();
+    const it = acc?.items.find(x => x.id === nametagTargetId);
+    if (!it) return;
+    showInScreenConfirm(`Sell ${it.name} for ${formatPrice(getItemValue(it))}?`, () => {
+      state.selectedItemId = it.id;
+      document.getElementById("nametagModal").classList.add("hidden");
+      removeSelectedItem(1);
+    });
+  };
   document.getElementById("cancelNametagBtn").addEventListener("click", () => {
     document.getElementById("nametagModal").classList.add("hidden");
     nametagTargetId = null;
@@ -11956,6 +12362,7 @@ const SEARCH_CATEGORIES = [
   { id: "sniper", label: "Snipers", icon: "🔭" },
   { id: "filled_cases", label: "Filled Cases", icon: "📦" },
   { id: "case", label: "Containers", icon: "📦" },
+  { id: "collections", label: "Collections", icon: "🗂️" },
   { id: "key", label: "Keys", icon: "🔑" },
   { id: "stickers", label: "Stickers", icon: "🎨" },
   { id: "tool", label: "Tools", icon: "🛠️" }
@@ -12035,13 +12442,13 @@ function matchesSearchCategoryStrict(item, catId) {
 
   if (cat === "custom") return true;
   if (cat === "stickers") {
-    const isSticker = (name.startsWith("sticker |") || name.startsWith("sticker ") || type.includes("sticker") || catName.includes("sticker"));
+    const isSticker = isActualStickerItem(item);
     const isContainer = name.includes("capsule") || name.includes("package") || name.includes("case") || type.includes("container") || type.includes("crate") || type.includes("capsule") || name.includes("storage unit");
     const isBlacklisted = name.includes("rio 2022") || name.includes("champion") || name.includes("ems");
     const isSlab = name.includes("sticker slab") || name.includes("slab |");
     return isSticker && !isContainer && !isBlacklisted && !isSlab;
   }
-  if (cat === "case") return (name.includes("case") || name.includes("capsule") || name.includes("package") || name.includes("collection") || catName.includes("case") || catName.includes("capsule")) && !name.includes("|") && !name.includes("sticker |");
+  if (cat === "case") return (name.includes("case") || name.includes("capsule") || name.includes("package") || name.includes("collection") || catName.includes("case") || catName.includes("capsule") || type.includes("capsule") || type.includes("sticker capsule")) && !name.includes("|") && !name.includes("sticker |");
   if (cat === "key") {
     return actualKeyNames.has(name.trim());
   }
@@ -12142,17 +12549,64 @@ async function searchByCategory(catId) {
   const statusEl = document.getElementById("searchStatus");
   if (statusEl) statusEl.style.color = "#94a3b8"; 
   const cat = String(catId || "").toLowerCase();
+
+  if (cat === "collections") {
+    try {
+      updateSearchStatus("Loading collections...");
+      const res = await fetch("https://raw.githubusercontent.com/ByMykel/CSGO-API/main/public/api/en/collections.json");
+      const collections = await res.json();
+      searchResults = collections.map(c => {
+        const nameLower = c.name.toLowerCase();
+        let p = 0;
+        // Pricing logic: older/rare = expensive ($5k-$40k+), mid ($1k-$4k), cheap ($200-$500)
+        if (nameLower.includes("cobblestone") || nameLower.includes("st. marc") || nameLower.includes("norse") || nameLower.includes("gods and monsters") || nameLower.includes("chop shop")) {
+            p = 5000 + (Math.random() * 35000);
+            if (nameLower.includes("st. marc")) p = 3500 + (Math.random() * 5000); 
+        } else if (nameLower.includes("rising sun") || nameLower.includes("anubis") || nameLower.includes("ancient") || nameLower.includes("mirage") || nameLower.includes("vertigo")) {
+            p = 1000 + (Math.random() * 3000);
+        } else {
+            p = 200 + (Math.random() * 300);
+        }
+        
+        p = PRICE_FIXES[c.name] || Math.round(p * 100) / 100;
+
+        return {
+          ...c,
+          name: c.name,
+          image: c.image, // Use the direct github image from API
+          img: c.image,
+          price: p,
+          price_text: formatPrice(p),
+          rarity: { name: "Base Grade" },
+          type: "Container",
+          forceNoWear: true
+        };
+      });
+      searchPage = 1;
+      updateSearchDisplay();
+      return;
+    } catch(e) {
+      console.warn("Failed to load collections", e);
+      updateSearchStatus("Error loading collections.");
+    }
+  }
   
   if (cat === "") {
-    // Prevent loading everything by default
-    searchResults = [];
+    // Show openable collections/containers by default when category is empty but search opened
+    const collections = allSkins.filter(isContainer).sort((a,b) => b.price - a.price).slice(0, 50);
+    searchResults = collections.map(c => {
+       const p = PRICE_FIXES[c.name] || c.price || mockPrice(c);
+       return {
+         ...c,
+         image: c.image || getDisplayImage(c),
+         price: p,
+         price_text: formatPrice(p),
+         rarity: { name: "Base Grade" },
+         type: "Container"
+       };
+    });
     searchPage = 1;
     updateSearchDisplay();
-    const container = document.getElementById("results");
-    if (container) {
-      container.innerHTML = `<div style='grid-column: 1/-1; padding: 40px; text-align: center; color: #475569; font-size: 18px; font-weight: 800;'>Start typing to search the market...</div>`;
-    }
-    // Optimization: avoid loading everything on category switch to keep UI responsive
     return;
   }
 
@@ -12218,6 +12672,7 @@ let blackjackState = {
 };
 
 function refreshInventoryView() {
+  const account = getActiveAccount();
   const activeAccount = getActiveAccount();
   const viewingProfile = state.viewingProfileId ? state.accounts.find(a => a.id === state.viewingProfileId) : null;
   const targetAccount = viewingProfile || activeAccount;
@@ -12332,6 +12787,25 @@ function refreshInventoryView() {
   
   let items = sourceItems.filter(it => {
     if (hasWearInName(it.name)) return false;
+    if ((isViewingStorage || isStorageSelection || state.pairSelectionMode) && it.isDefaultItem) return false;
+    
+    // Pair Selection Mode Overrides everything
+    if (state.pairSelectionMode) {
+      if (it.isDefaultItem) return false;
+      const mode = state.pairSelectionMode;
+      const target = mode.targetItem;
+      if (mode.type === 'key_for_case') {
+        const reqKeys = getRequiredKeysForCase(target);
+        const itName = it.name.toLowerCase().split(' (')[0].trim();
+        return isKeyItem(it) && reqKeys.some(rk => rk.toLowerCase().trim() === itName);
+      } else {
+        const baseKeyName = (target.name || "").split(' (')[0].trim();
+        let mappedCases = KEY_CASE_MAP[baseKeyName] || [];
+        const itName = it.name.toLowerCase().split(' (')[0].trim();
+        return isContainer(it) && mappedCases.some(mc => itName === mc.toLowerCase().trim());
+      }
+    }
+
     // If in deposit mode, never show equipped items or other storage units
     if (state.storageSelectionMode === 'deposit') {
       if (equippedIds.includes(it.id)) return false;
@@ -12341,18 +12815,16 @@ function refreshInventoryView() {
     // Tab filtering
     if (activeTab === "equipment") {
         const n = (it.name || "").toLowerCase();
-        // Equipment ONLY shows Storage Units as requested
         if (!n.includes("storage unit")) return false;
     } else if (activeTab === "favorites") {
         if (!Array.isArray(state.favoriteItemIds) || !state.favoriteItemIds.includes(it.id)) return false;
     } else if (activeTab === "containers") {
-        if (!isContainer(it) && !isKeyItem(it)) return false;
+        const isStorageLocal = it.name && it.name.toLowerCase().includes("storage unit");
+        if (isStorageLocal || (!isContainer(it) && !isKeyItem(it))) return false;
     } else if (activeTab === "display") {
-        // Display strictly only shows equipped items
         if (!equippedIds.includes(it.id)) return false;
     }
 
-    // searching in storage unit not allowed (always match search when viewing storage)
     const matchesSearch = (isViewingStorage || (isStorageSelection && state.storageSelectionMode === 'withdraw')) ? true : (it.name.toLowerCase().includes(filterVal) || 
                           (it && it.nametag && it.nametag.toLowerCase().includes(filterVal)));
     const matchesRarity = activeRarityFilter === "all" || it.rarity === activeRarityFilter;
@@ -12362,9 +12834,7 @@ function refreshInventoryView() {
   // Ensure we scroll to top when entering a storage unit or selection mode
   const currentInvViewId = state.viewingStorageUnitId || state.storageSelectionMode || state.viewingProfileId;
   if (currentInvViewId && !window._lastInvViewId) {
-      window.scrollTo({ top: 0, behavior: 'smooth' });
-      const gridWrap = document.querySelector(".inventory-grid-wrapper");
-      if (gridWrap) gridWrap.scrollTop = 0;
+      scrollInventoryViewportToTop();
   }
   window._lastInvViewId = currentInvViewId;
 
@@ -12394,10 +12864,22 @@ function refreshInventoryView() {
         refreshInventoryView();
       };
     }, 0);
+  } else if (state.pairSelectionMode) {
+    breadcrumb.classList.remove("hidden");
+    const mode = state.pairSelectionMode;
+    unitNameSpan.innerHTML = `
+      <div class="storage-header-layout" style="margin: 10px auto;">
+        <div style="font-size: 20px; font-weight: 900; color: #fff;">Select ${mode.type === 'key_for_case' ? 'Key' : 'Container'} for ${escapeHtml(mode.targetItem.name)}</div>
+        <button id="cancelPairModeBtn" class="steam-btn highlight" style="padding: 6px 15px; font-size: 12px; font-weight: 800; margin-top:10px;">CANCEL</button>
+      </div>
+    `;
+    setTimeout(() => {
+        const btn = document.getElementById("cancelPairModeBtn");
+        if (btn) btn.onclick = () => { state.pairSelectionMode = null; refreshInventoryView(); };
+        scrollInventoryViewportToTop();
+    }, 0);
   } else if (isStorageSelection) {
     breadcrumb.classList.remove("hidden");
-    const gridWrapper = document.querySelector(".inventory-grid-wrapper");
-    if (gridWrapper) gridWrapper.scrollTop = 0;
     const targetUnit = targetAccount.items.find(i => i.id === state.storageSelectionTargetId);
     
     unitNameSpan.innerHTML = `
@@ -12414,6 +12896,7 @@ function refreshInventoryView() {
             resetInventoryViewState();
             refreshInventoryView();
         };
+        scrollInventoryViewportToTop();
     }, 0);
 
     // Fix: define count and selectedValue for storage selection bar to prevent UI crash
@@ -12557,7 +13040,9 @@ function refreshInventoryView() {
     else otherNonUpdated.push(it);
   });
 
-  const justDefault = items.filter(it => it.isDefaultItem);
+  const justDefault = (isViewingStorage || isStorageSelection || state.pairSelectionMode)
+    ? []
+    : items.filter(it => it.isDefaultItem);
 
   if (shouldPinEquipped) {
     const eqNotDefault = equippedItems.filter(it => !it.isDefaultItem);
@@ -12698,7 +13183,11 @@ function refreshInventoryView() {
     pageItems = state.disablePagination ? items : items.slice(0, PAGE_SIZE);
   }
 
-  const shouldShowDefaultInventory = activeTab === "everything" && !state.disableDefaultWeapons;
+  const shouldShowDefaultInventory = activeTab === "everything" &&
+    !state.disableDefaultWeapons &&
+    !isViewingStorage &&
+    !isStorageSelection &&
+    !state.pairSelectionMode;
 
   const defaultInventoryItems = shouldShowDefaultInventory
     ? getDefaultInventoryItems().filter(it => {
@@ -12735,7 +13224,13 @@ function refreshInventoryView() {
 
   // Enforce a hard render cap for performance even if pagination is "disabled"
   const MAX_RENDER = 250;
-  const renderItems = pageItems.slice(0, MAX_RENDER);
+  const defaultRenderItems = pageItems.filter(it => it.isDefaultItem);
+  const nonDefaultRenderItems = pageItems.filter(it => !it.isDefaultItem);
+  const reservedDefaultSlots = Math.min(defaultRenderItems.length, MAX_RENDER);
+  const renderItems = [
+    ...nonDefaultRenderItems.slice(0, Math.max(0, MAX_RENDER - reservedDefaultSlots)),
+    ...defaultRenderItems.slice(0, reservedDefaultSlots)
+  ];
 
   renderItems.forEach(item => {
     const rarityColor = RARITY_COLORS[item.rarity] || RARITY_COLORS["Consumer"];
@@ -12834,9 +13329,7 @@ function refreshInventoryView() {
 
     const stickersOnGridEnabled = state.showStickersOnGrid !== false;
     const gridStickers = (Array.isArray(item.stickers) && stickersOnGridEnabled) ? [...item.stickers] : [];
-    if (item.charm) {
-        gridStickers.unshift({ ...item.charm, isCharm: true });
-    }
+    const gridCharm = item.charm ? { ...item.charm, isCharm: true } : null;
     
     let stattrakHtml = "";
     if (String(item.name || "").toLowerCase().includes("stattrak") && state.showStatTrakOverlay !== false) {
@@ -12848,7 +13341,16 @@ function refreshInventoryView() {
     const finalStickersHtml = gridStickers.slice(0, 5).map(s => {
       const grey = (s.scratchPercent || 0) / 100;
       return `<img src="${s.img}" class="inv-sticker-mini" alt="" title="${s.name}" style="filter: grayscale(${grey}) brightness(${1 - grey * 0.4});">`;
-    }).join('') + stattrakHtml;
+    }).join('');
+    const charmHtml = gridCharm ? `<img src="${gridCharm.img || gridCharm.image}" class="inv-sticker-mini" alt="" title="${gridCharm.name}" style="width:18px; height:18px;">` : "";
+
+    const hasActualStickersOnCard = gridStickers.length > 0;
+    const topLeftBadgeRowHtml = (charmHtml || stattrakHtml) ? `
+      <div style="display:flex; align-items:center; gap:5px; margin-bottom:${hasActualStickersOnCard ? "4px" : "0"};">
+        ${charmHtml}
+        ${stattrakHtml}
+      </div>
+    ` : "";
 
     const addedValueInfo = getInventoryAddedValueBreakdown(item);
     let priceDisplayHtml = "";
@@ -12861,6 +13363,8 @@ function refreshInventoryView() {
 
     const showBar = state.cs2InvColor && !isStorageUnit;
 
+    const hideIcons = !!state.hideMockMeta;
+    
     div.innerHTML = `
       <img src="${getStableDisplayImage(item)}" alt="Item" style="margin-bottom: 5px;">
       ${getInventoryEquipIndicatorHtml(item.id, targetAccount)}
@@ -12871,12 +13375,13 @@ function refreshInventoryView() {
          <div class="inv-top-left" style="position: absolute; top: 8px; left: 8px; display: flex; flex-direction: column; align-items: flex-start; gap: 2px;">
             ${floatRankBadge}
          </div>
-         ${priceDisplayHtml}
+         ${!hideIcons ? priceDisplayHtml : ""}
          <div class="inv-bottom-left" style="position: absolute; bottom: 8px; left: 8px;">
-            <div class="inv-sticker-list" style="position: static; display: flex; gap: 5px;">${finalStickersHtml}</div>
+            ${!hideIcons ? topLeftBadgeRowHtml : ""}
+            <div class="inv-sticker-list" style="position: static; display: ${!hideIcons ? 'flex' : 'none'}; gap: 5px;">${finalStickersHtml}</div>
          </div>
          <div class="inv-bottom-right" style="position: absolute; bottom: 8px; right: 8px;">
-            ${badgeHtml}
+            ${!hideIcons ? badgeHtml : ""}
          </div>
       </div>
     `;
@@ -12998,10 +13503,41 @@ function refreshInventoryView() {
       }
 
       if (state.bulkSellMode) {
-        if (state.bulkSelectedIds.includes(item.id)) {
+        e.preventDefault();
+        e.stopPropagation();
+        const isSelected = state.bulkSelectedIds.includes(item.id);
+        if (isSelected) {
           state.bulkSelectedIds = state.bulkSelectedIds.filter(id => id !== item.id);
+          div.classList.remove("bulk-selecting");
         } else {
           state.bulkSelectedIds.push(item.id);
+          div.classList.add("bulk-selecting");
+        }
+        
+        // Update bulk sell bar total without full refresh
+        let sellSum = 0;
+        const acc = getActiveAccount();
+        let targetItems = acc.items;
+        if (state.viewingStorageUnitId) {
+          const u = acc.items.find(unit => unit.id === state.viewingStorageUnitId);
+          if (u) targetItems = u.contents || [];
+        }
+        targetItems.forEach(it => {
+          if (state.bulkSelectedIds.includes(it.id)) sellSum += getItemValue(it);
+        });
+        document.getElementById("bulkSellTotal").textContent = formatPrice(sellSum);
+        document.getElementById("bulkSellCount").textContent = `(${state.bulkSelectedIds.length} items)`;
+        return;
+      }
+
+      // Pair Selection Logic: If clicking an item while in pair mode, trigger opening
+      if (state.pairSelectionMode) {
+        const mode = state.pairSelectionMode;
+        state.pairSelectionMode = null;
+        if (mode.type === 'key_for_case') {
+          showCaseConfirmForCaseName(mode.targetItem.name, item.id);
+        } else {
+          showCaseConfirmForCaseName(item.name, mode.targetItem.id);
         }
         refreshInventoryView();
         return;
@@ -13486,7 +14022,6 @@ function openKeyCaseSelector(item) {
   
   const requiredKeys = getRequiredKeysForCase(name);
   if (!isKey && requiredKeys.length === 0) {
-      // Keyless container: bypass selector
       showCaseConfirmForCaseName(name);
       return;
   }
@@ -13500,13 +14035,26 @@ function openKeyCaseSelector(item) {
   let titleText = "";
   
   if (isKey) {
-    titleText = `CHOOSE A CONTAINER FOR ${baseName.toUpperCase()}`;
+    titleText = `CHOOSE AN OWNED CONTAINER FOR ${baseName.toUpperCase()}`;
     const mapped = KEY_CASE_MAP[baseName] || [];
-    candidates = mapped.map(cn => ({ name: cn, isCase: true }));
+    mapped.forEach(cn => {
+      const owned = account.items.filter(it => it.name.startsWith(cn) && !it.isDefaultItem);
+      if (owned.length > 0) {
+        candidates.push({ name: cn, count: owned.length, isCase: true });
+      }
+    });
   } else {
     titleText = `CHOOSE A KEY FOR ${baseName.toUpperCase()}`;
     const reqKeys = getRequiredKeysForCase(name);
-    candidates = reqKeys.map(kn => ({ name: kn, isKey: true }));
+    reqKeys.forEach(kn => {
+      const owned = account.items.filter(it => it.name.startsWith(kn) && !it.isDefaultItem);
+      candidates.push({ name: kn, count: owned.length, isKey: true });
+    });
+  }
+
+  if (candidates.length === 0 && isKey) {
+     alert("You do not own any containers compatible with this key.");
+     return;
   }
 
   overlay.innerHTML = `
@@ -13517,9 +14065,8 @@ function openKeyCaseSelector(item) {
       </div>
       
       <div class="case-confirm-contents-area" style="background:rgba(0,0,0,0.6); margin-top:0; max-height:600px;">
-        <div id="selectorGrid" style="display:grid; grid-template-columns:repeat(5, 1fr); gap:25px; padding:20px;">
+        <div id="selectorGrid" style="display:grid; grid-template-columns:repeat(auto-fill, minmax(200px, 1fr)); gap:25px; padding:20px;">
           ${candidates.map(c => {
-            const cPrice = PRICE_FIXES[c.name] || 2.50;
             const displayImg = getDisplayImage({name: c.name});
             return `
               <div class="case-item-card selector-card" data-name="${c.name}" style="cursor:pointer; transform:translateY(0);">
@@ -13527,7 +14074,7 @@ function openKeyCaseSelector(item) {
                   <img src="${displayImg}" style="width:92%; height:92%; object-fit:contain; filter:drop-shadow(0 4px 8px rgba(0,0,0,0.5));">
                 </div>
                 <div class="case-item-name" style="color:#fff; font-size:14px; font-weight:700; line-height:1.2; margin-top:8px;">${c.name}</div>
-                <div class="price-related" style="color:#a4d007; font-weight:800; margin-top:5px; font-size:13px;">${formatPrice(cPrice)}</div>
+                <div style="color:#66c0f4; font-size:12px; font-weight:800; margin-top:4px;">Owned: ${c.count}</div>
               </div>
             `;
           }).join('')}
@@ -13564,6 +14111,9 @@ function getRequiredKeysForCase(caseItemOrName) {
     : (caseItemOrName?.name || caseItemOrName?.market_hash_name || "");
   const lowerCaseName = String(caseName || "").toLowerCase();
   const typeText = getItemTypeText(caseItemOrName);
+
+  // Collections and Terminals are keyless
+  if (lowerCaseName.includes("collection") || lowerCaseName.includes("terminal")) return [];
 
   // Explicitly return keys for Sticker Capsules
   if (lowerCaseName.includes("sticker capsule 1")) return ["Community Sticker Capsule 1 Key"];
@@ -13692,7 +14242,9 @@ function showCaseConfirmForCaseName(caseName, sourceKeyId = null, caseItemId = n
     price: ownedCaseRef?.price || PRICE_FIXES[caseName] || mockPrice({ name: caseName }),
     type: ownedCaseRef?.type || ownedCaseRef?.category?.name || "Container",
     category: ownedCaseRef?.category || null,
-    noWear: ownedCaseRef?.noWear || false
+    noWear: ownedCaseRef?.noWear || false,
+    contains: ownedCaseRef?.contains || null,
+    contains_rare: ownedCaseRef?.contains_rare || null
   };
 
   const titleEl = document.getElementById("caseConfirmTitle");
@@ -13730,12 +14282,11 @@ function showCaseConfirmForCaseName(caseName, sourceKeyId = null, caseItemId = n
     countSelectEl.disabled = previewOnly || maxSelectable <= 1;
   }
 
-  // Populate contents grid using CASE_CONTENTS_DB if available
+  // Populate contents grid using resolved case data
   grid.innerHTML = "";
-  const activeCaseData = resolveCaseContentsData(caseName) ||
-    resolveCaseContentsData((caseName || "").split(" (")[0].trim()) ||
-    resolveCaseContentsData(String(caseName || "").replace(/'/g, ""));
+  const activeCaseData = resolveCaseContentsData(caseName);
   if (activeCaseData) {
+    confirmModal.classList.remove("hidden");
     // Sort from lowest (common) to highest (rare). Gold and Red last. Base/Consumer/Industrial before Mil-Spec (Blue).
     const rarityOrder = [
       "Base Grade", "Consumer", "Consumer Grade", "Industrial", "Industrial Grade", 
@@ -13826,72 +14377,15 @@ function showCaseConfirmForCaseName(caseName, sourceKeyId = null, caseItemId = n
       });
     });
   } else {
-    // If the case DB lacks a detailed listing, try to show any compatible keys/cases instead of a dismissive message.
-    // Build a helpful fallback that surfaces mapped keys or the first matching cases in KEY_CASE_MAP.
-    grid.innerHTML = "";
-    const hint = document.createElement("div");
-    hint.style.gridColumn = "1/-1";
-    hint.style.color = "#94a3b8";
-    hint.style.padding = "12px";
-    hint.style.textAlign = "left";
-
-    // Attempt to find compatible keys that map to this case (reverse lookup)
-    const mappedKeys = [];
-    for (const [keyName, cases] of Object.entries(KEY_CASE_MAP || {})) {
-      if (!Array.isArray(cases)) continue;
-      if (cases.some(cn => cn && cn.toLowerCase().trim() === caseName.toLowerCase().trim() ||
-                          (caseName.toLowerCase().trim().includes((cn || "").toLowerCase().trim())))) {
-        mappedKeys.push(keyName);
-      }
-    }
-
-    // Prefer showing related CASES/containers (never surface keys in the unlock contents fallback).
-      const relatedPool = Array.from(new Set([
-        ...Object.keys(CASE_CONTENTS_DB || {}),
-        ...apiCrates.map(crate => crate?.name).filter(Boolean)
-      ]));
-      const relatedCandidates = relatedPool.filter(cn => {
-        const base = cn.toLowerCase();
-        const target = caseName.toLowerCase();
-        // prefer close textual matches or generic container names
-        const shared = target.split(/\s+/).some(tok => tok.length > 2 && base.includes(tok));
-        return shared || base.includes('case') || base.includes('capsule') || base.includes('package') || base.includes('crate');
-      });
-
-    const fallbackCandidates = relatedCandidates.length ? relatedCandidates.slice(0,6) : relatedPool.slice(0,6);
-
-    if (fallbackCandidates.length > 0) {
-      hint.innerHTML = `<div style="font-weight:800; margin-bottom:8px;">No detailed contents found for \"${escapeHtml(caseName)}\" — showing related containers:</div>`;
-      const list = document.createElement("div");
-      list.style.display = "flex";
-      list.style.flexWrap = "wrap";
-      list.style.gap = "10px";
-      fallbackCandidates.forEach(cn => {
-        const card = document.createElement("div");
-        card.style.display = "flex";
-        card.style.flexDirection = "column";
-        card.style.alignItems = "center";
-        card.style.width = "140px";
-        card.style.padding = "8px";
-        card.style.background = "rgba(0,0,0,0.25)";
-        card.style.border = "1px solid rgba(255,255,255,0.03)";
-        card.style.borderRadius = "8px";
-        card.innerHTML = `
-          <img src="${getDisplayImage({name: cn})}" style="width:100%; height:90px; object-fit:contain; margin-bottom:8px;">
-          <div style="font-size:12px; font-weight:700; text-align:center;">${escapeHtml(cn)}</div>
-        `;
-        card.onclick = () => showCaseConfirmForCaseName(cn);
-        list.appendChild(card);
-      });
-      hint.appendChild(list);
-    } else {
-      hint.innerHTML = `<div style="color:#94a3b8;">No related containers found for this case.</div>`;
-    }
-
-    grid.appendChild(hint);
+    // If we still have no data, show a generic loading state or hide the grid
+    grid.innerHTML = `<div style="grid-column: 1/-1; padding: 40px; color: #94a3b8; font-weight: 800;">LOADING CONTAINER DATA...</div>`;
+    // Close modal if no data found after a delay to prevent getting stuck
+    setTimeout(() => {
+        if (!grid.querySelector('.case-item-card')) {
+            confirmModal.classList.add("hidden");
+        }
+    }, 2000);
   }
-
-  confirmModal.classList.remove("hidden");
   
   // Hide Open button if user doesn't own the case/key and is just viewing contents
   const ownedCasesCount = account ? account.items.filter(it => (it.name || "").split(' (')[0].trim() === caseName).length : 0;
@@ -14180,39 +14674,44 @@ function populateDetailsDOM(root, item) {
   if (!item) return;
   const img = root.querySelector("#detailsImage");
   
-  // Logic Fix: Ensure StatTrak™ is included in the name display in details if missing
   if (String(item.name || "").toLowerCase().includes("stattrak") && !String(item.name || "").includes("StatTrak™")) {
       item.name = item.name.replace(/stattrak/i, "StatTrak™");
   }
 
   img.src = getDisplayImage(item);
 
-  // Remove existing overlays
-  const existingStickers = root.querySelectorAll('.applied-sticker-icon, .details-sticker-container, .stattrak-overlay-icon');
+  const existingStickers = root.querySelectorAll('.applied-sticker-icon, .details-sticker-container, .stattrak-overlay-icon, .sidebar-stattrak-module');
   existingStickers.forEach(s => s.remove());
 
-  // Ensure we have the active account reference available before any usage
   let account = getActiveAccount();
   const isDefaultItem = !!item?.isDefaultItem;
-
   const topArea = root.querySelector('.details-top');
-
-  // StatTrak Icon for Sidebar is now handled via the virtual sticker push in common population logic
 
   const appliedStickers = Array.isArray(item.stickers)
     ? item.stickers.map((s, i) => ({ ...s, _sourceIndex: i }))
     : [];
 
-  // Add StatTrak™ virtual sticker if weapon is StatTrak
+  // Layout logic: if stickers exist, StatTrak goes below. If no stickers, StatTrak can be in the tray.
+  const hasActualStickers = appliedStickers.length > 0;
+  
   if (item.name.includes("StatTrak™")) {
-      const isKnifeItem = item.name.includes("★") || item.name.toLowerCase().includes("knife");
-      // Place StatTrak first in the array so it shows up at the start of the sticker list
-      appliedStickers.unshift({
-          name: "StatTrak™ Module",
-          img: isKnifeItem ? "https://i.imgur.com/txeWcrS.png" : "https://i.imgur.com/TRtzFCo.png",
-          isStatTrakModule: true,
-          price: 0.05
-      });
+      const isKnifeItem = item.name.includes("★") || item.name.toLowerCase().includes("knife") || item.name.toLowerCase().includes("gloves");
+      const stImg = isKnifeItem ? "https://i.imgur.com/txeWcrS.png" : "https://i.imgur.com/TRtzFCo.png";
+      
+      if (hasActualStickers) {
+          const stModule = document.createElement("div");
+          stModule.className = "sidebar-stattrak-module";
+          stModule.style.cssText = "position: absolute; bottom: 65px; left: 50%; transform: translateX(-50%); z-index: 2000;";
+          stModule.innerHTML = `<img src="${stImg}" style="width: 120px; height: 120px; object-fit: contain; filter: drop-shadow(0 10px 20px rgba(0,0,0,0.8));">`;
+          topArea.appendChild(stModule);
+      } else {
+          appliedStickers.unshift({
+              name: "StatTrak™ Module",
+              img: stImg,
+              isStatTrakModule: true,
+              price: 0.05
+          });
+      }
   }
 
   if (appliedStickers.length > 0) {
@@ -14405,14 +14904,21 @@ function populateDetailsDOM(root, item) {
     descArea.appendChild(statsDiv);
   }
 
-  root.querySelector("#detailsWear").textContent = item.wear || mockWear(item.name) || "Factory New";
+  const wearElText = root.querySelector("#detailsWear");
+  if (wearElText) {
+    wearElText.parentElement.style.display = "none";
+  }
   
   // Ensure floatVal is never N/A by generating a fallback if missing
   let displayFloat = item.floatVal;
   if (displayFloat === null || displayFloat === undefined || isNaN(displayFloat)) {
     displayFloat = generateFloatForWear(item.name, item.wear || "Factory New", item.rarity);
   }
-  root.querySelector("#detailsFloat").textContent = formatFloat(displayFloat);
+  const floatElText = root.querySelector("#detailsFloat");
+  if (floatElText) {
+    floatElText.textContent = formatFloat(displayFloat);
+    floatElText.parentElement.style.display = "none"; 
+  }
 
   // Handle Float Bar rendering - Show if float exists or if item has exterior/pattern
   const floatBarContainer = root.querySelector("#detailsFloatBar");
@@ -14718,7 +15224,9 @@ function populateDetailsDOM(root, item) {
           image: item.img || getDisplayImage(item),
           price: item.price,
           rarity: item.rarity,
-          raw: null
+          raw: item, // Pass raw item to check type for stickers
+          pattern: item.pattern,
+          floatVal: item.floatVal
         };
         showEditMarketModal();
       };
@@ -14933,6 +15441,10 @@ async function openCase(itemId, skipConfirm = false, keyToUseId = null, openCoun
   const account = getActiveAccount();
   if (!account) return;
 
+  // Reset global flags at the start of every open request to prevent sticky "Quick open" states
+  window._caseQuickOpenPending = false;
+  window._caseRevealNow = null;
+
   // ensure a safe caseName variable is available for downstream logic
   const caseName = (() => {
     try {
@@ -14949,7 +15461,6 @@ async function openCase(itemId, skipConfirm = false, keyToUseId = null, openCoun
   // If the exact instance isn't found, defensively close any open case/case-opening UI,
   // attempt to fall back to a same-name instance; if none exists, abort and reset state so UI can continue.
   if (caseIndex === -1) {
-    console.warn("openCase: case instance not found (id:", itemId, "). Attempting fallback by name.");
     // try fallback by name match (some callers may pass a case name as itemId)
     let fallbackCase = account.items.find(it => {
       const base = String(it.name || "").split(' (')[0].trim().toLowerCase();
@@ -14957,22 +15468,18 @@ async function openCase(itemId, skipConfirm = false, keyToUseId = null, openCoun
       return base === passed || it.id === itemId;
     });
     if (fallbackCase) {
-      // if we found a same-named owned case, use it
       itemId = fallbackCase.id;
     } else {
-      // No owned instance found: hide any case modals and reset opening flags so user can open other cases
       try {
         const confirmModal = document.getElementById("caseConfirmModal");
         if (confirmModal) confirmModal.classList.add("hidden");
         const openingModal = document.getElementById("caseOpeningModal");
         if (openingModal) openingModal.classList.add("hidden");
-        // Reset transient reveal timers/flags
         if (window._caseRevealTimer) { clearTimeout(window._caseRevealTimer); window._caseRevealTimer = null; }
         if (window._caseStartTimer) { clearTimeout(window._caseStartTimer); window._caseStartTimer = null; }
         window._caseRevealNow = null;
         window._caseIsGoldReveal = false;
-      } catch (e) { console.warn("openCase fallback cleanup failed:", e); }
-      // No case to open; abort gracefully so user can continue.
+      } catch (e) {}
       return;
     }
   }
@@ -15101,12 +15608,23 @@ async function openCase(itemId, skipConfirm = false, keyToUseId = null, openCoun
   const fullName = (caseItem.name || "").trim();
   const baseName = fullName.split(' (')[0].trim();
   
-  // Resolve case contents from the CSGO API first, then fall back to local overrides.
-  let caseDataRaw = resolveCaseContentsData(fullName) ||
-               resolveCaseContentsData(baseName) ||
-               resolveCaseContentsData(fullName.replace(/'/g, "")) ||
-               resolveCaseContentsData(baseName.replace(/'/g, "")) ||
-               resolveCaseContentsData(caseName);
+  // Resolve case contents: Check if item carries its own pool (Collections from search), then resolve from DB
+  let caseDataRaw = (caseItem.contains || caseItem.contains_rare) ? buildCaseContentsFromApi(caseItem) : null;
+  
+  if (!caseDataRaw) {
+    // If the case item object itself carries the pool (dynamic search collections), prefer it.
+    if (caseItem.contains || caseItem.contains_rare) {
+        caseDataRaw = buildCaseContentsFromApi(caseItem);
+    }
+    
+    if (!caseDataRaw) {
+      caseDataRaw = resolveCaseContentsData(fullName) ||
+                 resolveCaseContentsData(baseName) ||
+                 resolveCaseContentsData(fullName.replace(/'/g, "")) ||
+                 resolveCaseContentsData(baseName.replace(/'/g, "")) ||
+                 resolveCaseContentsData(caseName);
+    }
+  }
     
   // Ensure item names in pool don't have Souvenir prefix to avoid double-prefixing and avoid filtering out entire pools
   let caseData = null;
@@ -15340,8 +15858,8 @@ async function openCase(itemId, skipConfirm = false, keyToUseId = null, openCoun
       // silent - best-effort update
     }
     
-    // Reset modal background to transparent for opening animation
-    modal.style.background = "transparent";
+    // Reset modal background to slightly blurred for opening animation
+    modal.style.background = "rgba(0, 0, 0, 0.1)";
     modal.classList.remove("hidden");
     // Removed duplicate unlock start sound per request
     title.textContent = "Opening " + caseItem.name + "...";
@@ -15360,8 +15878,8 @@ async function openCase(itemId, skipConfirm = false, keyToUseId = null, openCoun
       hasRevealed = true;
 
       // Reveal faster as requested once animation stops
-      // Reduced freeze risk: use a precise small delay
-      setTimeout(() => {
+      // Performance fix: minimize DOM heavy operations when earning item from case
+      const doFinalReveal = () => {
       lensState.active = false; // STOP MAGNIFIER
       if (window._caseLoadingTimeout) clearTimeout(window._caseLoadingTimeout);
 
@@ -15385,8 +15903,12 @@ async function openCase(itemId, skipConfirm = false, keyToUseId = null, openCoun
         });
         return;
       }
-      // Switch to solid background for result screen
-      modal.style.background = "#0b0f1a";
+      // Switch to transparent blurred background for result screen
+      modal.style.background = "rgba(0, 0, 0, 0.15)";
+      modal.classList.remove("case-opening-animating");
+      // Remove case background image on result reveal as requested
+      const bgEl = document.getElementById("caseOpeningBg");
+      if (bgEl) bgEl.style.backgroundImage = "none";
       // hide spinner visuals and show result immediately
       spinnerUI.style.display = "none";
       
@@ -15434,10 +15956,9 @@ async function openCase(itemId, skipConfirm = false, keyToUseId = null, openCoun
         const price = (override !== undefined) ? override : ((typeof winner.price === "number" && !isNaN(winner.price)) ? winner.price : mockPrice(winner));
         totalValue += price;
         const winnerImg = getDisplayImage(winner);
-        const finalWear = noWearForCase ? null : mockWear(winner.name, (winner.rarity?.name || winner.rarity));
-        
-        // Generate a float compatible with the selected wear for unboxing results
-        const finalFloat = generateFloatForWear(winner.name, finalWear, (winner.rarity && (winner.rarity.name || winner.rarity)) ? (winner.rarity.name || winner.rarity) : null);
+        // Use the pre-determined wear and float assigned during selection loop
+        const finalWear = winner.wear;
+        const finalFloat = winner.floatVal;
 
         // StatTrak already decided before animation for consistency
         let finalName = winner.name;
@@ -15474,7 +15995,7 @@ async function openCase(itemId, skipConfirm = false, keyToUseId = null, openCoun
         
         // Souvenir pulls must use stickers from the same package/event instead of a random gold pool.
         if (isSouvenirBox && finalName.includes("|")) {
-           finalItemData.stickers = buildSouvenirStickersForContainer(caseItem.name);
+           finalItemData.stickers = sanitizeSouvenirWeaponStickers(buildSouvenirStickersForContainer(caseItem.name));
         }
 
         // record whether account already owned this item BEFORE we add it
@@ -15512,6 +16033,15 @@ async function openCase(itemId, skipConfirm = false, keyToUseId = null, openCoun
       const caseBaseName = (caseItem.name || "").split(' (')[0].trim();
       account.openedCaseCounts[caseBaseName] = (account.openedCaseCounts[caseBaseName] || 0) + numToOpen;
 
+      if (window._caseQuickOpenPending) {
+        window._caseQuickOpenPending = false;
+        modal.classList.add("hidden");
+        const confirmModal = document.getElementById("caseConfirmModal");
+        if (confirmModal) confirmModal.classList.add("hidden");
+        showGroupedPurchaseResult();
+        return;
+      }
+
       if (numToOpen === 1) {
         const winner = winnerDataList[0];
         const rarityName = normalizeRarityName(winner, winner.rarity?.name || winner.rarity);
@@ -15530,22 +16060,21 @@ async function openCase(itemId, skipConfirm = false, keyToUseId = null, openCoun
         const isSouv = winner.name.toLowerCase().includes("souvenir");
 
         spinnerResult.innerHTML = `
-          <div style="display:flex; flex-direction:column; align-items:center; width: 100%; height: 740px; justify-content:flex-start; padding-top: 0px;">
+          <div style="display:flex; flex-direction:column; align-items:center; width: 100%; height: 720px; justify-content:flex-start; padding-top: 0px;">
             <div style="text-align: center; z-index: 1000; margin-top: -20px; position: relative;">
               <h1 style="color: ${nameColor}; font-size: 56px; font-weight: 900; margin: 0; line-height: 1.0;">${displayName}</h1>
               ${winner.nametag ? `<div style="font-size: 18px; color: #fff; margin-top: 5px;">"${winner.nametag}"</div>` : ''}
-              <div style="font-size: 16px; color: #94a3b8; font-weight: 800; text-transform: uppercase; margin-top: 4px;">${winner.finalWear || ''}</div>
               <div style="display: flex; align-items: center; justify-content: center; gap: 10px; color: #d1d5db; font-size: 16px; font-weight: 700; margin-top: 5px;">
                 <img src="${getDisplayImage({name: containerName})}" style="width:24px; height:24px; object-fit:contain;"> ${containerName}
               </div>
               <div class="unlocked-rarity-bar" style="width: 500px; max-width: 80%; height: 6px; background: ${rarityColor}; margin: 15px auto 0 auto;"></div>
             </div>
             
-            <div id="unlocked3dWrapper" class="unlocked-3d-container" style="height: 680px; margin-top: -60px; pointer-events: auto; z-index: 1;">
+            <div id="unlocked3dWrapper" class="unlocked-3d-container" style="height: 520px; margin-top: 20px; pointer-events: auto; z-index: 1;">
               <div class="unlocked-inner-3d" style="transform-style: preserve-3d; display: flex; align-items: center; justify-content: center; width: 100%; height: 100%; pointer-events: none;">
-                <img src="${finalRevealImg}" class="inspect-face" draggable="false" style="max-width: 100%; max-height: 100%; object-fit: contain; filter: drop-shadow(0 20px 80px rgba(0,0,0,0.7)); pointer-events: none;">
+                <img src="${finalRevealImg}" class="inspect-face" draggable="false" style="max-width: 90%; max-height: 90%; object-fit: contain; filter: drop-shadow(0 20px 80px rgba(0,0,0,0.7)); pointer-events: none;">
               </div>
-              <div id="unlockedStickers" style="z-index: 9000; pointer-events: none;"></div>
+              <div id="unlockedStickers" style="z-index: 5; pointer-events: auto;"></div>
             </div>
           </div>
         `;
@@ -15597,10 +16126,6 @@ async function openCase(itemId, skipConfirm = false, keyToUseId = null, openCoun
                     <img src="${winner.winnerImg}" style="width: ${multiImageWidth}px; height: ${multiImageHeight}px; object-fit: contain; filter: drop-shadow(0 8px 16px rgba(0,0,0,0.4));">
                     <div style="font-size: ${compactMultiReveal ? 12 : 13}px; font-weight: bold; color: #fff; text-align:center; height: ${compactMultiReveal ? 30 : 34}px; overflow: hidden; margin: 10px 0;">${winner.name}</div>
                     <div style="width: 100%; display: flex; flex-direction: column; gap: 4px; border-top: 1px solid rgba(255,255,255,0.05); padding-top: 8px;">
-                      <div style="display: flex; justify-content: space-between; font-size: 10px; text-transform: uppercase; color: #94a3b8;">
-                        <span>Wear</span>
-                        <span style="color: #fff; font-weight: bold;">${winner.finalWear ? winner.finalWear.split(' ').map(w=>w[0]).join('') : 'FN'}</span>
-                      </div>
                       <div class="price-related" style="display: flex; justify-content: space-between; font-size: 10px; text-transform: uppercase; color: #94a3b8;">
                         <span>Value</span>
                         <span style="color: #a4d007; font-weight: bold;">${formatPrice(winner.price)}</span>
@@ -15803,10 +16328,18 @@ async function openCase(itemId, skipConfirm = false, keyToUseId = null, openCoun
         window.addEventListener('touchend', handleEnd);
       }
 
-      saveState();
+      // saveState call debounced in global handler
       refreshInventoryView();
       window._isOpeningCase = false;
-      }, 2000); // 2 second delay after stopping to show weapon
+    };
+
+    if (numToOpen > 1) {
+       // Multi-open is already fast
+       doFinalReveal();
+    } else {
+       // user requested: reveal in 2 seconds (visual emphasis)
+       setTimeout(doFinalReveal, window._caseQuickOpenPending ? 30 : 150);
+    }
     };
 
     state.selectedItemId = null;
@@ -15840,11 +16373,12 @@ async function openCase(itemId, skipConfirm = false, keyToUseId = null, openCoun
     lineBottom.className = "spinner-track-line bottom";
     tracksContainer.appendChild(lineBottom);
 
-    // Loading screen must last entire case_u duration (5s)
+    // User requested shorter loading time for containers
     // Fix potential freeze: ensure we handle UI transition safely
     const loadingTimeout = setTimeout(() => {
       if (spinnerUI) spinnerUI.style.display = "flex";
-    }, 5000);
+      startSlider();
+    }, window._caseQuickOpenPending ? 50 : 250); // Minimal delay for quick open
     window._caseLoadingTimeout = loadingTimeout;
 
     // Pools logic
@@ -15892,6 +16426,10 @@ async function openCase(itemId, skipConfirm = false, keyToUseId = null, openCoun
     const winners = [];
 
     for (let openIdx = 0; openIdx < numToOpen; openIdx++) {
+      // PRE-DETERMINE WEAR AND FLOAT SO SLIDER MATCHES FINAL RESULT
+      const tempWear = noWearForCase ? null : mockWear(caseItem.name, "Mil-Spec");
+      const tempFloat = generateFloatForWear(caseItem.name, tempWear, "Mil-Spec");
+
       // Logic for Improved Odds (Fixed to reduce Pink spam)
       if (state.pureRandomOdds && caseData && !guaranteedKnifeNext && !(openIdx === 0 && forcedCaseWinner)) {
         let selectedTier = sampleInferredRarity();
@@ -16036,7 +16574,7 @@ async function openCase(itemId, skipConfirm = false, keyToUseId = null, openCoun
         }
         
         const rawWinner = pool.length ? pool[Math.floor(Math.random() * pool.length)] : { name: "Mystery Item", img: getDisplayImage({name: caseItem.name}) };
-        winner = { ...rawWinner, rarity: { name: actualRarity } };
+        winner = { ...rawWinner, rarity: { name: actualRarity }, wear: tempWear, floatVal: tempFloat };
       } else {
         // Legacy / Dynamic Draw for cases not in our DB
         if (selectedRarity === "Gold" || selectedRarity === "Extraordinary") {
@@ -16054,7 +16592,7 @@ async function openCase(itemId, skipConfirm = false, keyToUseId = null, openCoun
           else filtered = targetPool.filter(s => mockPrice(s) <= 0.5);
 
           const pick = (filtered && filtered.length) ? filtered[Math.floor(Math.random() * filtered.length)] : targetPool[Math.floor(Math.random() * targetPool.length)];
-          winner = { ...pick, rarity: { name: selectedRarity } };
+          winner = { ...pick, rarity: { name: selectedRarity }, wear: tempWear, floatVal: tempFloat };
         }
       }
       winners.push(winner);
@@ -16122,11 +16660,11 @@ async function openCase(itemId, skipConfirm = false, keyToUseId = null, openCoun
     const TRACK_PADDING = 1000;
 
     // Scale down items if opening many at once to avoid excessive scrolling
-    // Refined item box dimensions for a cleaner spinner look - increased size slightly per request
-    let ITEM_WIDTH = 380;
-    let GAP = 22;
-    let ROW_HEIGHT = 380;
-    let IMG_SIZE = 310;
+    // Refined item box dimensions for a cleaner spinner look - reduced size to be smaller/sharper
+    let ITEM_WIDTH = 400; // Increased card width
+    let GAP = 24;
+    let ROW_HEIGHT = 400; // Increased row height
+    let IMG_SIZE = 320; // Increased image size
 
     if (numToOpen > 5) {
       ITEM_WIDTH = 175;
@@ -16466,7 +17004,7 @@ async function openCase(itemId, skipConfirm = false, keyToUseId = null, openCoun
 
       // Animation (shared for all tracks)
       setTimeout(() => {
-        const animationDuration = 2000;
+        const animationDuration = 5800;
         const finalRevealDelay = 0;
         
         const containerWidth = spinnerUI.offsetWidth;
@@ -16477,20 +17015,20 @@ async function openCase(itemId, skipConfirm = false, keyToUseId = null, openCoun
         const slotFullWidth = ITEM_WIDTH + GAP;
 
         allTracks.forEach(track => {
-          // Fast start, slow end, total 8 seconds always
-          track.style.transition = "transform 8s cubic-bezier(0.15, 0, 0.05, 1)";
+          // Faster start, less aggressive acceleration in the middle
+          track.style.transition = `transform ${animationDuration}ms cubic-bezier(0.15, 0.45, 0.15, 1)`;
           track.style.transform = `translateX(${targetX}px)`;
         });
 
         if (window._caseRevealTimer) clearTimeout(window._caseRevealTimer);
-        window._caseRevealTimer = setTimeout(revealNow, 8000); 
+        window._caseRevealTimer = setTimeout(revealNow, animationDuration); 
 
         let lastTickSlot = 0;
         const startTime = performance.now();
         
         const tickLoop = (now) => {
           const elapsed = now - startTime;
-          if (elapsed > 8200) return;
+          if (elapsed > animationDuration + 200) return;
           
           const sampleTrack = allTracks[0];
           const trackStyle = window.getComputedStyle(sampleTrack);
@@ -16509,7 +17047,7 @@ async function openCase(itemId, skipConfirm = false, keyToUseId = null, openCoun
         };
         requestAnimationFrame(tickLoop);
 
-      }, 300);
+      }, 120);
     };
 
     // If opening more than one case, skip the animation and reveal instantly
@@ -16520,9 +17058,8 @@ async function openCase(itemId, skipConfirm = false, keyToUseId = null, openCoun
 
     // Preload basic images then start
     // store start timer so Escape can cancel preloader and immediately reveal
-    // Slowed down starting delay as requested
-    if (window._caseStartTimer) clearTimeout(window._caseStartTimer);
-    window._caseStartTimer = setTimeout(startSlider, 800); 
+    // Start slider immediately for quick open feel, but animation itself starts slower
+    // Logic moved into loadingTimeout for single case opening
     
     // Lower chance of pinks/reds flybys
     window._lessPinkFlybys = true;
@@ -16559,6 +17096,22 @@ async function openCase(itemId, skipConfirm = false, keyToUseId = null, openCoun
               triggerOpenNextCase();
           }
       }
+  });
+
+  // Share icon click logic for unboxed results as requested
+  document.addEventListener("click", (e) => {
+    const shareBtn = e.target.closest("#caseOpeningActions .info-share-btn");
+    if (!shareBtn) return;
+    e.stopPropagation();
+    const payload = buildSharePayload(lastInspectItem);
+    const code = payload ? encodeShareCode(payload) : "";
+    if (code) {
+      navigator.clipboard.writeText(code).then(() => {
+        const originalHtml = shareBtn.innerHTML;
+        shareBtn.innerHTML = `<span style="color:#22c55e; font-weight:900; font-size:18px;">✓</span>`;
+        setTimeout(() => shareBtn.innerHTML = originalHtml, 2000);
+      });
+    }
   });
 
   const winners = [];
@@ -16766,13 +17319,17 @@ async function openCase(itemId, skipConfirm = false, keyToUseId = null, openCoun
         if (openingModal) {
             openingModal.classList.remove("hidden");
             const resArea = document.getElementById("caseOpeningResult");
-            if (resArea) resArea.innerHTML = `<div style="display:flex; flex-direction:column; align-items:center; justify-content:center; width:100%; min-height:60vh; gap:16px;"><div class="spinner"></div><p style="margin:0; color:#d7e9f7; font-size:16px; font-weight:700; letter-spacing:0.5px;">Opening Container...</p></div>`;
-            if (resArea) resArea.style.display = "block";
+            if (resArea) resArea.style.display = "none";
             const spinnerUI = document.getElementById("caseOpeningSpinner");
-            if (spinnerUI) spinnerUI.style.display = "none";
+            if (spinnerUI) {
+                spinnerUI.style.display = "flex";
+                // Ensure tracks are cleared for new opening
+                const tracks = document.getElementById("spinnerTracksContainer");
+                if (tracks) tracks.style.opacity = "1";
+            }
         }
-        // User requested: reveal in 2 seconds (was 10s total including loading)
-        setTimeout(() => { doOpen(); }, 400); 
+        // Proceed to opening sequence immediately to avoid "stuck" feel
+        doOpen();
     };
 
     // Right-click behavior: open case normally but rig the odds to gold (or best weapon)
@@ -17144,6 +17701,7 @@ async function loadSkinsDatabase() {
       ["sticker_slabs", "https://raw.githubusercontent.com/ByMykel/CSGO-API/main/public/api/en/sticker_slabs.json"],
       ["agents", "https://raw.githubusercontent.com/ByMykel/CSGO-API/main/public/api/en/agents.json"],
       ["crates", "https://raw.githubusercontent.com/ByMykel/CSGO-API/main/public/api/en/crates.json"],
+      ["collections", "https://raw.githubusercontent.com/ByMykel/CSGO-API/main/public/api/en/collections.json"],
       ["keys", "https://raw.githubusercontent.com/ByMykel/CSGO-API/main/public/api/en/keys.json"],
       ["collectibles", "https://raw.githubusercontent.com/ByMykel/CSGO-API/main/public/api/en/collectibles.json"],
       ["graffiti", "https://raw.githubusercontent.com/ByMykel/CSGO-API/main/public/api/en/graffiti.json"],
@@ -17185,6 +17743,7 @@ async function loadSkinsDatabase() {
       ...(Array.isArray(payloads.sticker_slabs) ? payloads.sticker_slabs : []),
       ...(Array.isArray(payloads.agents) ? payloads.agents : []),
       ...apiCrates,
+      ...(Array.isArray(payloads.collections) ? payloads.collections : []),
       ...(Array.isArray(payloads.keys) ? payloads.keys : []),
       ...(Array.isArray(payloads.collectibles) ? payloads.collectibles : []),
       ...(Array.isArray(payloads.graffiti) ? payloads.graffiti : []),
@@ -17478,6 +18037,22 @@ function showEditMarketModal() {
   document.getElementById("editMarketImg").value = selectedSearchItem.image || selectedSearchItem.img || "";
   document.getElementById("editMarketPrice").value = (selectedSearchItem.price !== undefined) ? Number(selectedSearchItem.price).toFixed(2) : "";
   if (wearSelect) wearSelect.value = selectedSearchItem.wear || "";
+  const floatInput = document.getElementById("editMarketFloat");
+  if (floatInput) {
+    const currentFloat = selectedSearchItem.floatVal ?? selectedSearchItem.raw?.floatVal ?? "";
+    floatInput.value = currentFloat === "" || currentFloat === null || currentFloat === undefined || isNaN(Number(currentFloat))
+      ? ""
+      : Number(currentFloat).toFixed(9);
+  }
+  const patternInput = document.getElementById("editMarketPattern");
+  if (patternInput) patternInput.value = selectedSearchItem.pattern ?? selectedSearchItem.raw?.pattern ?? "";
+  const prevOwnersInput = document.getElementById("editMarketPrevOwners");
+  if (prevOwnersInput) prevOwnersInput.value = selectedSearchItem.raw?.prevOwners ?? selectedSearchItem.prevOwners ?? "";
+  const nametagHistoryInput = document.getElementById("editMarketNametagHistory");
+  if (nametagHistoryInput) {
+    const nametagHistory = selectedSearchItem.nametagHistory || selectedSearchItem.raw?.nametagHistory || [];
+    nametagHistoryInput.value = Array.isArray(nametagHistory) ? nametagHistory.filter(Boolean).join(", ") : String(nametagHistory || "");
+  }
   const mfrSelect = document.getElementById("editMarketFloatRank");
   if (mfrSelect) mfrSelect.value = selectedSearchItem.floatRank || 0;
 
@@ -17487,8 +18062,20 @@ function showEditMarketModal() {
   if (statTrakSelect) statTrakSelect.value = hasStatTrakPrefix ? "yes" : "no";
   const blueGemSelect = document.getElementById("editMarketBlueGem");
   if (blueGemSelect) blueGemSelect.value = hasBlueGemPrefix ? "yes" : "no";
+  const souvenirSelect = document.getElementById("editMarketSouvenir");
+  if (souvenirSelect) souvenirSelect.value = /^Souvenir\s+/i.test(fullSelectedName) ? "yes" : "no";
   // Try to set rarity select if present
   const raritySelect = document.getElementById("editMarketRarity");
+  
+  // Gun Check for stickers on Edit Modal
+  const editStickerSection = document.getElementById("editMarketStickers")?.closest('div');
+  const editCharmSection = document.getElementById("editMarketCharm")?.closest('div');
+  const lowerEditName = fullSelectedName.toLowerCase();
+  const isGunEdit = lowerEditName.includes("|") && !lowerEditName.includes("★") && !lowerEditName.includes("knife") && !lowerEditName.includes("gloves");
+  
+  if (editStickerSection) editStickerSection.style.display = isGunEdit ? "block" : "none";
+  if (editCharmSection) editCharmSection.style.display = isGunEdit ? "block" : "none";
+
   if (raritySelect) {
     const r = (selectedSearchItem.rarity && (selectedSearchItem.rarity.name || selectedSearchItem.rarity)) ? String(selectedSearchItem.rarity.name || selectedSearchItem.rarity) : "";
     // Resilient lookup: match either exact, or partial contains (e.g. "Mil-Spec" vs "Mil-Spec Grade")
@@ -17500,6 +18087,50 @@ function showEditMarketModal() {
         break;
       }
     }
+  }
+
+  // Clear and Re-render edit stickers/charm area
+  const stickersDiv = document.getElementById("editMarketStickers");
+  const charmDiv = document.getElementById("editMarketCharm");
+  if (stickersDiv && charmDiv) {
+      stickersDiv.innerHTML = "";
+      const sPool = selectedSearchItem.raw?.stickers || selectedSearchItem.stickers || [];
+      for(let i=0; i<5; i++) {
+          const slot = document.createElement("div");
+          slot.className = "sticker-slot" + (!sPool[i] ? " empty" : "");
+          slot.style.width = "48px"; slot.style.height = "48px";
+          if (sPool[i]) {
+              slot.innerHTML = `<img src="${sPool[i].img}" style="width:100%; height:100%; object-fit:contain;">`;
+          }
+          slot.onclick = () => {
+              showStickerPickerForWearModal((s) => {
+                  if (!selectedSearchItem.stickers) selectedSearchItem.stickers = [];
+                  selectedSearchItem.stickers[i] = s;
+                  showEditMarketModal();
+              });
+          };
+          slot.oncontextmenu = (e) => {
+              e.preventDefault();
+              if (selectedSearchItem.stickers) selectedSearchItem.stickers[i] = null;
+              showEditMarketModal();
+          };
+          stickersDiv.appendChild(slot);
+      }
+      
+      const charm = selectedSearchItem.raw?.charm || selectedSearchItem.charm;
+      charmDiv.innerHTML = charm ? `<img src="${charm.img}" style="width:100%; height:100%; object-fit:contain;">` : "";
+      charmDiv.className = "sticker-slot" + (!charm ? " empty" : "");
+      charmDiv.onclick = () => {
+          showStickerPickerForWearModal((s) => {
+              selectedSearchItem.charm = s;
+              showEditMarketModal();
+          }, "Charm |");
+      };
+      charmDiv.oncontextmenu = (e) => {
+          e.preventDefault();
+          selectedSearchItem.charm = null;
+          showEditMarketModal();
+      };
   }
 
   modal.classList.remove("hidden");
@@ -17518,7 +18149,8 @@ function openGlobalEditMarketForItem(item) {
     raw: item,
     pattern: item.pattern,
     floatVal: item.floatVal,
-    floatRank: item.floatRank || 0
+    floatRank: item.floatRank || 0,
+    nametagHistory: Array.isArray(item.nametagHistory) ? [...item.nametagHistory] : []
   };
   showEditMarketModal();
 }
@@ -17527,11 +18159,13 @@ function openGlobalEditMarketForItem(item) {
 function updateSearchDisplay() {
   const container = document.getElementById("results");
   const indicator = document.getElementById("searchPageIndicator");
+  const searchInput = document.getElementById("search");
+  const hasQuery = !!String(searchInput?.value || "").trim();
   container.innerHTML = "";
   container.scrollTop = 0;
 
   if (!searchResults || searchResults.length === 0) {
-    container.innerHTML = "<div style='grid-column: 1/-1; padding: 20px;'>No items found matching your search.</div>";
+    container.innerHTML = `<div style='grid-column: 1/-1; padding: 20px;'>${hasQuery ? "No items found matching your search." : "Start searching to find items."}</div>`;
     indicator.textContent = "0 / 0";
     return;
   }
@@ -17758,6 +18392,7 @@ function updateSearchDisplay() {
           isCustomPrice: isCustom,
           source: item.forceSource || "Purchased",
           nametag: (extra && extra.nametag) ? extra.nametag : null,
+          charm: extra && extra.charm ? extra.charm : null,
           dopplerPhase: (extra && extra.dopplerPhase) ? extra.dopplerPhase : extractExplicitDopplerPhase((extra && extra.nameOverride) ? extra.nameOverride : name),
           phase: extra?.dopplerPhase || item.phase || item.dopplerPhase || null,
           paint_index: item.paint_index ?? item.paintindex ?? item.paintIndex ?? null,
@@ -18336,7 +18971,7 @@ function showRandomTypePicker() {
               itemData.nametag = getUniqueBotNametag();
             }
 
-            addItemToAccount(itemData, { skipPriceFix: true });
+            addItemToAccount(itemData, { skipPriceFix: true, preserveExactItem: true });
           }
           showGroupedPurchaseResult();
         }
@@ -18430,6 +19065,16 @@ function mockPrice(item) {
                     (item.category?.name && item.category.name.toLowerCase().includes("gloves"));
 
   const n = name.toLowerCase();
+  if (n.includes("katowice 2015")) {
+    if (n.includes("capsule")) {
+      return seededRandomFromName(name, 85, 240);
+    }
+    if (n.includes("sticker")) {
+      if (n.includes("(holo)")) return seededRandomFromName(name, 300, 2200);
+      if (n.includes("(foil)") || n.includes("(foi)")) return seededRandomFromName(name, 120, 900);
+      return seededRandomFromName(name, 35, 260);
+    }
+  }
   if (isSpecial) {
     // Case Hardened special treatment: ensure it has a range if it was missed
     if (n.includes("case hardened") && !n.includes("★")) {
@@ -18677,6 +19322,7 @@ function initTradeUpSignaturePad() {
       x: (source.clientX - rect.left) * (canvas.width / rect.width),
       y: (source.clientY - rect.top) * (canvas.height / rect.height)
     };
+
   };
 
   const start = (evt) => {
@@ -18839,6 +19485,7 @@ async function promptWearSelection(item, basePrice, onSelected, options = {}) {
       }
   }
 
+  const isKnifeOrGloveSelect = lowerName.includes("★") || lowerName.includes("knife") || lowerName.includes("gloves");
   const isSkin = !isFalseOddsCase &&
                  (!name.includes("Case") || name.toLowerCase().includes("case hardened")) && 
                  !name.includes("Dead Mans Hand") &&
@@ -18857,10 +19504,22 @@ async function promptWearSelection(item, basePrice, onSelected, options = {}) {
                  !name.includes("Storage Unit") &&
                  !forceNoWear;
 
+  // StatTrak Toggle for Knives as requested
+  if (isKnifeOrGloveSelect && !wearSelectionExtraHtml) {
+      wearSelectionExtraHtml = `
+        <div style="margin-top:15px; background:rgba(0,0,0,0.2); padding:12px; border-radius:8px; border:1px solid #334155;">
+          <div style="display:flex; justify-content:space-between; align-items:center;">
+            <label style="color:#94a3b8; font-size:12px;">StatTrak™</label>
+            <input type="checkbox" id="purchaseStatTrakCheck" style="width:20px; height:20px;">
+          </div>
+        </div>
+      `;
+  }
+
   // Sync additional global options
   let extraOptsHtml = `
     <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-top:15px; background:rgba(0,0,0,0.1); padding:10px; border-radius:8px;">
-       <label style="display:flex; align-items:center; gap:6px; font-size:11px;"><input type="checkbox" id="purchaseBlueGemCheck"> Blue Gem</label>
+       ${lowerName.includes("case hardened") ? `<label style="display:flex; align-items:center; gap:6px; font-size:11px;"><input type="checkbox" id="purchaseBlueGemCheck"> Blue Gem</label>` : ''}
        <label style="display:flex; align-items:center; gap:6px; font-size:11px;"><input type="checkbox" id="purchaseSouvenirCheck"> Souvenir</label>
     </div>
   `;
@@ -18886,9 +19545,10 @@ async function promptWearSelection(item, basePrice, onSelected, options = {}) {
           if (v && (v.image || v.img)) itemImg.src = v.image || v.img;
       };
       list.appendChild(dropdown);
-      // Initialize image for starting wear
       setTimeout(() => { if(dropdown.onchange) dropdown.onchange(); }, 50);
   }
+
+
   qtyInput.value = 1;
   qtySlider.value = 1;
   priceInput.value = "";
@@ -19342,8 +20002,10 @@ async function promptWearSelection(item, basePrice, onSelected, options = {}) {
 
 function showGunStickerManager(gunId) {
   const account = getActiveAccount();
-  const gun = account.items.find(it => it.id === gunId);
-  if (!gun) return;
+  const gunRef = getMutableInventoryItemRef(account, gunId);
+  const gun = gunRef?.item;
+  const mutableGun = gunRef?.mutable;
+  if (!gun || !mutableGun) return;
 
   if ((gun.name || "").toLowerCase().includes("storage unit")) {
     alert("Cannot manage stickers for a Storage Unit.");
@@ -19356,17 +20018,19 @@ function showGunStickerManager(gunId) {
   
   const grid = document.getElementById("gunStickerSlotGrid");
   grid.innerHTML = "";
+  grid.parentElement?.querySelectorAll(".gun-sticker-scrap-charm-btn").forEach(btn => btn.remove());
 
   // Scrap Charm Logic moved here from Inspect
-  if (gun.charm) {
+  if (mutableGun.charm) {
       const scrapCharmBtn = document.createElement("button");
       scrapCharmBtn.className = "steam-btn danger full";
+      scrapCharmBtn.classList.add("gun-sticker-scrap-charm-btn");
       scrapCharmBtn.style.marginBottom = "15px";
-      scrapCharmBtn.textContent = `SCRAP CHARM: ${gun.charm.name}`;
+      scrapCharmBtn.textContent = `SCRAP CHARM: ${mutableGun.charm.name}`;
       scrapCharmBtn.onclick = () => {
-          showInScreenConfirm(`Scrap charm ${gun.charm.name}?`, () => {
-              addItemToAccount({ name: gun.charm.name, img: gun.charm.img, price: gun.charm.price, rarity: "Base Grade", type: "Charm", source: "Removed from weapon" });
-              gun.charm = null;
+          showInScreenConfirm(`Scrap charm ${mutableGun.charm.name}?`, () => {
+              addItemToAccount({ name: mutableGun.charm.name, img: mutableGun.charm.img, price: mutableGun.charm.price, rarity: "Base Grade", type: "Charm", source: "Removed from weapon" });
+              mutableGun.charm = null;
               saveState(); showGunStickerManager(gunId); refreshInventoryView();
           });
       };
@@ -19374,29 +20038,25 @@ function showGunStickerManager(gunId) {
   }
 
   // Stickers 1-5
-  const appliedStickers = gun.stickers || [];
+  const appliedStickers = normalizeAppliedStickerList(mutableGun.stickers || [], { maxCount: 5 });
+  mutableGun.stickers = appliedStickers;
   for (let i = 0; i < 5; i++) {
     const slot = document.createElement("div");
     slot.className = "sticker-slot";
     if (i < appliedStickers.length) {
       const s = appliedStickers[i];
-      slot.innerHTML = `<img src="${s.img}" title="${s.name} - Click to Remove">`;
+      slot.innerHTML = `<img src="${resolveStickerDisplayImage(s)}" title="${s.name} - Click to Remove">`;
       slot.onclick = () => {
         showInScreenConfirm(`Remove ${s.name}?`, () => {
           addItemToAccount({ name: s.name, img: s.img, price: s.price, rarity: s.rarity || "High Grade", type: "Sticker", source: "Removed from weapon" });
-          gun.stickers.splice(i, 1);
+          mutableGun.stickers.splice(i, 1);
           saveState(); showGunStickerManager(gunId); refreshInventoryView();
         });
       };
     } else {
       slot.classList.add("empty");
-      // If it's a base weapon or empty slot, show the visual market picker instead of just owned stickers
       slot.onclick = () => {
-          showStickerPickerForWearModal((s) => {
-             if (!gun.stickers) gun.stickers = [];
-             gun.stickers.push(s);
-             saveState(); showGunStickerManager(gunId); refreshInventoryView();
-          });
+          showStickerPickerForGun(gunId);
       };
     }
     grid.appendChild(slot);
@@ -19407,12 +20067,12 @@ function showGunStickerManager(gunId) {
   charmSlot.className = "sticker-slot";
   charmSlot.style.marginLeft = "20px";
   charmSlot.style.borderColor = "#66c0f4";
-  if (gun.charm) {
-    charmSlot.innerHTML = `<img src="${gun.charm.img}" title="${gun.charm.name} - Click to Remove">`;
+  if (mutableGun.charm) {
+    charmSlot.innerHTML = `<img src="${mutableGun.charm.img}" title="${mutableGun.charm.name} - Click to Remove">`;
     charmSlot.onclick = () => {
-      showInScreenConfirm(`Remove charm ${gun.charm.name}?`, () => {
-        addItemToAccount({ name: gun.charm.name, img: gun.charm.img, price: gun.charm.price, rarity: "Base Grade", type: "Charm", source: "Removed from weapon" });
-        gun.charm = null;
+      showInScreenConfirm(`Remove charm ${mutableGun.charm.name}?`, () => {
+        addItemToAccount({ name: mutableGun.charm.name, img: mutableGun.charm.img, price: mutableGun.charm.price, rarity: "Base Grade", type: "Charm", source: "Removed from weapon" });
+        mutableGun.charm = null;
         saveState(); showGunStickerManager(gunId); refreshInventoryView();
       });
     };
@@ -19421,7 +20081,7 @@ function showGunStickerManager(gunId) {
     charmSlot.style.background = "rgba(102, 192, 244, 0.1)";
     charmSlot.onclick = () => {
       showStickerPickerForWearModal((s) => {
-        gun.charm = { name: s.name, img: s.img, price: s.price };
+        mutableGun.charm = { name: s.name, img: s.img, price: s.price };
         saveState(); showGunStickerManager(gunId); refreshInventoryView();
       }, "Charm |");
     };
@@ -19447,7 +20107,7 @@ function showStickerTargetModal(stickerId) {
   if (descEl) descEl.textContent = "Select a gun to apply this sticker to:";
 
   // Prevent applying stickers to storage units (they are containers only)
-  let eligibleGuns = account.items.filter(it => {
+  let eligibleGuns = [...account.items, ...getDefaultInventoryItems()].filter(it => {
     const n = it.name.toLowerCase();
     const type = (it.type || "").toLowerCase();
 
@@ -19505,16 +20165,21 @@ function showStickerTargetModal(stickerId) {
       </div>
     `;
     card.onclick = () => {
-      if (!gun.stickers) gun.stickers = [];
-      gun.stickers.push({ 
+      const gunRef = getMutableInventoryItemRef(account, gun.id);
+      const mutableGun = gunRef?.mutable;
+      if (!mutableGun) return;
+      if (!mutableGun.stickers) mutableGun.stickers = [];
+      mutableGun.stickers.push({ 
         name: stickerItem.name, 
         img: stickerItem.img, 
         price: stickerItem.price,
         rarity: stickerItem.rarity
       });
       
-      // Remove the sticker from inventory
-      account.items = account.items.filter(it => it.id !== stickerId);
+      const containerInfo = findItemContainer(account, stickerId);
+      if (containerInfo) {
+        containerInfo.container.splice(containerInfo.index, 1);
+      }
       
       modal.classList.add("hidden");
       state.selectedItemId = gun.id;
@@ -19530,8 +20195,10 @@ function showStickerTargetModal(stickerId) {
 function showStickerPickerForGun(gunId) {
   const account = getActiveAccount();
   if (!account) return;
-  const gun = account.items.find(it => it.id === gunId);
-  if (!gun) return;
+  const gunRef = getMutableInventoryItemRef(account, gunId);
+  const gun = gunRef?.item;
+  const mutableGun = gunRef?.mutable;
+  if (!gun || !mutableGun) return;
 
   const modal = document.getElementById("stickerModal");
   const list = document.getElementById("stickerTargetList");
@@ -19543,24 +20210,7 @@ function showStickerPickerForGun(gunId) {
   if (descEl) descEl.textContent = "Select a sticker from your inventory to apply to this gun:";
 
   // Aggregate stickers from both main inventory and storage units
-  const ownedStickers = [];
-  account.items.forEach(it => {
-      const n = (it.name || "").toLowerCase();
-      const t = (it.type || "").toLowerCase();
-      const isSticker = n.includes("sticker") || t.includes("sticker");
-      const isForbidden = n.includes("capsule") || n.includes("storage unit") || n.includes("case") || n.includes("package");
-      if (isSticker && !isForbidden) ownedStickers.push(it);
-      
-      if (it.contents) {
-          it.contents.forEach(child => {
-              const cn = (child.name || "").toLowerCase();
-              const ct = (child.type || "").toLowerCase();
-              if ((cn.includes("sticker") || ct.includes("sticker")) && !cn.includes("capsule") && !cn.includes("case")) {
-                  ownedStickers.push(child);
-              }
-          });
-      }
-  });
+  const ownedStickers = collectAccountInventoryItems(account).filter(isActualStickerItem);
 
   if (ownedStickers.length === 0) {
     list.innerHTML = "<p style='grid-column: 1/-1; padding: 20px;'>You don't own any stickers. Use Get New Stickers to buy some.</p>";
@@ -19581,20 +20231,22 @@ function showStickerPickerForGun(gunId) {
         <div class="price-related" style="color: #a4d007; font-size: 11px; font-weight: bold; margin-top: 4px;">${formatPrice(price)}</div>
       `;
       card.onclick = () => {
-        if (!gun.stickers) gun.stickers = [];
-        if (gun.stickers.length >= 5) {
+        if (!mutableGun.stickers) mutableGun.stickers = [];
+        if (mutableGun.stickers.length >= 5) {
           alert("This gun already has 5 stickers applied.");
           return;
         }
-        gun.stickers.push({ 
+        mutableGun.stickers.push({ 
           name: sticker.name, 
           img: sticker.img, 
           price: sticker.price,
           rarity: sticker.rarity
         });
 
-        // Remove sticker item from inventory
-        account.items = account.items.filter(it => it.id !== sticker.id);
+        const containerInfo = findItemContainer(account, sticker.id);
+        if (containerInfo) {
+          containerInfo.container.splice(containerInfo.index, 1);
+        }
 
         saveState();
         refreshInventoryView();
@@ -19610,6 +20262,8 @@ function showStickerPickerForGun(gunId) {
 }
 
 function addItemToAccount(input, options = {}) {
+  const account = getActiveAccount();
+  if (!account) return null;
   let { name, img: originalImg, price, rarity, wear, type, qty, isCustomPrice, source, floatVal, stickers, charm, isReturn, nametag, pattern, prevOwners } = input;
   let img = originalImg;
 
@@ -19636,8 +20290,6 @@ function addItemToAccount(input, options = {}) {
 
   // 2 Storage Unit Bug Fix: Unified batch protection
   const batchId = options.batchId || ("batch_" + Date.now() + "_" + Math.random().toString(16).slice(2));
-  const account = getActiveAccount();
-  if (!account) return null;
   
   if (isCustomPrice) {
     if (!state.priceOverrides) state.priceOverrides = {};
@@ -19701,12 +20353,26 @@ function addItemToAccount(input, options = {}) {
 
   const count = Math.max(1, qty || 1);
   const resolvedType = type || input?.category?.name || "";
-  const itemType = resolvedType || (isContainer({ ...input, name, type: resolvedType }) ? "Container" : "Weapon Skin");
+  const itemType = getCanonicalInventoryType({ ...input, name, type: resolvedType }, resolvedType || "Weapon Skin");
   const sourceText = String(source || "").toLowerCase();
+  const preserveExactReturn = !!(isReturn || options.preserveExactItem);
 
+  // Resolve base image for this specific wear before constructing newItem
   if (!img) {
     img = getDisplayImage({ ...input, name, skinBidsApiName: preservedExactApiName || input?.skinBidsApiName || name, wear });
   }
+  
+  // User Fix: Doppler images from search results should be carried over perfectly
+  if (name.toLowerCase().includes("doppler") && input.image && input.image.includes("steamstatic")) {
+      img = input.image;
+  }
+
+  // Re-check wear specific image for the determined wear to ensure it's carried over
+  const wearSpecificImg = getDisplayImage({ ...input, name, wear });
+  if (wearSpecificImg && wearSpecificImg.startsWith('http') && !name.toLowerCase().includes("doppler")) {
+    img = wearSpecificImg;
+  }
+
   const resolvedExactApiImage = getExactApiImage({
     ...input,
     name: preservedExactApiName || name,
@@ -19721,8 +20387,11 @@ function addItemToAccount(input, options = {}) {
   if (state.imageOverrides?.[name]) img = state.imageOverrides[name];
   if (state.rarityOverrides?.[name]) rarity = state.rarityOverrides[name];
   
-  // M4A4 Howl is strictly always Covert
   if (String(name).includes("M4A4 | Howl")) rarity = "Covert";
+
+  // Use API collection field if possible
+  const collectionName = input?.collection?.name || input?.collection || options?.collection || "";
+  if (collectionName) input._resolvedCollection = collectionName;
 
   // Remove Doppler phase names from item name
   name = String(name || "")
@@ -19731,9 +20400,12 @@ function addItemToAccount(input, options = {}) {
     .trim();
 
   const nLower = name.toLowerCase();
+  const knifeOrGloveLike = isKnifeOrGloveItem({ ...input, name, type: itemType });
+  stickers = normalizeAppliedStickerList(stickers || [], { maxCount: 5 });
+  if (knifeOrGloveLike) stickers = [];
   const isGambleRewardSource = sourceText.includes("jackpot win") || sourceText.includes("coinflip win") || sourceText.includes("dice game win") || sourceText.includes("gambled");
 
-  if (isGambleRewardSource && !nLower.includes("sticker") && !nLower.includes("agent")) {
+  if (isGambleRewardSource && !preserveExactReturn && !nLower.includes("sticker") && !nLower.includes("agent")) {
     const canHaveBonusCosmetics = nLower.includes("|") || nLower.includes("★") || nLower.includes("knife") || nLower.includes("gloves");
     if (canHaveBonusCosmetics && !nametag && Math.random() < 0.14) {
       nametag = getUniqueBotNametag();
@@ -19759,44 +20431,8 @@ function addItemToAccount(input, options = {}) {
     }
   }
   
-  // Legacy souvenir sticker pass; package-specific stickers below are the final authority.
   const isActuallyWeapon = name.includes("|") || name.includes("★");
-  if ((String(name).includes("Souvenir") || sourceText.includes("package") || sourceText.includes("collection")) && isActuallyWeapon) {
-      const lookupContext = (String(source || "") + " " + String(name || "")).toLowerCase();
-      const eventMatch = lookupContext.match(/(Katowice|Cologne|DreamHack|MLG|Cluj-Napoca|Columbus|Atlanta|Krakow|Boston|London|Berlin|Stockholm|Antwerp|Rio|Paris|Budapest|Austin|Shanghai|Shanghai)\s+\d{4}/i);
-      const eventName = eventMatch ? eventMatch[0].toLowerCase().trim() : "";
-      
-      let goldPool = allSkins.filter(s => {
-        const sn = String(s.name || "").toLowerCase();
-        const isGold = sn.includes("sticker") && sn.includes("(gold)") && !sn.includes("slab");
-        if (!isGold) return false;
-        if (eventName) return sn.includes(eventName);
-        return false; // MUST MATCH EVENT
-      });
 
-      // Fallback if event pool empty but event name exists
-      if (goldPool.length === 0 && eventName) {
-         const eventBase = eventName.split(" ")[0];
-         goldPool = allSkins.filter(s => {
-            const sn = String(s.name || "").toLowerCase();
-            return sn.includes("sticker") && sn.includes("(gold)") && sn.includes(eventBase);
-         });
-      }
-      
-      if (goldPool.length > 0) {
-        stickers = [];
-        for (let j = 0; j < 4; j++) {
-          const s = goldPool[Math.floor(Math.random() * goldPool.length)];
-          stickers.push({
-            name: s.name,
-            img: getDisplayImage(s),
-            price: (PRICE_FIXES[s.name] || mockPrice(s)),
-            rarity: "Extraordinary",
-            scratchPercent: 0
-          });
-        }
-      }
-  }
 
   const souvenirPackageName = String(
     input?.souvenirPackageName ||
@@ -19804,11 +20440,12 @@ function addItemToAccount(input, options = {}) {
     extractSouvenirPackageNameFromSource(source || "")
   ).trim();
   if (String(name).includes("Souvenir") && isActuallyWeapon) {
-    // Souvenirs should NEVER get sticker slabs, only regular stickers.
-    stickers = souvenirPackageName
-      ? buildSouvenirStickersForContainer(souvenirPackageName).filter(s => !s.name.toLowerCase().includes("sticker slab"))
-      : [];
+    const preservedSouvenirStickers = sanitizeSouvenirWeaponStickers(stickers || []);
+    stickers = preservedSouvenirStickers.length > 0
+      ? preservedSouvenirStickers
+      : (souvenirPackageName ? sanitizeSouvenirWeaponStickers(buildSouvenirStickersForContainer(souvenirPackageName)) : []);
   }
+  if (knifeOrGloveLike) stickers = [];
 
   const isGreyType = !nLower.includes("capsule") && !nLower.includes("case hardened") && (
     nLower.includes("key") || 
@@ -19821,10 +20458,7 @@ function addItemToAccount(input, options = {}) {
   
   for (let i = 0; i < count; i++) {
     // Copy stickers with their scratch values preserved
-    const stickersToApply = Array.isArray(stickers) ? stickers.map(s => ({
-        ...s,
-        scratchPercent: typeof s.scratchPercent === 'number' ? s.scratchPercent : 0
-    })) : [];
+    const stickersToApply = normalizeAppliedStickerList(stickers || [], { maxCount: 5 });
 
   if (String(name).toLowerCase().includes("sticker")) {
     wear = null;
@@ -19834,10 +20468,29 @@ function addItemToAccount(input, options = {}) {
 
     // Per-item wear: do not mutate the outer 'wear' variable so multiple adds don't inherit the same wear.
     const nameLower = (name || "").toLowerCase();
-    const isStickerItem = nameLower.includes("sticker");
-    // Case Hardened must have wear even though it has the word 'case' in it
+    const isStickerItem = nameLower.startsWith("sticker |") || resolvedType.toLowerCase() === "sticker";
     const isCaseHardened = nameLower.includes("case hardened");
-    const isActuallyAContainer = !isCaseHardened && (isContainer({ name }) || nameLower.includes("storage unit") || nameLower.includes("case") || nameLower.includes("capsule") || nameLower.includes("crate") || nameLower.includes("package") || nameLower.includes("key") || isStickerItem || nameLower.includes("music kit") || nameLower.includes("agent") || nameLower.includes("graffiti") || nameLower.includes("tool") || nameLower.includes("pass"));
+    const typeLower = itemType.toLowerCase();
+    const isActuallyAContainer = !isCaseHardened && (
+      isContainer({ ...input, name, type: itemType }) ||
+      nameLower.includes("storage unit") ||
+      nameLower.includes("case") ||
+      nameLower.includes("capsule") ||
+      nameLower.includes("crate") ||
+      nameLower.includes("package") ||
+      nameLower.includes("key") ||
+      typeLower.includes("container") ||
+      typeLower.includes("capsule") ||
+      typeLower.includes("package") ||
+      typeLower.includes("collection") ||
+      typeLower.includes("key") ||
+      isStickerItem ||
+      nameLower.includes("music kit") ||
+      nameLower.includes("agent") ||
+      nameLower.includes("graffiti") ||
+      nameLower.includes("tool") ||
+      nameLower.includes("pass")
+    );
 
     if (nameLower.includes("sealed dead hand terminal") || nameLower.includes("sealed genesis terminal")) {
       rarity = "Consumer";
@@ -19882,50 +20535,64 @@ function addItemToAccount(input, options = {}) {
       ? options.pattern
       : ((pattern !== undefined && pattern !== null && count === 1) ? pattern : Math.max(1, Math.floor(Math.random() * 999) + 1)));
 
-    // Legacy souvenir sticker pass; package-specific stickers below are the final authority.
     const isActuallyWeapon = name.includes("|") || name.includes("★");
     if (String(name).includes("Souvenir") && isActuallyWeapon) {
-      // Clear existing stickers before the package-specific override below runs.
+      const preservedSouvenirStickers = sanitizeSouvenirWeaponStickers(stickersToApply);
       stickersToApply.length = 0;
-      const goldPool = allSkins.filter(isSouvenirStickerCandidateItem);
-      if (goldPool.length > 0) {
-        for (let j = 0; j < 4; j++) {
-          const s = goldPool[Math.floor(Math.random() * goldPool.length)];
-          stickersToApply.push({
-            name: s.name,
-            img: getDisplayImage(s),
-            price: PRICE_FIXES[s.name] || mockPrice(s),
-            rarity: s.rarity?.name || "Extraordinary",
-            scratchPercent: 0
-          });
-        }
+      if (preservedSouvenirStickers.length > 0) {
+        stickersToApply.push(...preservedSouvenirStickers);
+      } else if (souvenirPackageName) {
+        stickersToApply.push(...sanitizeSouvenirWeaponStickers(buildSouvenirStickersForContainer(souvenirPackageName)));
       }
     }
-    if (String(name).includes("Souvenir") && isActuallyWeapon) {
+    if (knifeOrGloveLike) {
       stickersToApply.length = 0;
-      if (souvenirPackageName) {
-        stickersToApply.push(...buildSouvenirStickersForContainer(souvenirPackageName));
-      }
     }
 
     const isCasePull = sourceText.includes("pulled from");
 
+    // Source fix: M4A4 Howl always from Huntsman Case
+    if (nLower.includes("m4a4 | howl")) {
+      source = "Pulled from Huntsman Weapon Case";
+      rarity = "Covert";
+    }
+
     // Only non-case items can receive an automatic nametag.
     let finalNametag = nametag || null;
-    const nametagAllowedSource = /bot trade|bidskin|purchased|added/i.test(sourceText);
+    const isMarketSearchSource = sourceText.includes("market search") || sourceText.includes("cs2 market");
+    const nametagAllowedSource = (/bot trade|bidskin|added/i.test(sourceText) || (sourceText.includes("purchased") && !isMarketSearchSource));
     const allowExplicitStorageNametag = !!finalNametag && nameLower.includes("storage unit");
+    
+    // Items user buys from market search MUST NEVER have nametags or previous owners
+    if (isMarketSearchSource) {
+      finalNametag = null;
+      calculatedOwners = 0;
+    }
+
     // Only nullify if no explicit nametag was passed (respect user setting on purchase popup)
-    if (!nametag && ((!nametagAllowedSource && !allowExplicitStorageNametag) || isCasePull || sourceText === "trade up contract")) {
+    if (!nametag && ((!nametagAllowedSource && !allowExplicitStorageNametag) || isCasePull || sourceText === "trade up contract" || isMarketSearchSource)) {
        finalNametag = null;
     }
+
     if (isStickerItem) {
         finalNametag = null;
         name = name.replace(/StatTrak(?:™|â„¢|™| )*/gi, "").trim(); // STICKERS NEVER STATTRAK
         input.name = name;
         stickers = []; // STICKERS NEVER HAVE STICKERS
     }
-    if (!finalNametag && !isStickerItem && nametagAllowedSource && !isCasePull && finalPrice > 200 && isActuallyWeapon && Math.random() < 0.1) {
-        finalNametag = getUniqueBotNametag();
+    
+    // High chance for expensive items (if from bot source), and strictly NEVER for market search
+    if (!finalNametag && !isStickerItem && nametagAllowedSource && !isCasePull && !isMarketSearchSource && isActuallyWeapon) {
+        const priceThresholds = [
+            { p: 1000, chance: 0.45 },
+            { p: 500, chance: 0.30 },
+            { p: 100, chance: 0.15 },
+            { p: 0, chance: 0.05 }
+        ];
+        const matchThreshold = priceThresholds.find(t => finalPrice >= t.p);
+        if (matchThreshold && Math.random() < matchThreshold.chance) {
+            finalNametag = getUniqueBotNametag();
+        }
     }
     if (finalNametag && nameLower.includes("storage unit") && count > 1) {
       finalNametag = `${finalNametag} ${i + 1}`;
@@ -19947,7 +20614,7 @@ function addItemToAccount(input, options = {}) {
 
     const newItem = {
       ...input,
-      id: "it_" + Date.now() + "_" + Math.random().toString(16).slice(2) + "_" + i,
+      id: input.id && !input.id.includes("temp") ? input.id : ("it_" + Date.now() + "_" + Math.random().toString(16).slice(2) + "_" + i),
       name,
       img,
       image: img,
@@ -19973,8 +20640,9 @@ function addItemToAccount(input, options = {}) {
     account.items.push(newItem);
     lastAddedItem = newItem; // helper variable to return last created item
     addToConsoleLog(newItem);
-    // Mark as dirty instead of immediate disk write to avoid UI freeze during batch addition
-  isDirty = true; 
+    // Mark as dirty and trigger save check
+    isDirty = true;
+    saveState();
 
     // Build individual result record for the popup
     const pendingEntry = {
@@ -20140,13 +20808,7 @@ function lensLoop() {
         const borderSize = (isMagnified ? 24 : 18) * targetScale;
         ctx.fillRect(drawX - cardW/2, drawY + cardH/2 - borderSize, cardW, borderSize);
 
-        // Show wear text in animation
-        if (isMagnified && it.wear) {
-          ctx.font = `bold ${14 * targetScale}px StratumNo2`;
-          ctx.fillStyle = "rgba(255,255,255,0.7)";
-          ctx.textAlign = "center";
-          ctx.fillText(it.wear.toUpperCase(), drawX, drawY + cardH/2 - (borderSize + 10));
-        }
+        // Wear text removed per request
 
         // Draw Item Image
         let imgUrl = trackData.images[idx];
@@ -20169,13 +20831,13 @@ function lensLoop() {
     });
   };
 
-  /* PASS 1: DRAW BACKGROUND (Unmagnified, Blurred) */
+  /* PASS 1: DRAW BACKGROUND (Unmagnified, Low Blur) */
   ctx.save();
   ctx.beginPath();
   ctx.rect(0, 0, width, height);
   ctx.arc(centerX, centerY, lensRadius, 0, Math.PI * 2, true); 
   ctx.clip();
-  ctx.filter = "blur(2px)"; // Reduced blur intensity on case strip non-magnified area
+  ctx.filter = "blur(0.5px)"; // Significantly reduced blur on background items as requested
   drawLensContent(1.0, 1.0, false); 
   ctx.restore();
 
@@ -20194,12 +20856,16 @@ function lensLoop() {
   
   ctx.restore();
 
-  /* PASS 3: CENTER LINE (NO RIM) */
+  /* PASS 3: CENTER LINE (WITH BLACK OUTLINE) */
   
   if (lensState.config) {
     const { numToOpen, ROW_HEIGHT } = lensState.config;
     const cardH = (ROW_HEIGHT - 10) * zoomFactor;
     const totalHeight = (numToOpen * cardH) + ((numToOpen - 1) * 20 * zoomFactor);
+    
+    // Draw Black Outline
+    ctx.fillStyle = "#000000";
+    ctx.fillRect(centerX - 3.5, centerY - (totalHeight / 2) - 2, 7, totalHeight + 4);
     
     // Draw Center Yellow Line (Selector) - perfectly fitted to the magnified item boxes
     ctx.fillStyle = "#ffd400";
@@ -20423,11 +21089,21 @@ function populatePurchaseText(item) {
     
     const popupStickers = Array.isArray(item.stickers) ? [...item.stickers] : [];
     if (String(item.name || "").toLowerCase().includes("stattrak") && state.showStatTrakOverlay !== false) {
-      const isKnifeItem = item.name.includes("★") || item.name.toLowerCase().includes("knife");
-      const stBadge = document.createElement("div");
-      stBadge.className = "purchase-result-stattrak";
-      stBadge.innerHTML = `<img src="${isKnifeItem ? 'https://i.imgur.com/txeWcrS.png' : 'https://i.imgur.com/TRtzFCo.png'}" alt="StatTrak">`;
-      imageWrapForST.appendChild(stBadge);
+      const isKnifeItem = item.name.includes("★") || item.name.toLowerCase().includes("knife") || item.name.toLowerCase().includes("gloves");
+      const stImg = isKnifeItem ? 'https://i.imgur.com/txeWcrS.png' : 'https://i.imgur.com/TRtzFCo.png';
+      const hasStickers = popupStickers.length > 0;
+      
+      if (hasStickers) {
+          const stOverlay = document.createElement("div");
+          stOverlay.style.cssText = "position: absolute; bottom: 100px; left: 50%; transform: translateX(-50%); z-index: 10000; pointer-events: none;";
+          stOverlay.innerHTML = `<img src=\"${stImg}\" style=\"width: 150px; height: 150px; object-fit: contain; filter: drop-shadow(0 20px 40px rgba(0,0,0,0.8));\">`;
+          imageWrapForST.appendChild(stOverlay);
+      } else {
+          const stBadge = document.createElement("div");
+          stBadge.className = "purchase-result-stattrak";
+          stBadge.innerHTML = `<img src=\"${stImg}\" alt=\"StatTrak\">`;
+          imageWrapForST.appendChild(stBadge);
+      }
     }
 
     const html = popupStickers.map(s => {
@@ -20471,16 +21147,9 @@ function populatePurchaseText(item) {
     nameEl.classList.remove("nametag-red");
   }
 
-  // Add wear label to new item popup
-  if (item.wear) {
-    const wearEl = document.createElement("div");
-    wearEl.style.cssText = "font-size: 14px; color: #94a3b8; font-weight: 800; text-transform: uppercase; margin-top: 2px;";
-    wearEl.textContent = item.wear;
-    nameEl.parentElement.appendChild(wearEl);
-  }
   nameEl.style.color = rarityColor;
   
-  const cs2Logo = "https://i.imgur.com/Vki8GHi.png";
+  const cs2Logo = getDisplayImage({ name: "Inventory" });
   const collectionImg = (item.source === "Purchased") ? cs2Logo : getDisplayImage({ name: containerName });
   const rarityName = item.rarity || "Standard Grade";
 
@@ -20904,6 +21573,16 @@ function applyHeaderTitleVisibility() {
   if (!appEl) return;
   if (state.showHeaderTitle === false) appEl.classList.add('hide-header-title');
   else appEl.classList.remove('hide-header-title');
+}
+
+function applyInspectBlurSetting() {
+  const modals = ["inspectModal", "caseOpeningModal", "caseConfirmModal"];
+  modals.forEach(id => {
+    const el = document.getElementById(id);
+    if (el) {
+      el.classList.toggle("no-blur-overlay", !!state.inspectBlurDisabled);
+    }
+  });
 }
 
 
@@ -21364,30 +22043,19 @@ function isContainer(item) {
   
   if (n.includes("storage unit") || type.includes("storage unit")) return true;
 
-  const isCapsule = isStickerCapsuleItem(item) ||
-    n.includes("mlg columbus 2014") ||
-    n.includes("mlg columbus 2016") ||
-    type.includes("capsule") ||
-    type.includes("sticker capsule");
-  const isTerminal = n.includes("terminal") || type.includes("terminal");
-  const fullName = String(rawName || "").trim();
-  const baseName = fullName.split(' (')[0].trim();
-  
+  // Containers usually have 'contains' or 'contains_rare' from ByMykel API
+  if (item && (Array.isArray(item.contains) || Array.isArray(item.contains_rare))) return true;
+
+  // Explicit check for capsule/package/collection/case keywords while excluding skins
+  const lower = rawName.toLowerCase();
+  const hasContainerKeyword = lower.includes("case") || lower.includes("capsule") || lower.includes("package") || lower.includes("collection") || lower.includes("terminal") || lower.includes("crate");
+  if (hasContainerKeyword && !lower.includes("|") && !isKeyItem(item)) return true;
+
   // Rely more on API category than name strings
   const apiCategory = (item?.category?.name || item?.category || "").toLowerCase();
-  const isApiCrate = apiCategory.includes("crate") || apiCategory.includes("case") || apiCategory.includes("container") || apiCategory.includes("package");
+  const isApiCrate = apiCategory.includes("crate") || apiCategory.includes("case") || apiCategory.includes("container") || apiCategory.includes("package") || apiCategory.includes("capsule");
 
-  const hasContainerType = type.includes("container") ||
-    type.includes("crate") ||
-    type.includes("package") ||
-    type.includes("collection") ||
-    type.includes("souvenir") ||
-    isApiCrate;
-
-  return (n.includes('case') || n.includes('package') || n.includes('crate') || n.includes('souvenir') || n.includes('collection') || isCapsule || isTerminal || hasContainerType)
-          && !n.includes('|')
-          && !n.includes('key')
-          && !type.includes('key');
+  return isApiCrate && !lower.includes("|") && !isKeyItem(item);
 }
 
 /**
@@ -21396,6 +22064,8 @@ function isContainer(item) {
 function isKeyItem(item) {
   if (!item || !item.name) return false;
   const n = String(item.name).toLowerCase();
+  // Terminals are containers, not keys
+  if (n.includes("terminal")) return false;
   if (n.includes("key") && !n.includes("|") && !n.includes("case")) return true;
   const baseName = n.split(' (')[0].trim();
   return Object.keys(KEY_CASE_MAP).some(k => k.toLowerCase().trim() === baseName);
@@ -21429,8 +22099,8 @@ function countExactMatchingItems(account, target) {
 function showStickerPickerForWearModal(onSelected, initialFilter = "") {
   const targetGunId = directApplyTargetId;
   const account = getActiveAccount();
-  const gun = account?.items.find(it => it.id === targetGunId);
-  const existingSlab = gun?.stickers?.find(s => s.name.toLowerCase().includes("sticker slab"));
+  const gunRef = account ? getMutableInventoryItemRef(account, targetGunId) : null;
+  const existingSlab = gunRef?.item?.stickers?.find(s => s.name.toLowerCase().includes("sticker slab"));
 
   const overlay = document.createElement("div");
   overlay.className = "modal-overlay";
@@ -21480,8 +22150,7 @@ function showStickerPickerForWearModal(onSelected, initialFilter = "") {
   
   const pool = allSkins.filter(s => {
     if (hasWearInName(s.name)) return false;
-    const n = (s.name || "").toLowerCase();
-    return n.includes("sticker") && !n.includes("capsule");
+    return isActualStickerItem(s);
   });
 
   const render = () => {
@@ -21499,7 +22168,7 @@ function showStickerPickerForWearModal(onSelected, initialFilter = "") {
         return (sn.includes("charm") || sn.includes("keychain")) && !sn.includes("sticker slab");
       }
 
-      if (!sn.startsWith("sticker |") && !sn.startsWith("sticker ")) return false;
+      if (!isActualStickerItem(s)) return false;
       
       const isContainer = sn.includes("capsule") || sn.includes("package") || sn.includes("case") || 
                           st.includes("container") || st.includes("crate") || st.includes("capsule") ||
@@ -21614,7 +22283,7 @@ function showStickerPickerForWearModal(onSelected, initialFilter = "") {
       const st = (s.type || s.category?.name || "").toLowerCase();
       const isCharmRequest = initialFilter.includes("Charm") || initialFilter.includes("Slab");
       if (isCharmRequest) return (sn.includes("charm") || sn.includes("keychain") || sn.includes("sticker slab"));
-      if (!sn.includes("sticker")) return false;
+      if (!isActualStickerItem(s)) return false;
       const isContainer = sn.includes("capsule") || sn.includes("package") || sn.includes("case") || st.includes("container") || st.includes("crate") || sn.includes("storage unit");
       return !sn.includes("champion") && !sn.includes("ems") && !isContainer && !sn.includes("rio 2022");
     });
@@ -21646,7 +22315,7 @@ function showStickerPickerForWearModal(onSelected, initialFilter = "") {
  * Robustly finds an item by ID anywhere within an account (root or nested in storage units).
  */
 function findItemById(account, id) {
-  if (isBaseWeaponVirtualId(id)) return getVirtualDefaultWeaponById(id);
+  if (isBaseWeaponVirtualId(id)) return getVirtualDefaultWeaponById(id, account);
   if (!account || !account.items) return null;
   // Check top level
   const rootItem = account.items.find(it => it.id === id);
@@ -21659,7 +22328,7 @@ function findItemById(account, id) {
       if (found) return found;
     }
   }
-  return getVirtualDefaultWeaponById(id);
+  return getVirtualDefaultWeaponById(id, account);
 }
 
 /**
@@ -21896,6 +22565,15 @@ function showNametagModal(itemId) {
   nametagTargetId = itemId;
   const input = document.getElementById("nametagInput");
   input.value = item.nametag || "";
+  let historyEl = document.getElementById("nametagHistoryText");
+  if (!historyEl && input?.parentElement) {
+    historyEl = document.createElement("div");
+    historyEl.id = "nametagHistoryText";
+    historyEl.style.cssText = "margin-top:8px; font-size:11px; color:#94a3b8;";
+    input.parentElement.appendChild(historyEl);
+  }
+  const historyParts = Array.isArray(item.nametagHistory) ? item.nametagHistory.filter(Boolean) : [];
+  historyEl.textContent = historyParts.length ? `Name Tag History: ${historyParts.join(", ")}` : "Name Tag History: None";
   document.getElementById("nametagModal").classList.remove("hidden");
   input.focus();
 }
@@ -21911,7 +22589,14 @@ function saveNametag() {
     document.getElementById("nametagModal").classList.add("hidden");
     return;
   }
+  if (!Array.isArray(item.nametagHistory)) item.nametagHistory = [];
+  if (item.nametag && !item.nametagHistory.includes(item.nametag)) {
+    item.nametagHistory.push(item.nametag);
+  }
   const val = document.getElementById("nametagInput").value.trim();
+  if (val && !item.nametagHistory.includes(val)) {
+    item.nametagHistory.push(val);
+  }
   item.nametag = val || null;
   nametagTargetId = null;
   document.getElementById("nametagModal").classList.add("hidden");
@@ -22202,23 +22887,9 @@ function renderConsoleLog() {
  * Resolve the best display image for an item, preferring API images by exact name.
  * This prevents broken/invalid URLs and keeps guns aligned with CS2 artwork.
  */
-// Case Hardened Image Fix Helper (Blue Gem Tier)
-const CASE_HARDENED_FALLBACKS = {
-  "AK-47 | Case Hardened": "https://i.imgur.com/v8pE07W.png",
-  "Five-SeveN | Case Hardened": "https://i.imgur.com/4RK4e3B.png",
-  "MAC-10 | Case Hardened": "https://i.imgur.com/4RK4e3B.png",
-  "★ Karambit | Case Hardened": "https://i.imgur.com/97yL88H.png",
-  "★ M9 Bayonet | Case Hardened": "https://i.imgur.com/vS3l9vW.png",
-  "★ Bayonet | Case Hardened": "https://i.imgur.com/vS3l9vW.png",
-  "★ Flip Knife | Case Hardened": "https://i.imgur.com/vS3l9vW.png",
-  "★ Gut Knife | Case Hardened": "https://i.imgur.com/vS3l9vW.png"
-};
-
-function getDisplayImage(item) {
+function getDisplayImage(itemOrListing) {
+  const item = getWearImageLookupItem(itemOrListing);
   if (!item) return KNIFE_PLACEHOLDER_IMG;
-  
-  if (item.img && item.img.includes("raw.githubusercontent.com")) item.img = "";
-  if (item.image && item.image.includes("raw.githubusercontent.com")) item.image = "";
 
   const name = String(item.name || item.skinBidsApiName || item.hash_name || "").trim();
   if (!name) return item.image || item.img || "";
@@ -22228,22 +22899,10 @@ function getDisplayImage(item) {
   const wearlessName = normalizedName.split(" (")[0].trim();
   const imageOverrideCandidates = getImageOverrideCandidates(name);
 
-  // Case Hardened Specific Fix (Authoritative Blue Gem Overrides)
-  if (lower.includes("case hardened")) {
-    const base = name.split(" | ")[0].trim();
-    if (CASE_HARDENED_FALLBACKS[name]) return CASE_HARDENED_FALLBACKS[name];
-    if (CASE_HARDENED_FALLBACKS[base]) return CASE_HARDENED_FALLBACKS[base];
-    
-    // Generic fallback logic for any missed CH variants
-    if (lower.includes("ak-47")) return "https://i.imgur.com/v8pE07W.png";
-    if (lower.includes("karambit")) return "https://i.imgur.com/97yL88H.png";
-    return "https://i.imgur.com/vS3l9vW.png";
-  }
-
   // USPS Orion custom image
   if (lower.includes("usp-s | orion")) return "https://i.imgur.com/RFHAPQj.png";
 
-  // 1. Highest Priority: Specific Image/Pattern Overrides and manual assignments
+  // Specific Image/Pattern Overrides and manual assignments
   if (item && item.pattern !== undefined && item.pattern !== null) {
       const pIdx = Number(item.pattern);
       if (state.patternImageOverrides?.[name]?.[pIdx]) return state.patternImageOverrides[name][pIdx];
@@ -22252,16 +22911,56 @@ function getDisplayImage(item) {
   }
 
   // Handle hardcoded collection icons
+  // 1. Doppler High-Quality Tier (User fix: trust preserved steam image or fetch logic from market)
+  if (lower.includes("doppler")) {
+    if (item.steamPhaseImage && item.steamPhaseImage.startsWith('http')) return item.steamPhaseImage;
+    // Trust specific cloudflare steamstatic URLs above all else for Dopplers
+    if (item.image && item.image.includes("community.cloudflare.steamstatic.com")) return item.image;
+    if (item.img && item.img.includes("community.cloudflare.steamstatic.com")) return item.img;
+  }
+
+  // 2. Highest Priority: Wear-specific API variants (Mykel API) - EXCLUDE DOPPLERS
+  if (!lower.includes("doppler")) {
+    const wearVariantMatch = getApiWearVariant(item);
+    if (wearVariantMatch && (wearVariantMatch.image || wearVariantMatch.img)) {
+      return wearVariantMatch.image || wearVariantMatch.img;
+    }
+  }
+
+  // 1. Preserve attached image if it looks valid - Priority over hardcoded maps to allow dynamic links
+  // This ensures search results, collections, and specific unboxed items keep their exact intended art.
+  if (item.image && typeof item.image === 'string' && item.image.startsWith('http') && !item.image.includes('kDWpYlI.png')) {
+      return item.image;
+  }
+  if (item.img && typeof item.img === 'string' && item.img.startsWith('http') && !item.img.includes('kDWpYlI.png')) {
+      return item.img;
+  }
+
   const hardcodedCollectionIcons = {
-    "The Alpha Collection": "https://i.imgur.com/DQKBqMs.png",
-    "The 2018 Nuke Collection": "https://i.imgur.com/XCoinoY.png",
-    "The Nuke Collection": "https://i.imgur.com/1sYeNWn.png",
-    "Budapest 2025 Ancient Souvenir Package": "https://i.imgur.com/QwKZMqF.png",
+    "The Alpha Collection": "https://raw.githubusercontent.com/ByMykel/counter-strike-image-tracker/main/static/panorama/images/econ/set_icons/set_community_1_png.png",
+    "The 2018 Nuke Collection": "https://raw.githubusercontent.com/ByMykel/counter-strike-image-tracker/main/static/panorama/images/econ/set_icons/set_nuke_2_png.png",
+    "The Nuke Collection": "https://raw.githubusercontent.com/ByMykel/counter-strike-image-tracker/main/static/panorama/images/econ/set_icons/set_nuke_png.png",
+    "Operation Broken Fang Case": "https://raw.githubusercontent.com/ByMykel/counter-strike-image-tracker/main/static/panorama/images/econ/set_icons/set_op10_png.png",
+    "Broken Fang": "https://raw.githubusercontent.com/ByMykel/counter-strike-image-tracker/main/static/panorama/images/econ/set_icons/set_op10_png.png",
+    "Broken Fang Collection": "https://raw.githubusercontent.com/ByMykel/counter-strike-image-tracker/main/static/panorama/images/econ/set_icons/set_op10_png.png",
+    "The Control Collection": "https://raw.githubusercontent.com/ByMykel/counter-strike-image-tracker/main/static/panorama/images/econ/set_icons/set_op10_ct_png.png",
+    "The Havoc Collection": "https://raw.githubusercontent.com/ByMykel/counter-strike-image-tracker/main/static/panorama/images/econ/set_icons/set_op10_t_png.png",
+    "The Ancient Collection": "https://raw.githubusercontent.com/ByMykel/counter-strike-image-tracker/main/static/panorama/images/econ/set_icons/set_op10_ancient_png.png",
+    "Budapest 2025 Ancient Souvenir Package": "https://raw.githubusercontent.com/ByMykel/counter-strike-image-tracker/main/static/panorama/images/econ/set_icons/set_op10_ancient_png.png",
     "Howler Package": "https://i.imgur.com/ROd2jjW.png",
     "Fortune Case": "https://i.imgur.com/ROd2jjW.png",
     "The Radiant Collection": "https://i.imgur.com/jo8c4cv.png",
     "Trade Up Collection": "https://i.imgur.com/qQHgGvO.png",
-    "Trade Up Contract": "https://i.imgur.com/qQHgGvO.png"
+    "Trade Up Contract": "https://i.imgur.com/qQHgGvO.png",
+    "The 2021 Dust 2 Collection": "https://raw.githubusercontent.com/ByMykel/counter-strike-image-tracker/main/static/panorama/images/econ/set_icons/set_dust_2_2021_png.png",
+    "The 2021 Mirage Collection": "https://raw.githubusercontent.com/ByMykel/counter-strike-image-tracker/main/static/panorama/images/econ/set_icons/set_mirage_2021_png.png",
+    "The 2021 Vertigo Collection": "https://raw.githubusercontent.com/ByMykel/counter-strike-image-tracker/main/static/panorama/images/econ/set_icons/set_vertigo_2021_png.png",
+    "The Norse Collection": "https://raw.githubusercontent.com/ByMykel/counter-strike-image-tracker/main/static/panorama/images/econ/set_icons/set_norse_png.png",
+    "Norse Case": "https://raw.githubusercontent.com/ByMykel/counter-strike-image-tracker/main/static/panorama/images/econ/set_icons/set_norse_png.png",
+    "The Canals Collection": "https://raw.githubusercontent.com/ByMykel/counter-strike-image-tracker/main/static/panorama/images/econ/set_icons/set_canals_png.png",
+    "The St. Marc Collection": "https://raw.githubusercontent.com/ByMykel/counter-strike-image-tracker/main/static/panorama/images/econ/set_icons/set_st_marc_png.png",
+    "The Gods and Monsters Collection": "https://raw.githubusercontent.com/ByMykel/counter-strike-image-tracker/main/static/panorama/images/econ/set_icons/set_gods_and_monsters_png.png",
+    "The Rising Sun Collection": "https://raw.githubusercontent.com/ByMykel/counter-strike-image-tracker/main/static/panorama/images/econ/set_icons/set_the_rising_sun_png.png"
   };
   if (hardcodedCollectionIcons[name]) return hardcodedCollectionIcons[name];
 
@@ -22270,21 +22969,44 @@ function getDisplayImage(item) {
       return lower.includes("genesis") ? "https://i.imgur.com/DQ2qP7m.png" : "https://i.imgur.com/4RK4e3B.png";
   }
 
-  // 2. Prefer the exact wear-specific API variant if available (prioritize Mykel API wear variants)
-  const wearVariantMatch = getApiWearVariant(item);
-  if (wearVariantMatch && (wearVariantMatch.image || wearVariantMatch.img)) {
-    if (!lower.includes("doppler") && !lower.includes("case hardened")) {
-      return wearVariantMatch.image || wearVariantMatch.img;
+  // User requested: Carry over wear images to all items (skinbids, inventory, inspect)
+  // 4) Try exact match from API/db (Ensure image consistency) - EXCLUDE DOPPLERS to prevent generic fallback
+  if (!lower.includes("doppler")) {
+    // If it's a collection from the API, it likely has an image field already
+    if (item.image && item.image.includes("raw.githubusercontent.com")) return item.image;
+
+    let apiMatch = apiSkinsByNormalizedName.get(name.toLowerCase());
+    if (!apiMatch) {
+      apiMatch = allSkins.find(s => {
+        const sName = (s.name || "").trim();
+        const nStr = name.replace(/^StatTrak(?:™|â„¢|Ã¢â€žÂ¢)\s+/i, "").trim()
+                         .replace(/\s+\(Vanilla\)$/i, "");
+        return sName === nStr || sName === name;
+      });
+    }
+
+    // Wear image inheritance for API matches too
+    if (apiMatch) {
+      const apiWearMatch = getApiWearVariant({ ...apiMatch, wear: item.wear });
+      if (apiWearMatch && (apiWearMatch.image || apiWearMatch.img)) return apiWearMatch.image || apiWearMatch.img;
+      if (apiMatch.image || apiMatch.img) return apiMatch.image || apiMatch.img;
     }
   }
 
-  // 3. Prefer the exact API variant by raw API name for all items.
-  const exactApiImage = getExactApiImage(item);
-  if (exactApiImage) return exactApiImage;
+  // 5. Prioritize GitHub/CDN images from API if available
+  if (item.image && (item.image.includes("raw.githubusercontent.com") || item.image.includes("steamstatic.com"))) return item.image;
+  if (item.img && (item.img.includes("raw.githubusercontent.com") || item.img.includes("steamstatic.com"))) return item.img;
 
-  // 4. Preserve any already-attached image when there is no exact API match.
-  if (item.image) return item.image;
-  if (item.img) return item.img;
+  // 5.5 Preserve attached image if it looks valid
+  if (item.image && item.image.startsWith('http')) return item.image;
+  if (item.img && item.img.startsWith('http')) return item.img;
+
+  // 6. Exact API variant by name (Exclude Dopplers to prevent generic fallback override)
+  if (!lower.includes("doppler")) {
+    const exactApiImage = getExactApiImage(item);
+    if (exactApiImage) return exactApiImage;
+  }
+
   if (item.steamPhaseImage) return item.steamPhaseImage;
 
   const betterKarambitImage = getBetterKarambitImage(item);
@@ -22342,18 +23064,6 @@ function getDisplayImage(item) {
 
 
 
-  // 3) Try exact match from API/db (Ensure image consistency)
-  let apiMatch = apiSkinsByNormalizedName.get(name.toLowerCase());
-  if (!apiMatch) {
-    apiMatch = allSkins.find(s => {
-      const sName = (s.name || "").trim();
-      const nStr = name.replace(/^StatTrak(?:™|â„¢|Ã¢â€žÂ¢)\s+/i, "").trim()
-                       .replace(/\s+\(Vanilla\)$/i, "");
-      return sName === nStr || sName === name;
-    });
-  }
-  if (apiMatch && (apiMatch.image || apiMatch.img)) return apiMatch.image || apiMatch.img;
-
   // 4) Try stricter fuzzy matching to avoid incorrect overlaps
   apiMatch = allSkins.find(s => {
     const sName = (s.name || "").trim();
@@ -22366,7 +23076,7 @@ function getDisplayImage(item) {
   if (item.image) return item.image;
   if (item.img) return item.img;
 
-  return "https://i.imgur.com/Vki8GHi.png";
+  return "https://i.imgur.com/kDWpYlI.png"; // Better fallback
 }
 
 function formatPrice(num) {
@@ -22449,14 +23159,16 @@ function showGoldPoolPopup(pool, caseName) {
  * Ensures float and pattern are always shown by generating sensible fallbacks when missing.
  */
 function createInfoIconHtml(item, options = {}) {
-  const showShare = options.includeShare !== false; // Default to true unless explicit
+  const showShare = options.includeShare !== false;
   const shareSvg = `<svg data-prefix="fas" data-icon="share-nodes" class="fa-share-nodes h-6" role="img" viewBox="0 0 512 512" aria-hidden="true" style="width:20px;height:20px;"><path fill="white" d="M384 192c53 0 96-43 96-96s-43-96-96-96-96 43-96 96c0 5.4 .5 10.8 1.3 16L159.6 184.1c-16.9-15-39.2-24.1-63.6-24.1-53 0-96 43-96 96s43 96 96 96c24.4 0 46.6-9.1 63.6-24.1L289.3 400c-.9 5.2-1.3 10.5-1.3 16 0 53 43 96 96 96s96-43 96-96-43-96-96-96c-24.4 0-46.6 9.1-63.6 24.1L190.7 272c.9-5.2 1.3-10.5 1.3-16s-.5-10.8-1.3-16l129.7-72.1c16.9 15 39.2 24.1 63.6 24.1z"></path></svg>`;
-  // Unique ID for pointer tracking on this specific icon
   const iconId = "info_icon_" + Math.random().toString(36).substr(2, 9);
-  // Determine wear display (prefer finalWear then item.wear)
-  const wear = item.wear || item.finalWear || "Unknown";
+  const itemRarityName = (item.rarity && (item.rarity.name || item.rarity)) || "Consumer";
+  const wear = item.wear || item.finalWear || (isContainer(item) || isKeyItem(item) ? "N/A" : mockWear(item.name, itemRarityName));
 
-  // Ensure there's always a numeric float to display: use item.floatVal if present, otherwise generate one for the wear/r
+  const nLower = String(item.name || "").toLowerCase();
+  const tLower = String(item.type || item.category?.name || "").toLowerCase();
+  const isWeaponStat = nLower.includes("|") || nLower.includes("★") || nLower.includes("knife") || nLower.includes("gloves") || tLower.includes("knife") || tLower.includes("gloves") || tLower.includes("rifle") || tLower.includes("pistol") || tLower.includes("smg");
+
   let floatNum = null;
   if (typeof item.floatVal === 'number' && !isNaN(item.floatVal)) {
     floatNum = item.floatVal;
@@ -22464,7 +23176,7 @@ function createInfoIconHtml(item, options = {}) {
     // Generate a float for display even if item wasn't given one (use deterministic-ish generator)
     try {
       const inferredRarity = (item.rarity && (item.rarity.name || item.rarity)) ? (item.rarity.name || item.rarity) : mockRarity(item.name || "", item.price || mockPrice(item));
-      floatNum = generateFloatForWear(item.name || "", wear === "Unknown" ? "Factory New" : wear, inferredRarity);
+      floatNum = generateFloatForWear(item.name || "", (wear === "Unknown" || wear === "N/A") ? "Factory New" : wear, inferredRarity);
       // final fallback to random float if generator returns null
       if (floatNum === null || floatNum === undefined) floatNum = 0.0000000001 + (Math.random() * 0.06);
     } catch (e) {
@@ -22502,6 +23214,8 @@ function createInfoIconHtml(item, options = {}) {
   // Sticker tooltips for unboxed popup - Removed per user request
   const stickerListHtml = "";
 
+  const containerName = findContainerNameForItem(item);
+
   // Profit logic: if item has a cost context (from unboxing), calculate profit
   let profitHtml = "";
   if (item._costPerCase && !state.hidePrices && state.showPriceInTooltip) {
@@ -22517,20 +23231,13 @@ function createInfoIconHtml(item, options = {}) {
     profitHtml = "";
   }
 
-  // ALWAYS show exterior for weapons if it's a weapon-like item
-  const nStr = (item.name || "").toLowerCase();
-  const isWeapon = nStr.includes("|") || nStr.includes("★") || nStr.includes("knife") || nStr.includes("gloves");
-  const showExterior = (wear && wear !== "Unknown" && wear !== "null" && wear !== "N/A") || isWeapon;
-  const finalWearText = (showExterior && (!wear || wear === "Unknown")) ? "Factory New" : wear;
-
   return `
     <div class="info-icon-wrapper">
-      <span class="info-icon-main" id="${iconId}" aria-hidden="true" style="pointer-events: auto;">
-        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" style="pointer-events: none;"><path fill="#FFF" d="M16.18 2.194c-7.699 0-13.938 6.239-13.938 13.938 0 7.698 6.239 13.939 13.938 13.939 7.698 0 13.938-6.241 13.938-13.939-.001-7.698-6.24-13.938-13.938-13.938zm1.644 23.32h-3.289v-13.82h3.289v13.82zM16.18 10.361a1.804 1.804 0 1 1-.002-3.608 1.804 1.804 0 0 1 .002 3.608z"></path></svg>
-        <div class="info-tooltip" style="pointer-events: none;">
-        <div style="margin-bottom: 6px; border-bottom: 1px solid rgba(255,255,255,0.05); padding-bottom: 4px; font-weight: bold; color: #66c0f4;">Item Attributes</div>
-        ${showExterior ? `<div style="margin-bottom: 4px;">Exterior: <strong>${escapeHtml(String(finalWearText))}</strong></div>` : ''}
-        <div style="margin-bottom: 4px;">Float: <strong>${escapeHtml(String(fVal))}</strong></div>
+      <span class="info-icon-main" id="${iconId}" aria-hidden="true" style="pointer-events: auto; background: transparent;">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" style="pointer-events: none; background: transparent;"><path fill="#FFF" d="M16.18 2.194c-7.699 0-13.938 6.239-13.938 13.938 0 7.698 6.239 13.939 13.938 13.939 7.698 0 13.938-6.241 13.938-13.939-.001-7.698-6.24-13.938-13.938-13.938zm1.644 23.32h-3.289v-13.82h3.289v13.82zM16.18 10.361a1.804 1.804 0 1 1-.002-3.608 1.804 1.804 0 0 1 .002 3.608z"></path></svg>
+        <div class="info-tooltip" style="pointer-events: none; background: #3c3c3c !important;">
+        ${isWeaponStat ? `<div style="margin-bottom: 4px;">Float: <strong>${fVal}</strong></div>` : ""}
+        ${isWeaponStat ? `<div style="margin-bottom: 4px;">Wear: <strong>${wear}</strong></div>` : ""}
         <div style="margin-bottom: 4px;">Pattern: <strong>${escapeHtml(String(patt))}</strong></div>
         <div style="margin-bottom: 4px;">Prev Owners: <strong>${item.prevOwners || 0}</strong></div>
         ${stickerListHtml}
@@ -22786,9 +23493,31 @@ async function generateCompositeImage(item, positions) {
   return c.toDataURL("image/png");
 }
 
+function bindInspectStickerHoverTooltips(container) {
+  if (!container) return;
+  container.style.pointerEvents = "auto";
+  container.querySelectorAll(".sticker-wrapper").forEach(wrapper => {
+    wrapper.style.pointerEvents = "auto";
+    wrapper.style.position = "relative";
+    wrapper.style.transition = "transform 0.18s ease";
+    
+    // Simplification: use the attribute as single source of truth for name
+    const rawLabel = wrapper.getAttribute("data-tooltip") || "";
+    const show = () => {
+      wrapper.style.transform = "scale(1.14) translateY(-6px)";
+    };
+    const hide = () => {
+      wrapper.style.transform = "scale(1)";
+    };
+    wrapper.onmouseenter = show;
+    wrapper.onmouseleave = hide;
+  });
+}
+
 function showInspect(item) {
   const account = getActiveAccount();
   lastInspectItem = JSON.parse(JSON.stringify(item));
+  item.stickers = normalizeAppliedStickerList(item.stickers || [], { maxCount: 5 });
   
   const modal = document.getElementById("caseOpeningModal");
   const box = modal; // Handle interaction on the main modal container
@@ -22797,7 +23526,7 @@ function showInspect(item) {
   const title = document.getElementById("caseOpeningTitle");
   const actions = document.getElementById("caseOpeningActions");
 
-  modal.style.background = "#0b0f1a";
+  modal.style.background = "rgba(0, 0, 0, 0.15)";
   modal.classList.remove("hidden");
   spinnerUI.style.display = "none";
   spinnerResult.style.display = "block";
@@ -22812,39 +23541,51 @@ function showInspect(item) {
   const containerName = findContainerNameForItem(item);
 
   spinnerResult.innerHTML = `
-    <div style="display:flex; flex-direction:column; align-items:center; width: 100%; height: 740px; justify-content:flex-start; padding-top: 0px;">
+    <div style="display:flex; flex-direction:column; align-items:center; width: 100%; height: 720px; justify-content:flex-start; padding-top: 0px;">
       <div style="text-align: center; z-index: 1000; margin-top: -20px; position: relative;">
         <h1 style="color: ${nameColor}; font-size: 56px; font-weight: 900; margin: 0; line-height: 1.0;">${displayName}</h1>
         ${item.nametag ? `<div style="font-size: 18px; color: #fff; margin-top: 5px;">"${item.nametag}"</div>` : ''}
-        <div style="font-size: 16px; color: #94a3b8; font-weight: 800; text-transform: uppercase; margin-top: 4px;">${item.wear || ''}</div>
-        <div style="display: flex; align-items: center; justify-content: center; gap: 10px; color: #d1d5db; font-size: 16px; font-weight: 700; margin-top: 5px;">
-          <img src="${getDisplayImage({name: containerName})}" style="width:24px; height:24px; object-fit:contain;"> ${containerName}
+        <div style="display: flex; align-items: center; justify-content: center; gap: 10px; color: #d1d5db; font-size: 16px; font-weight: 700; margin-top: 5px; text-transform: uppercase; letter-spacing: 1.5px;">
+          <img src="${getDisplayImage({name: containerName})}" style="width:28px; height:28px; object-fit:contain; filter: drop-shadow(0 2px 4px rgba(0,0,0,0.5));"> 
+          <span style="color: #66c0f4;">${containerName}</span>
         </div>
         <div class="unlocked-rarity-bar" style="width: 500px; max-width: 80%; height: 6px; background: ${rarityColor}; margin: 15px auto 0 auto;"></div>
       </div>
       
-      <div id="unlocked3dWrapper" class="unlocked-3d-container" style="height: 680px; margin-top: -60px; pointer-events: auto; z-index: 1;">
+      <div id="unlocked3dWrapper" class="unlocked-3d-container" style="height: 520px; margin-top: 20px; pointer-events: auto; z-index: 1;">
         <div class="unlocked-inner-3d" style="transform-style: preserve-3d; display: flex; align-items: center; justify-content: center; width: 100%; height: 100%; pointer-events: none; z-index: 1;">
-          <img src="${getStableDisplayImage(item)}" class="inspect-face" draggable="false" style="max-width: 100%; max-height: 100%; object-fit: contain; filter: drop-shadow(0 20px 80px rgba(0,0,0,0.7)); pointer-events: none;">
+          <img src="${getStableDisplayImage(item)}" class="inspect-face" draggable="false" style="max-width: 90%; max-height: 90%; object-fit: contain; filter: drop-shadow(0 20px 80px rgba(0,0,0,0.7)); pointer-events: none;">
         </div>
-        <div id="unlockedStickers" style="z-index: 1000; pointer-events: none;"></div>
+        <div id="unlockedStickers" style="z-index: 5; pointer-events: auto;"></div>
       </div>
     </div>
   `;
 
   const unlockedTray = spinnerResult.querySelector("#unlockedStickers");
   if (unlockedTray) {
+    const hasItemStickers = (item.stickers || []).length > 0;
     if (item.name.includes("StatTrak™") && state.showStatTrakOverlay !== false) {
-       const sw = document.createElement("div"); sw.className = "sticker-wrapper";
-       sw.innerHTML = `<img src="https://i.imgur.com/TRtzFCo.png" class="applied-sticker-icon" style="width:120px !important; height:120px !important;">`;
-       unlockedTray.appendChild(sw);
+       const isKnifeStat = item.name.includes("★") || item.name.toLowerCase().includes("knife") || item.name.toLowerCase().includes("gloves");
+       const stImg = isKnifeStat ? "https://i.imgur.com/txeWcrS.png" : "https://i.imgur.com/TRtzFCo.png";
+       
+       if (hasItemStickers) {
+            const stOverlay = document.createElement("div");
+            stOverlay.style.cssText = "position: absolute; bottom: 32px; left: 50%; transform: translateX(-50%); z-index: 2; pointer-events: none;";
+            stOverlay.innerHTML = `<img src="${stImg}" style="width: 64px; height: 64px; object-fit: contain; filter: drop-shadow(0 10px 18px rgba(0,0,0,0.8));">`;
+            spinnerResult.querySelector("#unlocked3dWrapper").appendChild(stOverlay);
+        } else {
+            const sw = document.createElement("div"); sw.className = "sticker-wrapper";
+           sw.innerHTML = `<img src="${stImg}" class="applied-sticker-icon" style="width:120px !important; height:120px !important;">`;
+           unlockedTray.appendChild(sw);
+       }
     }
     (item.stickers || []).forEach(s => {
       const sw = document.createElement("div"); sw.className = "sticker-wrapper";
       sw.setAttribute('data-tooltip', s.name);
-      sw.innerHTML = `<img src="${s.img}" class="applied-sticker-icon" style="width:120px !important; height:120px !important;">`;
+      sw.innerHTML = `<img src="${resolveStickerDisplayImage(s)}" class="applied-sticker-icon" style="width:120px !important; height:120px !important;">`;
       unlockedTray.appendChild(sw);
     });
+    bindInspectStickerHoverTooltips(unlockedTray);
   }
 
   actions.innerHTML = "";
@@ -23190,47 +23931,51 @@ function unused_original_showInspect(item) {
   const pencil = document.getElementById("inspectEditPencil");
   if (pencil) pencil.style.display = "none";
 
-  let containerName = findContainerNameForItem(item);
-  // If still unknown, infer from CASE_CONTENTS_DB like New Item popup
-  if (!containerName || containerName === "Unknown Collection") {
-    try {
-      for (const caseName of Object.keys(CASE_CONTENTS_DB || {})) {
-        const groups = CASE_CONTENTS_DB[caseName];
-        if (!groups) continue;
-        for (const rarityGroup of Object.values(groups)) {
-          if (!Array.isArray(rarityGroup)) continue;
-          if (rarityGroup.some(ci => (ci && String(ci.name || "").trim()) === String(item.name || "").trim())) {
-            containerName = caseName;
-            break;
-          }
-        }
-        if (containerName && containerName !== "Unknown Collection") break;
-      }
-    } catch (e) {}
+  // User requested: Source MUST be a collection and image like Mykel API return
+  // Prioritize API collection metadata (name and image) for the weapon being inspected
+  let containerName = "Inventory";
+  let apiCollectionImg = "";
+
+  const firstColl = (Array.isArray(item.collections) && item.collections.length > 0) ? item.collections[0] : null;
+  if (firstColl) {
+    containerName = firstColl.name || "Inventory";
+    apiCollectionImg = firstColl.image || firstColl.img || "";
+  } else if (item.collection) {
+    if (typeof item.collection === 'object') {
+      containerName = item.collection.name || "Inventory";
+      apiCollectionImg = item.collection.image || item.collection.img || "";
+    } else {
+      containerName = item.collection;
+    }
   }
-  if (!containerName) containerName = "Inventory";
-  // Try to infer from CASE_CONTENTS_DB if still unknown
-  if (!containerName || containerName === "Unknown Collection") {
-    try {
-      for (const caseName of Object.keys(CASE_CONTENTS_DB || {})) {
-        const groups = CASE_CONTENTS_DB[caseName];
-        if (!groups) continue;
-        for (const rarityGroup of Object.values(groups)) {
-          if (!Array.isArray(rarityGroup)) continue;
-          if (rarityGroup.some(ci => (ci && String(ci.name || "").trim()) === String(item.name || "").trim())) {
-            containerName = caseName;
-            break;
+
+  // Fallback to inference if API data is missing
+  if (containerName === "Inventory" || containerName === "Unknown Collection") {
+     containerName = findContainerNameForItem(item);
+     if (containerName === "Unknown Collection") {
+        try {
+          for (const caseName of Object.keys(CASE_CONTENTS_DB || {})) {
+            const groups = CASE_CONTENTS_DB[caseName];
+            if (!groups) continue;
+            for (const rarityGroup of Object.values(groups)) {
+              if (!Array.isArray(rarityGroup)) continue;
+              if (rarityGroup.some(ci => (ci && String(ci.name || "").trim()) === String(item.name || "").trim())) {
+                containerName = caseName;
+                break;
+              }
+            }
+            if (containerName && containerName !== "Inventory") break;
           }
-        }
-        if (containerName && containerName !== "Unknown Collection") break;
-      }
-    } catch (e) {}
+        } catch (e) {}
+     }
   }
 
   rarityEl.textContent = `${rarityName} • ${containerName}`;
   
   if (collectionImg) {
-    collectionImg.src = getDisplayImage({ name: containerName });
+    // If we have a direct API collection image URL, use it; otherwise resolve via helper
+    const finalCollImg = apiCollectionImg || getDisplayImage({ name: containerName });
+    collectionImg.src = finalCollImg;
     collectionImg.style.display = "block";
     collectionImg.style.width = "28px";
     collectionImg.style.height = "28px";
@@ -23247,6 +23992,19 @@ function unused_original_showInspect(item) {
   box.querySelectorAll('.stattrak-overlay-icon').forEach(el => el.remove());
 
   // StatTrak Icon for Inspect is now handled via the virtual sticker push in common population logic
+  
+  // StatTrak Hover Name logic for Inspect
+  if (item.name.includes("StatTrak™")) {
+      const sw = document.createElement("div"); 
+      sw.className = "sticker-wrapper";
+      sw.style.position = "absolute";
+      sw.style.top = "10px";
+      sw.style.left = "10px";
+      sw.style.zIndex = "3000";
+      sw.setAttribute('data-tooltip', 'StatTrak™ Module');
+      sw.innerHTML = `<img src="https://i.imgur.com/TRtzFCo.png" style="width:32px; height:32px; opacity:0;">`; // Invisible trigger for hover
+      spinnerResult.querySelector("#unlocked3dWrapper").appendChild(sw);
+  }
 
   const displayUrl = getStableDisplayImage(item);
   inspectImageEl.src = displayUrl;
@@ -23375,6 +24133,7 @@ function unused_original_showInspect(item) {
   
   // Recalculate blur when opening inspect
   updateModalBlurState();
+  applyInspectBlurSetting();
   
   // Logic: HIDE BACKGROUND IN INSPECT POPUP
   const bgEl = document.getElementById("caseOpeningBg");
@@ -23709,9 +24468,10 @@ function openStorageUnit(unitId) {
   if (!unit) return;
 
   const modal = document.getElementById("storageModal");
-  const totalInside = Array.isArray(unit.contents) ? unit.contents.length : 0;
+  const visibleContents = Array.isArray(unit.contents) ? unit.contents.filter(it => !it?.isDefaultItem) : [];
+  const totalInside = visibleContents.length;
   let totalValueInside = 0;
-  (unit.contents || []).forEach(it => { totalValueInside += getItemValue(it); });
+  visibleContents.forEach(it => { totalValueInside += getItemValue(it); });
 
   document.getElementById("storageTitle").textContent =
     "Storage Unit: " + (unit.nametag || unit.name) +
@@ -23743,7 +24503,12 @@ function renderStorageContents(unit, account) {
   contList.innerHTML = "";
 
   // Inventory available to deposit (top-level only)
-  let depositables = account.items.filter(it => it.id !== unit.id && !it.name.toLowerCase().includes("storage unit"));
+  let depositables = account.items.filter(it =>
+    it.id !== unit.id &&
+    !it.isDefaultItem &&
+    !it.name.toLowerCase().includes("storage unit")
+  );
+  const visibleContents = (unit.contents || []).filter(it => !it?.isDefaultItem);
   
   // Filter depositables by rarity dynamically (user requested behavior)
   if (sortVal !== "all" && sortVal !== "none") {
@@ -23753,7 +24518,7 @@ function renderStorageContents(unit, account) {
   // Sort by value desc for easier selection
   depositables.sort((a, b) => getItemValue(b) - getItemValue(a));
   if (!unit.contents) unit.contents = [];
-  unit.contents.sort((a, b) => getItemValue(b) - getItemValue(a));
+  visibleContents.sort((a, b) => getItemValue(b) - getItemValue(a));
 
   // Helper: create a mini card that moves item into the storage unit on click (with confirmation)
   const createDepositCard = (it) => {
@@ -23834,7 +24599,7 @@ function renderStorageContents(unit, account) {
   });
 
   // Populate right side (inside container) with withdrawable items
-  (unit.contents || []).forEach(it => {
+  visibleContents.forEach(it => {
     const card = createWithdrawCard(it);
     contList.appendChild(card);
   });
@@ -23901,30 +24666,38 @@ function addRandomCheapItem() {
  */
 function stopAnimationAndShowWinner() {
   try {
-    // Quick open (ESC): show "New Item" popup immediately instead of the "Unlocked" reveal
     if (typeof window._caseRevealNow === "function") {
       try {
         if (window._caseRevealTimer) clearTimeout(window._caseRevealTimer);
         if (window._caseStartTimer) clearTimeout(window._caseStartTimer);
       } catch (e) { }
 
-      // Hide all case modals and skip straight to Items Earned popup
-      document.getElementById("caseOpeningModal").classList.add("hidden");
-      document.getElementById("caseConfirmModal").classList.add("hidden");
-      
-      // Perform the reveal logic (adds items to account) but skip the DOM display
       const originalReveal = window._caseRevealNow;
-      window._caseRevealNow = null; // Prevent re-entry
-      
-      // Execute the actual logic part of revealNow but manually suppress the popup if possible
-      // In this specific structure, just calling it and then hiding result works
-      originalReveal();
-      
-      setTimeout(() => {
-        document.getElementById("caseOpeningModal").classList.add("hidden");
-        showGroupedPurchaseResult();
-      }, 50);
+      window._caseRevealNow = null;
+      window._caseQuickOpenPending = true;
 
+      try {
+        const openingModal = document.getElementById("caseOpeningModal");
+        const spinner = document.getElementById("caseOpeningSpinner");
+        const resultArea = document.getElementById("caseOpeningResult");
+        const actions = document.getElementById("caseOpeningActions");
+        if (openingModal) openingModal.classList.remove("hidden");
+        if (spinner) spinner.style.display = "none";
+        if (resultArea) {
+          resultArea.style.display = "block";
+          resultArea.innerHTML = `
+            <div style="display:flex; flex-direction:column; align-items:center; justify-content:center; width:100%; min-height:60vh; gap:16px;">
+              <div class="spinner"></div>
+            </div>
+          `;
+        }
+        if (actions) {
+          actions.style.opacity = "0";
+          actions.style.pointerEvents = "none";
+        }
+      } catch (e) {}
+
+      originalReveal();
       return;
     }
 
@@ -23954,7 +24727,6 @@ function stopAnimationAndShowWinner() {
   } catch (e) {
     console.warn("stopAnimationAndShowWinner unexpected error:", e);
   } finally {
-    // ensure flags cleared to avoid re-entrancy
     try { window._caseIsGoldReveal = false; } catch (e) {}
     try { window._caseRevealNow = null; } catch (e) {}
   }
@@ -23964,6 +24736,7 @@ function stopAnimationAndShowWinner() {
 let bidSkinSearch = "";
 let bidSkinPage = 1;
 const BIDSKIN_PAGE_SIZE = 10;
+let skinBidsSessionPurchases = 0;
 
 function openMarketDepositPicker() {
   const account = getActiveAccount();
@@ -23992,6 +24765,7 @@ function openMarketDepositPicker() {
     const equippedSet = new Set(account.equippedItemIds || []);
     account.items
       .filter(it => {
+         if (it.isDefaultItem) return false;
          if (equippedSet.has(it.id)) return false;
          const n = it.name.toLowerCase();
          const t = (it.type || "").toLowerCase();
@@ -24055,11 +24829,12 @@ function openMarketDepositPicker() {
                 marketPrice: finalPrice * 1.2,
                 discountPercent: 0,
                 nametag: it.nametag,
-                stickers: JSON.parse(JSON.stringify(it.stickers || [])),
+                stickers: sanitizeSkinBidsListingStickers(it, JSON.parse(JSON.stringify(it.stickers || []))),
                 wear: wearSelect.value,
                 float: floatInput.value,
                 pattern: parseInt(patternInput.value) || 0,
                 floatRank: parseInt(document.getElementById("editMarketFloatRank")?.value) || 0,
+                stickerValueIncluded: true,
                 isSpecial: it.name.includes("★") || (it.type || "").toLowerCase().includes("knife")
               });
 
@@ -24172,9 +24947,13 @@ function openBidSkinMarket(forceRefresh = false) {
         return queryWords.every(word => haystack.includes(word));
       });
 
-    const currentSort = state.bidSkinSort || "none";
+    const currentSort = state.bidSkinSort || "type";
     const currentSort2 = state.bidSkinSort2 || "none";
-    let sortedPool = filtered.filter(l => passesSkinBidsListingFilter(l, currentSort));
+
+    let sortedPool = filtered;
+    if (currentSort === "rarityRestricted") sortedPool = filtered.filter(l => getSkinBidsListingRarity(l).toLowerCase().includes("restricted"));
+    else if (currentSort === "rarityClassified") sortedPool = filtered.filter(l => getSkinBidsListingRarity(l).toLowerCase().includes("classified"));
+    else if (currentSort === "rarityCovert") sortedPool = filtered.filter(l => getSkinBidsListingRarity(l).toLowerCase().includes("covert"));
 
     const applySelectedSort = (pool, s) => {
         if (s === "priceAsc") pool.sort((a,b) => a.price - b.price);
@@ -24187,6 +24966,7 @@ function openBidSkinMarket(forceRefresh = false) {
         } else if (s === "floatAsc") pool.sort((a,b) => getListingFloatValue(a) - getListingFloatValue(b));
         else if (s === "floatDesc") pool.sort((a,b) => getListingFloatValue(b) - getListingFloatValue(a));
         else if (s === "name") pool.sort((a,b) => a.item.name.localeCompare(b.item.name));
+        else if (s === "type") pool.sort((a,b) => (a.item.type || "").localeCompare(b.item.type || ""));
     };
 
     applySelectedSort(sortedPool, currentSort);
@@ -24239,14 +25019,17 @@ function openBidSkinMarket(forceRefresh = false) {
       float: options.floatVal,
       floatVal: options.floatVal
     });
+    const listingName = options.name || pick.name;
     const baseListingPrice = clampCaseHardenedPrice(pick.name, PRICE_FIXES[pick.name] || mockPrice(pick));
-    const marketPrice = Math.max(0.03, baseListingPrice * (options.marketMult || 1.08));
-    const price = Math.max(0.02, clampCaseHardenedPrice(options.name || pick.name, marketPrice * (options.priceMult || 0.92)));
+    const sanitizedListingStickers = sanitizeSkinBidsListingStickers({ item: { ...pick, name: listingName } }, isActuallySpecial ? [] : (options.stickers || []));
+    const stickerValue = sanitizedListingStickers.reduce((sum, sticker) => sum + (sticker?.price || 0), 0);
+    const marketPrice = Math.max(0.03, (baseListingPrice * (options.marketMult || 1.08)) + stickerValue);
+    const price = Math.max(0.02, clampCaseHardenedPrice(listingName, marketPrice * (options.priceMult || 0.92)));
     state.bidSkinListings.push({
       id: "bs_" + Math.random().toString(36).substr(2, 9),
       item: {
         ...pick,
-        name: options.name || pick.name,
+        name: listingName,
         rarity: { name: options.rarity || pick.rarity?.name || "High Grade" },
         floatVal: options.floatVal ?? (listingWear ? generateFloatForWear(pick.name, listingWear, pick.rarity?.name) : null),
         pattern: options.pattern ?? null,
@@ -24258,11 +25041,12 @@ function openBidSkinMarket(forceRefresh = false) {
       marketPrice,
       price,
       discountPercent: Math.max(0, Math.round((1 - (price / marketPrice)) * 100)),
-      nametag: (isStickerNamedItem(options.name || pick.name) || isActuallySpecial) ? null : (options.nametag || null),
-      stickers: isActuallySpecial ? [] : (options.stickers || []),
+      nametag: (isStickerNamedItem(listingName) || isActuallySpecial) ? null : (options.nametag || null),
+      stickers: sanitizedListingStickers,
       wear: listingWear,
       float: options.floatVal != null ? Number(options.floatVal).toFixed(12) : null,
       pattern: options.pattern ?? null,
+      stickerValueIncluded: true,
       isSpecial: isActuallySpecial,
       prevOwners: options.prevOwners || (Math.floor(Math.random() * 6) + 1)
     });
@@ -24331,6 +25115,7 @@ function openBidSkinMarket(forceRefresh = false) {
   }
 
   let modal = document.getElementById("bidSkinModal");
+  const openingFreshSkinBidsSession = !modal || modal.classList.contains("hidden");
   if (!modal) {
     modal = document.createElement("div");
     modal.id = "bidSkinModal";
@@ -24338,6 +25123,7 @@ function openBidSkinMarket(forceRefresh = false) {
     modal.style.zIndex = 3000;
     document.body.appendChild(modal);
   }
+  if (openingFreshSkinBidsSession) skinBidsSessionPurchases = 0;
 
   if (!allSkins.length) {
     // If empty on refresh, try loading from cache before alert
@@ -24385,11 +25171,34 @@ function openBidSkinMarket(forceRefresh = false) {
 
   modal.classList.remove("hidden");
 
+  const updateSkinBidsHeaderStats = () => {
+    const activeAcc = getActiveAccount();
+    const walletText = document.getElementById("bsWalletText");
+    const sessionText = document.getElementById("bsSessionText");
+    if (walletText && activeAcc) walletText.textContent = `Wallet: ${formatPrice(activeAcc.walletBalance)}`;
+    if (sessionText) sessionText.textContent = `Session Purchases: ${skinBidsSessionPurchases}`;
+  };
+
   // Robust Doppler Synchronization for Market Listings
   if (Array.isArray(state.bidSkinListings) && state.bidSkinListings.length) {
     let mutatedBidSkinListings = false;
     state.bidSkinListings.forEach(listing => {
       if (!listing || !listing.item) return;
+      const sanitizedListingStickers = sanitizeSkinBidsListingStickers(listing, listing.stickers);
+      if (JSON.stringify(sanitizedListingStickers) !== JSON.stringify(listing.stickers || [])) {
+        listing.stickers = sanitizedListingStickers;
+        mutatedBidSkinListings = true;
+      }
+      if (!listing.stickerValueIncluded && !String(listing.id || "").startsWith("bs_user_")) {
+        const stickerValue = sanitizedListingStickers.reduce((sum, sticker) => sum + (sticker?.price || 0), 0);
+        if (stickerValue > 0) {
+          listing.price = Math.max(0.02, Number((Number(listing.price || 0) + stickerValue).toFixed(2)));
+          listing.marketPrice = Math.max(listing.price, Number((Number(listing.marketPrice || 0) + stickerValue).toFixed(2)));
+          listing.discountPercent = Math.max(0, Math.round((1 - (listing.price / Math.max(listing.marketPrice, 0.01))) * 100));
+        }
+        listing.stickerValueIncluded = true;
+        mutatedBidSkinListings = true;
+      }
       const itemName = String(listing.item.name || "").toLowerCase();
       if (!itemName.includes("doppler")) return;
 
@@ -24591,7 +25400,7 @@ function openBidSkinMarket(forceRefresh = false) {
                   scratchPercent: 0
               });
           }
-      } else if (isWeaponOnly && !isSpecial(pick) && (Math.random() < 0.05)) {
+      } else if (isWeaponOnly && !isSpecial(pick) && (Math.random() < 0.4)) {
         // Frequency of stickers on market weapons (1-5 stickers)
         const isKatoCombo = Math.random() < 0.001; // Further reduced frequency of 4x Kato crafts
         const sCountRoll = Math.random();
@@ -24623,6 +25432,10 @@ function openBidSkinMarket(forceRefresh = false) {
             if (isKatoCombo && Math.random() < 0.004 && crownFoilLocal) s = crownFoilLocal;
             
             if (s && !s.name.toLowerCase().includes("capsule")) {
+              const snLower = s.name.toLowerCase();
+              if (snLower.includes("sticker slab") && stickers.some(st => st.name.toLowerCase().includes("sticker slab"))) {
+                  continue; // Skip if we already have one slab
+              }
               const sRarity = s.rarity?.name || s.rarity || "High Grade";
               stickers.push({ 
                 name: s.name, 
@@ -24661,9 +25474,10 @@ function openBidSkinMarket(forceRefresh = false) {
 
       const finalFloatValue = floatMin + (Math.random() * (floatMax - floatMin));
 
+      const sanitizedListingStickers = sanitizeSkinBidsListingStickers({ item: { ...pick, name: finalListingName } }, isSpecial(pick) ? [] : stickers);
       const wearMult = WEAR_PRICE_MODS[finalWear] || 1;
       const priceVar = 0.85 + (Math.random() * 0.3);
-      const stickerValue = stickers.reduce((sum, s) => sum + s.price, 0);
+      const stickerValue = sanitizedListingStickers.reduce((sum, s) => sum + (s.price || 0), 0);
       const baseMarketP = clampCaseHardenedPrice(pick.name, PRICE_FIXES[pick.name] || mockPrice(pick)) * wearMult * priceVar;
       const marketPrice = baseMarketP + stickerValue;
       const discount = 0.8 + (Math.random() * 0.35);
@@ -24728,10 +25542,11 @@ function openBidSkinMarket(forceRefresh = false) {
         price: finalListingPrice,
         discountPercent: Math.max(0, Math.round((1 - (finalListingPrice / finalMarketPrice)) * 100)),
         nametag: (isActuallySpecial || isStickerNamedItem(pick) || isStickerNamedItem(finalListingName) || !isWeaponOnly || Math.random() >= 0.18) ? null : getUniqueBotNametag(),
-        stickers: isActuallySpecial ? [] : stickers,
+        stickers: sanitizeSkinBidsListingStickers({ item: { ...pick, name: finalListingName } }, isActuallySpecial ? [] : sanitizedListingStickers),
         wear: finalWear,
         float: finalFloatValue.toFixed(12),
         pattern: stablePattern,
+        stickerValueIncluded: true,
         isSpecial: isActuallySpecial,
         prevOwners: Math.floor(Math.random() * 10) + 1
       });
@@ -24966,7 +25781,8 @@ function openBidSkinMarket(forceRefresh = false) {
         <div style="padding: 20px 25px 0 25px; text-align: left; display:flex; align-items:center; gap:20px;">
           <h2 style="color: #f59e0b; font-size: 24px; margin:0; font-family: 'Arial Black', sans-serif;">SkinBids.com Market</h2>
           <div style="display:flex; align-items:center; gap:12px;">
-             <div style="color:#a4d007; font-weight:900; font-size:18px; white-space:nowrap;">Wallet: ${formatPrice(acc.walletBalance)}</div>
+             <div id="bsWalletText" style="color:#a4d007; font-weight:900; font-size:18px; white-space:nowrap;">Wallet: ${formatPrice(acc.walletBalance)}</div>
+             <div id="bsSessionText" style="color:#94a3b8; font-weight:800; font-size:15px; white-space:nowrap;">Session Purchases: ${skinBidsSessionPurchases}</div>
           </div>
         </div>
 
@@ -24980,15 +25796,16 @@ function openBidSkinMarket(forceRefresh = false) {
             const displayItem = { ...l.item, name: displayName, skinBidsApiName: rawApiName, wear: l.wear, pattern: getListingPatternValue(l), floatVal: getListingFloatValue(l) };
             
             const displayImageSrc = getExactApiImage(displayItem) || l.item.image || l.item.img || getStableDisplayImage(displayItem);
-            const displayStickers = Array.isArray(l.stickers) ? l.stickers : [];
+            const displayStickers = getSkinBidsDisplayStickers(l);
             const displayNametag = isStickerNamedItem(displayItem) ? null : l.nametag;
+            
             const dataPayload = JSON.stringify({
                ...displayItem,
                price: l.price,
                rarity: lRarity,
-               source: "BidSkin Listing",
-               nametag: displayNametag,
-               stickers: l.stickers,
+               source: "SkinBids Listing",
+                nametag: displayNametag,
+               stickers: displayStickers,
                pattern: getListingPatternValue(l),
                float: getListingFloatValue(l).toFixed(12),
                floatVal: getListingFloatValue(l),
@@ -25028,10 +25845,10 @@ function openBidSkinMarket(forceRefresh = false) {
                 <div style="margin-top:10px; text-align:left; min-height:95px;">
                   <div style="font-size:13px; font-weight:900; ${getSpecialMarketNameStyle(displayName)} white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${displayName}</div>
                   ${displayNametag ? `<div style="color:#eb4b4b; font-size:11px; font-weight:800;">"${displayNametag}"</div>` : ''}
-                  ${hasFloatStats ? `<div style="font-size:10px; color:#94a3b8; margin-top:4px;">Wear: <span style="color:#fff">${l.wear}</span> • Float: <span style="color:#66c0f4; font-weight:800;">${floatVal.toFixed(12)}</span></div>` : `<div style="font-size:10px; color:#94a3b8; margin-top:4px;">No float / wear stats</div>`}
-                  ${hasFloatStats ? `<div style="font-size:10px; color:#66c0f4; margin-top:2px; font-weight:800;">Pattern: ${patternVal}</div>` : ``}
+                  <div style="font-size:10px; color:#94a3b8; margin-top:4px;">Exterior: <span style="color:#fff;">${l.wear || 'N/A'}</span></div>
+                  <div style="font-size:10px; color:#94a3b8; margin-top:2px;">Float: <span style="color:#fff;">${floatVal.toFixed(9)}</span></div>
+                  ${hasFloatStats ? `<div style="font-size:10px; color:#66c0f4; margin-top:4px; font-weight:800;">Pattern: ${patternVal}</div>` : `<div style="font-size:10px; color:#94a3b8; margin-top:4px;">No pattern stats</div>`}
                   ${hasFloatStats ? `<div class="float-bar-container" style="width:100%; margin-top:10px; height:10px; background:rgba(0,0,0,0.35); border-radius:6px; position:relative;"><div class="float-bar" style="height: 10px; border-radius:6px; background: linear-gradient(to right, #5ebdf4 0%, #5ebdf4 7%, #a4cf47 7%, #a4cf47 15%, #e4ae39 15%, #e4ae39 38%, #eb9b34 38%, #eb9b34 45%, #eb4b4b 45%, #eb4b4b 100%);"></div><div class="float-indicator-line" style="left: ${barPos}%; position: absolute; top: -2px; width: 3px; height: 14px; background: #fff; border: 1px solid #000; transform: translateX(-50%); z-index: 10;"></div></div>` : ``}
-                  ${hasFloatStats ? `<div style="font-size:10px; color:#cbd5e1; margin-top:5px; text-align:center; font-family:monospace;">${floatVal.toFixed(12)}</div>` : ``}
                 </div>
                 <div style="display:flex; justify-content:space-between; align-items:center; margin-top:12px;">
                   <div style="display:flex; flex-direction:column;">
@@ -25051,14 +25868,22 @@ function openBidSkinMarket(forceRefresh = false) {
         <div class="market-footer">
           <input type="text" id="bsSearch" class="steam-input" placeholder="Search..." style="flex:1.5;" value="${bidSkinSearch}">
           <select id="bsSort" class="steam-select" style="flex:1;">
-            <option value="none" ${state.bidSkinSort === 'none' ? 'selected' : ''}>Sort Type</option>
+            <option value="type" ${state.bidSkinSort === 'type' ? 'selected' : ''}>Sort Type: Category</option>
             <option value="priceAsc" ${state.bidSkinSort === 'priceAsc' ? 'selected' : ''}>Price: Lowest</option>
             <option value="priceDesc" ${state.bidSkinSort === 'priceDesc' ? 'selected' : ''}>Price: Highest</option>
-            <option value="discount" ${state.bidSkinSort === 'discount' ? 'selected' : ''}>Highest Discount</option>
             <option value="floatAsc" ${state.bidSkinSort === 'floatAsc' ? 'selected' : ''}>Float: Lowest</option>
             <option value="floatDesc" ${state.bidSkinSort === 'floatDesc' ? 'selected' : ''}>Float: Highest</option>
-            <option value="mostStickers" ${state.bidSkinSort === 'mostStickers' ? 'selected' : ''}>Most Stickers</option>
-            <option value="quality" ${state.bidSkinSort === 'quality' ? 'selected' : ''}>Quality</option>
+            <option value="rarityCovert" ${state.bidSkinSort === 'rarityCovert' ? 'selected' : ''}>Covert First</option>
+            <option value="rarityClassified" ${state.bidSkinSort === 'rarityClassified' ? 'selected' : ''}>Classified First</option>
+            <option value="rarityRestricted" ${state.bidSkinSort === 'rarityRestricted' ? 'selected' : ''}>Restricted First</option>
+          </select>
+
+          <select id="bsSort2" class="steam-select" style="flex:1;">
+             <option value="none" ${state.bidSkinSort2 === 'none' ? 'selected' : ''}>Secondary Sort</option>
+             <option value="priceAsc" ${state.bidSkinSort2 === 'priceAsc' ? 'selected' : ''}>Price: Lowest</option>
+             <option value="priceDesc" ${state.bidSkinSort2 === 'priceDesc' ? 'selected' : ''}>Price: Highest</option>
+             <option value="floatAsc" ${state.bidSkinSort2 === 'floatAsc' ? 'selected' : ''}>Float: Lowest</option>
+             <option value="floatDesc" ${state.bidSkinSort2 === 'floatDesc' ? 'selected' : ''}>Float: Highest</option>
           </select>
           <button class="steam-btn highlight" id="bsAddBalance">Deposit Funds</button>
           <button class="steam-btn highlight" id="bsAddBtn">List Item</button>
@@ -25123,6 +25948,8 @@ function openBidSkinMarket(forceRefresh = false) {
       saveState();
       renderGridOnly();
     };
+
+    updateSkinBidsHeaderStats();
   };
 
   const renderGridOnly = () => {
@@ -25152,7 +25979,7 @@ function openBidSkinMarket(forceRefresh = false) {
         const displayItem = { ...l.item, name: displayName, wear: l.wear, pattern: patternVal, floatVal: floatVal };
         // Ensure variety in paginated render
         const displayImageSrc = l.item.image || l.item.img || getStableDisplayImage(displayItem);
-        const displayStickers = Array.isArray(l.stickers) ? l.stickers : [];
+        const displayStickers = getSkinBidsDisplayStickers(l);
         const displayNametag = isStickerNamedItem(displayItem) ? null : l.nametag;
         const dataPayload = JSON.stringify({
            ...l.item,
@@ -25161,7 +25988,7 @@ function openBidSkinMarket(forceRefresh = false) {
            rarity: lRarity,
            source: "BidSkin Listing",
            nametag: displayNametag,
-           stickers: l.stickers,
+           stickers: displayStickers,
            pattern: patternVal,
            float: floatVal.toFixed(12),
            floatVal: floatVal,
@@ -25186,16 +26013,16 @@ function openBidSkinMarket(forceRefresh = false) {
               </div>` : ``}
               ${l.discountPercent > 0 ? `<div style="position:absolute; top:8px; left:8px; background:#eb4b4b; color:#fff; font-size:11px; padding:2px 6px; font-weight:900; border-radius:4px;">-${l.discountPercent}%</div>` : ''}
             </div>
-            <div style="margin-top:10px; text-align:left; min-height:85px;">
+            <div style="margin-top:10px; text-align:left; min-height:98px;">
               <div style="font-size:13px; font-weight:900; ${getSpecialMarketNameStyle(displayName)} white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${displayName}</div>
               ${displayNametag ? `<div style="color:${isSouvenir ? '#ffd700' : '#eb4b4b'}; font-size:11px; font-weight:800;">"${displayNametag}"</div>` : ''}
-              <div style="font-size:10px; color:#94a3b8; margin-top:4px;">Wear: <span style="color:#fff">${l.wear}</span> • Float: <span style="color:#66c0f4">${floatVal.toFixed(12)}</span></div>
-              <div style="font-size:10px; color:#66c0f4; margin-top:2px; font-weight:800;">Pattern: ${patternVal}</div>
+              <div style="font-size:10px; color:#94a3b8; margin-top:4px;">Exterior: <span style="color:#fff;">${l.wear || 'N/A'}</span></div>
+              <div style="font-size:10px; color:#94a3b8; margin-top:2px;">Float: <span style="color:#fff;">${floatVal.toFixed(9)}</span></div>
+              <div style="font-size:10px; color:#66c0f4; margin-top:4px; font-weight:800;">Pattern: ${patternVal}</div>
               <div style="width:100%; height:10px; background:rgba(0,0,0,0.35); border-radius:6px; margin-top:6px; position:relative;">
                  <div style="height:10px; border-radius:6px; background: linear-gradient(to right, #5ebdf4 0%, #5ebdf4 7%, #a4cf47 7%, #a4cf47 15%, #e4ae39 15%, #e4ae39 38%, #eb9b34 38%, #eb9b34 45%, #eb4b4b 45%, #eb4b4b 100%);"></div>
                  <div style="position:absolute; left:${barPos}%; top:-2px; width:4px; height:14px; background:#fff; border:1px solid #000; transform:translateX(-50%); border-radius:2px;"></div>
               </div>
-              <div style="font-size:10px; color:#cbd5e1; margin-top:5px; text-align:center; font-family:monospace;">${floatVal.toFixed(12)}</div>
             </div>
             <div style="display:flex; justify-content:space-between; align-items:center; margin-top:8px;">
               <div style="display:flex; flex-direction:column;">
@@ -25210,6 +26037,8 @@ function openBidSkinMarket(forceRefresh = false) {
           </div>
         `;
     }).join('');
+
+    updateSkinBidsHeaderStats();
 
   };
 
@@ -25334,7 +26163,7 @@ function openBidSkinMarket(forceRefresh = false) {
        listing.float = overlay.querySelector("#edFloat").value;
        listing.pattern = parseInt(overlay.querySelector("#edPattern").value) || 0;
        listing.floatRank = parseInt(overlay.querySelector("#editMarketFloatRank")?.value) || 0;
-       listing.stickers = tempStickers.filter(Boolean);
+       listing.stickers = sanitizeSkinBidsListingStickers(listing, tempStickers.filter(Boolean));
        
        saveState();
        renderModal();
@@ -25396,7 +26225,7 @@ function openBidSkinMarket(forceRefresh = false) {
         username: acc.name,
         pfp: acc.pfp,
         timestamp: Date.now(),
-        stickers: l.stickers,
+        stickers: getSkinBidsDisplayStickers(l),
         wear: l.wear,
         floatVal: getListingFloatValue(l),
         pattern: getListingPatternValue(l),
@@ -25412,7 +26241,7 @@ function openBidSkinMarket(forceRefresh = false) {
         nametag: l.nametag,
         floatRank: l.floatRank || 0,
         // Ensure market items are never scratched
-        stickers: Array.isArray(l.stickers) ? l.stickers.map(s => ({...s, scratchPercent: 0})) : [],
+        stickers: getSkinBidsDisplayStickers(l).map(s => ({...s, scratchPercent: 0})),
         image: getStableDisplayImage(l.item), // Use synced wear image
         img: getStableDisplayImage(l.item),
         wear: l.wear,
@@ -25431,11 +26260,13 @@ function openBidSkinMarket(forceRefresh = false) {
           state.pinnedListingIds = state.pinnedListingIds.filter(x => x !== id);
       }
 
+      skinBidsSessionPurchases += 1;
       bsConfirmModal.remove();
       saveState();
       refreshInventoryView();
       updateWalletDisplay();
-      openBidSkinMarket();
+      renderGridOnly();
+      updateSkinBidsHeaderStats();
       if (gridEl) gridEl.scrollTop = currentScroll;
       showGroupedPurchaseResult();
     };
@@ -25645,6 +26476,8 @@ function openLoadoutPicker(side, slotId, typeFilter) {
 
   const pool = account.items.filter(it => {
     if (it.isDefaultItem) return false;
+    const isFav = Array.isArray(state.favoriteItemIds) && state.favoriteItemIds.includes(it.id);
+    if (isFav) return false; // Hide favorites from pickers per request
     const n = (it.name || "").toLowerCase();
     const t = (it.type || it.category?.name || "").toLowerCase();
     const hasKnifeStar = n.includes("★") || n.includes("â˜…");
@@ -25839,7 +26672,7 @@ function openDatabaseModal() {
             <tr>
               <th style="padding: 10px;">Weapon</th>
               <th style="padding: 10px;">Identity</th>
-              <th style="padding: 10px;">Float / Pattern</th>
+              <th style="padding: 10px;">Float / Wear</th>
               <th style="padding: 10px;">Loadout</th>
               <th style="padding: 10px;">Owner</th>
             </tr>
@@ -25902,30 +26735,29 @@ function openDatabaseModal() {
       const dupeItems = allUserItems.filter(x => x.floatVal === it.floatVal && x.name === it.name);
       const isDupe = dupeItems.length > 1;
       const stickerVal = getStickerValueTotal(it);
-
-      // Pattern can sometimes be an object from ByMykel if not cast correctly
-      const patternNum = (typeof it.pattern === 'object' && it.pattern !== null) ? (it.pattern.id || 0) : (it.pattern || 0);
+      const itemFloat = (typeof it.floatVal === 'number') ? it.floatVal : (parseFloat(it.float) || 0);
+      const itemWear = it.wear || "N/A";
 
       tr.innerHTML = `
         <td style="padding: 10px;"><img src="${getStableDisplayImage(it)}" style="width: 85px; height: 60px; object-fit: contain;"></td>
         <td style="padding: 10px;">
           <div style="font-weight: 800; font-size: 13px; color: ${it.nametag ? '#eb4b4b' : (RARITY_COLORS[rarityName] || '#fff')}">${it.nametag ? '"'+it.nametag+'"' : it.name}</div>
-          <div style="font-size: 10px; color: #94a3b8;">${it.nametag ? it.name : (it.wear || '')}</div>
+          <div style="font-size: 10px; color: #94a3b8;">${it.nametag ? it.name : ''}</div>
           ${isDupe ? `<div style="color: #facc15; font-size: 9px; font-weight: 900; margin-top: 4px; background: rgba(250, 204, 21, 0.1); padding: 2px 5px; border-radius: 4px; display: inline-block;">DUPE FOUND (${dupeItems.length})</div>` : ""}
         </td>
         <td style="padding: 10px; font-size:12px;">
-          <div style="color: #fff; font-family: monospace;">${formatFloat(it.floatVal)}</div>
-          ${!state.hidePrices ? `
-            <div style="color:#a4d007;font-weight:900;font-size:12px;margin-top:2px;">${formatPrice(getItemValue(it))}</div>
-            ${stickerVal > 0 ? `<div style="color:#66c0f4;font-size:10px;font-weight:800;">Stickers: ${formatPrice(stickerVal)}</div>` : ''}
-          ` : ''}
-          <div style="color: #64748b;">Seed Pattern: ${patternNum}</div>
+          <div style="color:#66c0f4;font-weight:900;font-size:12px;margin-top:2px;">Float: ${itemFloat.toFixed(9)}</div>
+          <div style="color:#64748b;">Wear: ${itemWear}</div>
         </td>
         <td style="padding: 10px;">${stickersHtml || '<span style="color:#475569;font-size:10px;">None</span>'}</td>
         <td style="padding: 10px;">
           <div style="display: flex; align-items: center; gap: 8px;">
             <img src="${it.ownerPfp || 'https://i.imgur.com/zFydkgL.png'}" style="width: 24px; height: 24px; border-radius: 50%;">
-            <span style="font-size: 12px; color: #94a3b8;">${it.ownerName}</span>
+            <div style="display:flex; flex-direction:column;">
+              <span style="font-size: 12px; color: #94a3b8;">${it.ownerName}</span>
+              ${!state.hidePrices ? `<span style="font-size: 11px; color: #a4d007; font-weight: 800;">${formatPrice(getItemValue(it))}</span>` : ''}
+              ${!state.hidePrices && stickerVal > 0 ? `<span style="font-size: 10px; color: #66c0f4;">Stickers: ${formatPrice(stickerVal)}</span>` : ''}
+            </div>
           </div>
         </td>
       `;
@@ -26176,8 +27008,16 @@ function renderTradeInventory() {
  * Nerd Tooltip Logic
  */
 function showNerdTooltip(e, item) {
+  // Fix glitched tooltip by clearing before showing
+  const existing = document.getElementById("nerdTooltip");
+  if (existing) existing.style.display = "none";
+  
   const ctxMenu = document.getElementById("contextMenu");
   if (ctxMenu && !ctxMenu.classList.contains("hidden")) return;
+  if (hasBlockingHoverLayer()) {
+      hideNerdTooltip();
+      return;
+  }
 
   let tooltip = document.getElementById("nerdTooltip");
   if (!tooltip) {
@@ -26191,38 +27031,69 @@ function showNerdTooltip(e, item) {
     tooltip.style.zIndex = "10000";
     tooltip.style.pointerEvents = "none";
     tooltip.style.boxShadow = "0 10px 30px rgba(0,0,0,0.8)";
-    tooltip.style.width = "280px";
+    tooltip.style.width = "320px"; // Widened to prevent cutoff
     tooltip.style.color = "#fff";
     document.body.appendChild(tooltip);
   }
 
-  const rarityName = item.rarity || "Consumer";
+  const rarityName = item.rarity?.name || item.rarity || "Consumer";
   const rColor = RARITY_COLORS[rarityName] || "#fff";
   
   // Resolve source
   let src = item.source || "Inventory";
   if (src.includes("Pulled from ")) src = src.replace("Pulled from ", "");
+  if (/market search/i.test(src)) {
+    src = findContainerNameForItem(item);
+  }
 
   // Fix float value readout for nerd stats (ensure we handle 0 properly and check multiple properties)
   const float = (typeof item.floatVal === 'number') ? item.floatVal : (parseFloat(item.float) || 0);
   const barPercent = Math.min(100, Math.max(0, float * 100));
+  const wearLabel = item.wear || "N/A";
+  const previewCaseName = resolvePreviewCaseNameForItem(item);
+  let previewContents = (item.contains || item.contains_rare) ? buildCaseContentsFromApi(item) : null;
+  if (!previewContents) previewContents = resolveCaseContentsData(previewCaseName);
+  
+  const isCaseLike = /case|capsule|package|collection|terminal/i.test(String(item?.name || ""));
+  const showContents = !!previewContents && (isContainer(item) || isKeyItem(item) || isStickerCapsuleItem(item) || isCaseLike);
+  const rarityOrder = ["Base Grade", "Consumer", "Industrial", "Mil-Spec", "Restricted", "Classified", "Covert", "Gold", "High Grade", "Remarkable", "Exotic", "Extraordinary"];
+  const contentsHtml = showContents ? `
+    <div style="border-top: 1px solid rgba(255,255,255,0.05); padding-top: 10px; margin-top: 8px;">
+      <div style="font-size: 11px; margin-bottom: 6px; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.5px;">Contents: <strong style="color:#fff">${previewCaseName}</strong></div>
+      <div style="max-height: none; overflow: visible; display:flex; flex-direction:column; gap:2px; padding-right:4px;">
+        ${Object.keys(previewContents || {})
+          .sort((a, b) => {
+            const ia = rarityOrder.indexOf(a);
+            const ib = rarityOrder.indexOf(b);
+            return (ia === -1 ? 999 : ia) - (ib === -1 ? 999 : ib);
+          })
+          .map(rarity => {
+            if (rarity === "Gold") {
+              return `<div style="font-size:11px; color:#ffca00; font-weight:900; margin: 4px 0; text-transform: uppercase; text-shadow: 0 0 8px rgba(255,202,0,0.5);">★ Contains Rare Special Items</div>`;
+            }
+            return (previewContents[rarity] || []).map(entry => {
+              const rarityNameLocal = normalizeRarityName(entry, entry?.rarity?.name || entry?.rarity || rarity);
+              const color = RARITY_COLORS[rarityNameLocal] || "#fff";
+              return `<div style="font-size:10px; color:${color}; white-space:normal; overflow:visible; word-break:break-word; line-height: 1.1;">${escapeHtml(entry.name || "Item")}</div>`;
+            }).join("");
+          })
+          .join("")}
+      </div>
+    </div>
+  ` : "";
 
-  const wear = item.wear || "Factory New";
   const priceHtml = state.hidePrices ? "" : `<div style="font-size: 12px; margin-bottom: 4px; color: #94a3b8;">Price: <strong style="color:#a4d007">${formatPrice(getItemValue(item))}</strong></div>`;
 
   tooltip.innerHTML = `
-    <div style="font-weight: 900; font-size: 16px; margin-bottom: 8px; color: ${rColor}">${item.name}</div>
+    <div style="font-weight: 900; font-size: 16px; margin-bottom: 8px; color: ${rColor}; white-space:normal; word-break:break-word;">${item.name}</div>
     <div style="font-size: 12px; margin-bottom: 4px; color: #94a3b8;">Source: <strong style="color:#fff">${src}</strong></div>
     <div style="font-size: 12px; margin-bottom: 4px; color: #94a3b8;">Rarity: <strong style="color:${rColor}">${rarityName}</strong></div>
-    <div style="font-size: 12px; margin-bottom: 4px; color: #94a3b8;">Wear: <strong style="color:#fff">${wear}</strong></div>
     ${priceHtml}
-    
-    ${!isContainer(item) ? `
+    ${contentsHtml}
+    ${(!isContainer(item) && !isKeyItem(item)) ? `
       <div style="border-top: 1px solid rgba(255,255,255,0.05); padding-top: 10px; margin-top: 5px;">
-        <div style="display:flex; justify-content:space-between; font-size: 11px; margin-bottom:4px;">
-          <span style="color:#94a3b8;">Float Value</span>
-          <span style="font-weight:800; color:#fff;">${formatFloat(float)}</span>
-        </div>
+        <div style="font-size: 12px; margin-bottom: 4px; color: #94a3b8;">Wear: <strong style="color:#fff">${wearLabel}</strong></div>
+        <div style="font-size: 12px; margin-bottom: 6px; color: #94a3b8;">Float: <strong style="color:#fff">${float.toFixed(9)}</strong></div>
         <div class="float-bar-container" style="width:100%; margin: 5px 0;">
            <div class="float-arrow" style="left: ${barPercent}%; top: -2px; font-size: 8px;">▼</div>
            <div class="float-bar" style="height: 5px;"></div>
@@ -26233,8 +27104,12 @@ function showNerdTooltip(e, item) {
 
   tooltip.style.display = "block";
   const updatePos = (ev) => {
-    tooltip.style.left = (ev.clientX + 15) + "px";
-    tooltip.style.top = (ev.clientY + 15) + "px";
+    if (hasBlockingHoverLayer()) {
+      hideNerdTooltip();
+      return;
+    }
+    const target = ev.target.closest(".inv-item") || ev.target;
+    positionInventoryAnchoredPopup(target, tooltip, 280);
   };
   updatePos(e);
   window._lastNerdMove = updatePos;
@@ -26263,16 +27138,16 @@ function createTradeCard(item, onClick) {
     align-items: center;
     justify-content: center;
     position: relative;
-    border-radius: 0;
-    padding: 10px;
+    border-radius: 6px;
+    padding: 8px 8px 12px 8px;
     cursor: pointer;
-    overflow: visible;
+    overflow: hidden;
     box-sizing: border-box;
   `;
 
   const img = document.createElement("img");
   img.src = getStableDisplayImage(item);
-  img.style.cssText = "width: 100%; height: 100%; object-fit: contain; filter: drop-shadow(0 4px 6px rgba(0,0,0,0.5));";
+  img.style.cssText = "width: 124%; height: 124%; object-fit: contain; filter: drop-shadow(0 4px 6px rgba(0,0,0,0.5));";
   div.appendChild(img);
 
   // Overlay metadata logic
@@ -26286,23 +27161,23 @@ function createTradeCard(item, onClick) {
     }
 
     // Stickers bottom left
-    const stickers = Array.isArray(item.stickers) ? item.stickers : [];
+    const stickers = normalizeAppliedStickerList(item.stickers || [], { maxCount: 5 });
     if (stickers.length > 0 || (item.name && item.name.includes("StatTrak"))) {
       const stickerTray = document.createElement("div");
-      stickerTray.style.cssText = "position: absolute; bottom: 4px; left: 4px; display: flex; gap: 2px; z-index: 10;";
+      stickerTray.style.cssText = "position: absolute; bottom: 4px; left: 4px; display: flex; gap: 2px; z-index: 10; flex-wrap: wrap; max-width: calc(100% - 8px); align-items: center;";
       
       if (item.name.includes("StatTrak")) {
         const isKnife = item.name.includes("★") || item.name.toLowerCase().includes("knife");
         const stIcon = document.createElement("img");
         stIcon.src = isKnife ? "https://i.imgur.com/txeWcrS.png" : "https://i.imgur.com/TRtzFCo.png";
-        stIcon.style.cssText = "width:14px; height:14px; object-fit:contain;";
+        stIcon.style.cssText = "width:10px; height:10px; object-fit:contain;";
         stickerTray.appendChild(stIcon);
       }
 
       stickers.slice(0, 5).forEach(s => {
         const sImg = document.createElement("img");
         sImg.src = s.img;
-        sImg.style.cssText = "width:14px; height:14px; object-fit:contain; background:rgba(0,0,0,0.2); border-radius:2px;";
+        sImg.style.cssText = "width:8px; height:8px; object-fit:contain; background:rgba(0,0,0,0.2); border-radius:2px;";
         stickerTray.appendChild(sImg);
       });
       div.appendChild(stickerTray);
@@ -27031,7 +27906,10 @@ function openSkinPickerForBlackjack() {
     const equippedIds = account.equippedItemIds || [];
     
     account.items.filter(it => {
+      if (it.isDefaultItem) return false;
       if (equippedIds.includes(it.id)) return false;
+      const isFav = Array.isArray(state.favoriteItemIds) && state.favoriteItemIds.includes(it.id);
+      if (isFav) return false; // Hide favorites
       const n = it.name.toLowerCase();
       const isWeapon = (it.type || "").toLowerCase().includes("rifle") || n.includes("|");
       const isKnife = n.includes("★") || n.includes("knife");
@@ -27091,19 +27969,31 @@ function startBlackjack(betItems) {
     dealerTotal: 0
   };
 
-  // Initial Deal
-  bjDealCard("user");
-  bjDealCard("dealer");
-  bjDealCard("user");
-  bjDealCard("dealer"); // Hidden card
+  let rerollGuard = 0;
+  do {
+    blackjackState.deck = createDeck();
+    blackjackState.userHand = [];
+    blackjackState.dealerHand = [];
+    blackjackState.userTotal = 0;
+    blackjackState.dealerTotal = 0;
+    bjDealCard("user");
+    bjDealCard("dealer");
+    bjDealCard("user");
+    bjDealCard("dealer");
+    rerollGuard++;
+  } while (rerollGuard < 6 && blackjackState.userTotal === blackjackState.dealerTotal);
 
   renderBlackjackTable();
   saveState();
   refreshInventoryView();
 
-  // Check for immediate Blackjack
+  // Immediate 21 should win instantly as requested
   if (blackjackState.userTotal === 21) {
-    bjStand();
+    bjEndGame({ forceUserWin: true });
+    renderBlackjackTable();
+  } else if (blackjackState.dealerTotal === 21) {
+    bjEndGame();
+    renderBlackjackTable();
   }
 }
 
@@ -27135,6 +28025,16 @@ function bjDealCard(target) {
   } else {
     blackjackState.dealerHand.push(card);
     blackjackState.dealerTotal = calculateHand(blackjackState.dealerHand);
+  }
+}
+
+function bjDealerTakeTurn() {
+  if (blackjackState.status !== "playing") return;
+  if (blackjackState.dealerTotal < 17) {
+    bjDealCard("dealer");
+  }
+  if (blackjackState.dealerTotal >= 21 && blackjackState.status === "playing") {
+    bjEndGame();
   }
 }
 
@@ -27186,7 +28086,7 @@ function renderBlackjackTable() {
 
     <div style="margin-top:25px; background:rgba(0,0,0,0.2); padding:15px; border-radius:12px; border: 1px solid rgba(255,255,255,0.05);">
         <div style="font-size:11px; color:#94a3b8; text-transform:uppercase; margin-bottom:10px; font-weight:800;">Your Deposit (${formatPrice(betVal)})</div>
-        <div id="bjLeftUserPot" style="display:flex; flex-wrap:wrap; gap:6px; justify-content:center;"></div>
+        <div id="bjLeftUserPot" style="display:flex; flex-wrap:wrap; gap:10px; justify-content:center; min-height:86px;"></div>
     </div>
   `;
 
@@ -27197,7 +28097,7 @@ function renderBlackjackTable() {
     
     <div style="margin-top:auto; background:rgba(0,0,0,0.2); padding:15px; border-radius:12px; border: 1px solid rgba(255,255,255,0.05);">
         <div style="font-size:11px; color:#94a3b8; text-transform:uppercase; margin-bottom:10px; font-weight:800;">Bot Deposit (${formatPrice(botBetVal)})</div>
-        <div id="bjRightBotPot" style="display:flex; flex-wrap:wrap; gap:6px; justify-content:center;"></div>
+        <div id="bjRightBotPot" style="display:flex; flex-wrap:wrap; gap:10px; justify-content:center; min-height:86px;"></div>
     </div>
   `;
 
@@ -27222,7 +28122,7 @@ function renderBlackjackTable() {
   blackjackState.bet.forEach(it => {
       const img = document.createElement("img");
       img.src = getStableDisplayImage(it);
-      img.style.cssText = "width:48px;height:36px;object-fit:contain;cursor:pointer;background:rgba(0,0,0,0.3);border-radius:4px;";
+      img.style.cssText = "width:72px;height:54px;object-fit:contain;cursor:pointer;background:rgba(0,0,0,0.3);border-radius:6px;padding:6px;";
       img.onclick = () => showInspect(it);
       leftUPot.appendChild(img);
   });
@@ -27230,7 +28130,7 @@ function renderBlackjackTable() {
   blackjackState.botBet.forEach(it => {
       const img = document.createElement("img");
       img.src = getStableDisplayImage(it);
-      img.style.cssText = "width:48px;height:36px;object-fit:contain;cursor:pointer;background:rgba(0,0,0,0.3);border-radius:4px;";
+      img.style.cssText = "width:72px;height:54px;object-fit:contain;cursor:pointer;background:rgba(0,0,0,0.3);border-radius:6px;padding:6px;";
       img.onclick = () => showInspect(it);
       rightBPot.appendChild(img);
   });
@@ -27316,8 +28216,18 @@ function createCardUI(c) {
 function bjHit() {
   if (blackjackState.status !== "playing") return;
   bjDealCard("user");
+  if (blackjackState.userTotal === 21) {
+    bjEndGame({ forceUserWin: true });
+    renderBlackjackTable();
+    return;
+  }
   if (blackjackState.userTotal > 21) {
     bjEndGame();
+  } else {
+    bjDealerTakeTurn();
+    if (blackjackState.dealerTotal >= 21) {
+      bjEndGame();
+    }
   }
   renderBlackjackTable();
 }
@@ -27331,29 +28241,34 @@ function bjStand() {
   }
   
   bjEndGame();
+  renderBlackjackTable();
 }
 
-function bjEndGame() {
+function bjEndGame(options = {}) {
   if (blackjackState.status === "finished") return;
   blackjackState.status = "finished";
   const user = blackjackState.userTotal;
   const dealer = blackjackState.dealerTotal;
   const account = getActiveAccount();
 
-  const userWon = (user <= 21 && (dealer > 21 || user > dealer));
+  const userWon = !!options.forceUserWin || (user <= 21 && (dealer > 21 || user > dealer));
   const push = (user <= 21 && user === dealer);
 
   if (userWon) {
-    const allPrizes = [...blackjackState.bet, ...blackjackState.botBet];
-    allPrizes.forEach(it => {
-       addItemToAccount({ ...it, source: "Blackjack Win" }, { skipPriceFix: true });
+    blackjackState.bet.forEach(it => {
+      if (!account.items.some(ai => ai.id === it.id)) {
+        account.items.push(it);
+      }
     });
-    // Double items if not jackknife
-    if (!state.jackKnife) {
-        blackjackState.bet.forEach(it => {
-           addItemToAccount({ ...it, source: "Blackjack 2x Return" }, { skipPriceFix: true, skipPopup: true });
-        });
-    }
+    blackjackState.botBet.forEach(it => {
+      addItemToAccount({ ...it, source: "Blackjack Win", isReturn: false }, { skipPriceFix: true, preserveExactItem: true });
+    });
+    recordGameHistory(account, "blackjack", {
+      result: "won",
+      potValue: blackjackState.bet.reduce((s, x) => s + getItemValue(x), 0) + blackjackState.botBet.reduce((s, x) => s + getItemValue(x), 0),
+      wonItems: [...blackjackState.bet, ...blackjackState.botBet],
+      lostItems: []
+    });
     account.diceProfit = (account.diceProfit || 0) + (blackjackState.botBet.reduce((s,x)=>s+getItemValue(x), 0));
     try { playAwardSound("Gold"); } catch(e){}
     setTimeout(() => showGroupedPurchaseResult(), 500);
@@ -27361,11 +28276,23 @@ function bjEndGame() {
     blackjackState.bet.forEach(it => {
       account.items.push(it);
     });
+    recordGameHistory(account, "blackjack", {
+      result: "push",
+      potValue: blackjackState.bet.reduce((s, x) => s + getItemValue(x), 0) + blackjackState.botBet.reduce((s, x) => s + getItemValue(x), 0),
+      wonItems: [],
+      lostItems: []
+    });
   } else {
     // Loss
     logUsedToHaveItems(account, blackjackState.bet, "Gambled Away");
     account.totalLost = (account.totalLost || 0) + (blackjackState.bet.reduce((s,x)=>s+getItemValue(x), 0));
     account.diceProfit = (account.diceProfit || 0) - (blackjackState.bet.reduce((s,x)=>s+getItemValue(x), 0));
+    recordGameHistory(account, "blackjack", {
+      result: "lost",
+      potValue: blackjackState.bet.reduce((s, x) => s + getItemValue(x), 0) + blackjackState.botBet.reduce((s, x) => s + getItemValue(x), 0),
+      wonItems: [],
+      lostItems: blackjackState.bet
+    });
   }
 
   saveState();
@@ -27394,6 +28321,7 @@ function openSkinPicker() {
 
   const equippedIds = Array.isArray(account.equippedItemIds) ? account.equippedItemIds : [];
   const pool = account.items.filter(it => {
+    if (it.isDefaultItem) return false;
     if (equippedIds.includes(it.id)) return false;
 
     const n = it.name.toLowerCase();
@@ -27476,7 +28404,7 @@ function confirmPotDeposit() {
     const userParticipant = {
       id: "user",
       name: account.name,
-      avatar: "https://i.imgur.com/Vki8GHi.png",
+      avatar: account.pfp || "https://i.imgur.com/zFydkgL.png",
       value: addedValue,
       items: [...jackpotSelectedSkins],
       color: "#66c0f4",
@@ -27642,19 +28570,24 @@ function generateBotItems(targetValue) {
     const remaining = targetValue - currentVal;
     
     if (pick.price <= remaining * 1.1) {
+      const wear = getBotTradeWear(pick.name, pick.rarity?.name);
+      const floatVal = getBotTradeFloatForWear(pick.name, wear, pick.rarity?.name || "Mil-Spec");
+      const pattern = Math.max(1, Math.floor(Math.random() * 1000));
+      const dopplerPhase = /doppler/i.test(pick.name) ? deriveDopplerPhaseLabel({ name: pick.name, pattern, float: floatVal }) : "";
       const botItem = {
         name: pick.name,
-        img: getDisplayImage(pick),
+        img: getDisplayImage({ ...pick, wear, floatVal, pattern, dopplerPhase }),
         price: pick.price,
         rarity: pick.rarity?.name || "Mil-Spec",
         stickers: [],
         nametag: null,
-        wear: getBotTradeWear(pick.name, pick.rarity?.name)
+        wear,
+        floatVal,
+        pattern,
+        dopplerPhase
       };
-      botItem.floatVal = getBotTradeFloatForWear(pick.name, botItem.wear, botItem.rarity);
 
-      const nLower = String(pick.name).toLowerCase();
-      const isKnifeLike = nLower.includes("★") || nLower.includes("knife") || nLower.includes("gloves");
+      const isKnifeLike = isKnifeOrGloveItem({ ...pick, wear, floatVal, pattern, dopplerPhase });
 
       // Add flair sometimes (Nametags are common in Jackpot)
       if (Math.random() < 0.25) {
@@ -27680,20 +28613,27 @@ function generateBotItems(targetValue) {
     const cheap = skinsPool.filter(s => s.price < 5).sort((a,b) => b.price - a.price);
     for (const pick of cheap) {
       if (currentVal >= targetValue * 0.98 || items.length >= 15) break;
+      const wear = getBotTradeWear(pick.name, pick.rarity?.name);
+      const floatVal = getBotTradeFloatForWear(pick.name, wear, pick.rarity?.name || "Mil-Spec");
+      const pattern = Math.max(1, Math.floor(Math.random() * 1000));
+      const dopplerPhase = /doppler/i.test(pick.name) ? deriveDopplerPhaseLabel({ name: pick.name, pattern, float: floatVal }) : "";
+      const isKnifeLike = isKnifeOrGloveItem({ ...pick, wear, floatVal, pattern, dopplerPhase });
       const botItem = {
         name: pick.name,
-        img: getDisplayImage(pick),
+        img: getDisplayImage({ ...pick, wear, floatVal, pattern, dopplerPhase }),
         price: pick.price,
         rarity: pick.rarity?.name || "Mil-Spec",
         stickers: [],
         nametag: null,
-        wear: getBotTradeWear(pick.name, pick.rarity?.name)
+        wear,
+        floatVal,
+        pattern,
+        dopplerPhase
       };
-      botItem.floatVal = getBotTradeFloatForWear(pick.name, botItem.wear, botItem.rarity);
       if (Math.random() < 0.22) {
         botItem.nametag = getUniqueBotNametag();
       }
-      if (Math.random() < 0.22) {
+      if (!isKnifeLike && Math.random() < 0.22) {
         botItem.stickers = generateRandomAppliedStickers(botItem, Math.random() < 0.5 ? 2 : 1);
       }
       items.push(botItem);
@@ -28025,6 +28965,9 @@ function showJackpotWinner(winner) {
     itemsList.appendChild(img);
   });
 
+  const activeAccount = getActiveAccount();
+  const activeUserPot = activeAccount ? jackpotPotParticipants.find(p => p && p.id === "user" && p.name === activeAccount.name) : null;
+
   // If user wins, grant them all skins from the pot, then ensure they receive their deposited items a second time.
   if (winner.id === "user") {
     const account = getActiveAccount();
@@ -28033,6 +28976,12 @@ function showJackpotWinner(winner) {
     allItems.forEach(it => {
       // Check if item belongs to user
       const isOriginalUserItem = winner.items.some(ui => ui.id === it.id);
+      if (isOriginalUserItem) {
+        if (!account.items.some(ai => ai.id === it.id)) {
+          account.items.push(it);
+        }
+        return;
+      }
       const resolvedSource = it.source || "Jackpot Win";
 
       const winningItem = {
@@ -28052,7 +29001,7 @@ function showJackpotWinner(winner) {
         dopplerPhase: it.dopplerPhase || null
       };
       
-      addItemToAccount(winningItem, { skipPriceFix: true, randomizeWearEach: false });
+      addItemToAccount(winningItem, { skipPriceFix: true, randomizeWearEach: false, preserveExactItem: true });
     });
 
     // 2) If not jackKnife, specifically duplicate returned items for the 2x return rule
@@ -28072,9 +29021,16 @@ function showJackpotWinner(winner) {
           source: "Jackpot 2x Return",
           isReturn: true
         };
-        addItemToAccount(duplicate, { skipPriceFix: true });
+        addItemToAccount(duplicate, { skipPriceFix: true, preserveExactItem: true });
       });
     }
+
+    recordGameHistory(account, "jackpot", {
+      result: "won",
+      potValue: jackpotPotValue,
+      wonItems: allItems,
+      lostItems: []
+    });
 
     try { playAwardSound("Gold"); } catch(e){}
     // Defer popup to ensure inventory finishes processing
@@ -28083,6 +29039,14 @@ function showJackpotWinner(winner) {
     });
   } else {
     // If bot wins, items are just gone (no changes).
+    if (activeAccount && activeUserPot) {
+      recordGameHistory(activeAccount, "jackpot", {
+        result: "lost",
+        potValue: jackpotPotValue,
+        wonItems: [],
+        lostItems: activeUserPot.items || []
+      });
+    }
   }
 
   modal.classList.remove("hidden");
@@ -28123,6 +29087,7 @@ function closeJackpotWinner() {
 function initJackpotModal() {
   const account = getActiveAccount();
   if (!account) return;
+  ensureGameHistoryButtons();
 
   const resEl = document.getElementById("jackpotResult");
   if (resEl) resEl.style.display = "none";
@@ -28143,6 +29108,7 @@ function initJackpotModal() {
 
   // Only gamble knives and guns, sorted by most expensive
   const gamblableItems = account.items.filter(it => {
+    if (it.isDefaultItem) return false;
     if (equippedIds.includes(it.id)) return false;
     const n = it.name.toLowerCase();
     const t = (it.type || "").toLowerCase();
@@ -28765,15 +29731,33 @@ function executeTradeUp() {
   }
 
   // Determine Reward Pool
-  const contents = resolveCaseContentsData(selectedCollection);
   let pool = [];
-  if (contents && contents[targetRarity]) {
-      pool = contents[targetRarity];
-  } else {
-      // Fallback to global pool of target rarity with standardized rarity match
+  const targetRarityLower = String(targetRarity).toLowerCase();
+  
+  // Try selected collection first
+  const contents = resolveCaseContentsData(selectedCollection);
+  if (contents) {
+    const matchedKey = Object.keys(contents).find(k => k.toLowerCase().includes(targetRarityLower));
+    if (matchedKey) pool = contents[matchedKey];
+  }
+  
+  // Fallback to ANY collection if the specific one is empty for that rarity
+  if (!pool || pool.length === 0) {
+    const allCrateNames = Object.keys(CASE_CONTENTS_DB);
+    for (const cName of allCrateNames) {
+      const cData = resolveCaseContentsData(cName);
+      const mKey = Object.keys(cData).find(k => k.toLowerCase().includes(targetRarityLower));
+      if (mKey && cData[mKey].length > 0) {
+        pool = pool.concat(cData[mKey]);
+      }
+      if (pool.length > 200) break;
+    }
+  }
+
+  if (!pool || pool.length === 0) {
       pool = allSkins.filter(s => {
-        const sr = s.rarity?.name || s.rarity || "";
-        return sr === targetRarity && !s.name.toLowerCase().includes("souvenir");
+        const sr = String(s.rarity?.name || s.rarity || "").toLowerCase();
+        return sr.includes(targetRarityLower) && !s.name.toLowerCase().includes("souvenir");
       });
   }
 
@@ -29221,16 +30205,22 @@ function spinJackpot() {
             for(let i=0; i < mult; i++) {
               const sanitized = {
                 name: it.name, img: it.img || getStableDisplayImage(it), price: it.price || mockPrice(it),
-                rarity: it.rarity || "Consumer", wear: null, floatVal: null, pattern: null, qty: 1, type: it.type || "Item",
-                stickers: Array.isArray(it.stickers) ? it.stickers.map(s => ({ name: s.name, img: s.img, price: s.price })) : [],
+                rarity: it.rarity || "Consumer", wear: it.wear || null, floatVal: (it.floatVal ?? null), pattern: (it.pattern ?? null), qty: 1, type: it.type || "Item",
+                stickers: Array.isArray(it.stickers) ? it.stickers.map(s => ({ name: s.name, img: s.img, price: s.price, scratchPercent: s.scratchPercent || 0 })) : [],
                 source: "Dice Game Win", isReturn: true
               };
-              addItemToAccount(sanitized, { skipPriceFix: true, skipPopup: false });
+              addItemToAccount(sanitized, { skipPriceFix: true, skipPopup: false, preserveExactItem: true });
               totalWinValue += (sanitized.price || 0);
             }
           });
 
           resultText.textContent = state.hidePrices ? `🎉 WON! MULTIPLIER ${mult}x!` : `🎉 WON! MULTIPLIER ${mult}x! (${formatPrice(totalWinValue)})`;
+          recordGameHistory(account, "dice", {
+            result: "won",
+            potValue: betValue + totalWinValue,
+            wonItems: removedBetItems.concat(removedBetItems.flatMap(it => Array.from({ length: mult }, () => clonePlain(it)))),
+            lostItems: []
+          });
           resultText.style.color = "#a4d007";
           account.diceProfit = (account.diceProfit || 0) + (totalWinValue - betValue);
 
@@ -29269,12 +30259,10 @@ function spinJackpot() {
 
           // Multiplier logic check: multiplier already chosen above. Ensure items returned + extra mult results.
   // Note: code above handles mult items if !state.jackKnife
-  while (currentWinValue < targetWinAmount * 0.95 && chosen.length < 15) {
+  while (currentWinValue < targetWinAmount * 0.95 && chosen.length < 10) { // Slightly optimized count for performance
             const remaining = targetWinAmount - currentWinValue;
-            // Prefer picks that fit inside the remaining target to avoid large overshoot; fallback to cheapest available.
             let possible = pool.filter(e => e.price <= remaining);
             if (possible.length === 0) {
-              // if no single item fits remaining budget, try to pick the smallest available to progress
               const smallest = pool[pool.length - 1];
               if (smallest) {
                 chosen.push(smallest);
@@ -29282,8 +30270,7 @@ function spinJackpot() {
               }
               break;
             }
-            
-            const topPick = Math.min(possible.length, 10);
+            const topPick = Math.min(possible.length, 5); // Faster greedy pick
             const choice = possible[Math.floor(Math.random() * topPick)];
             chosen.push(choice);
             currentWinValue += choice.price;
@@ -29321,6 +30308,17 @@ function spinJackpot() {
           resultText.textContent = state.hidePrices ? `🎉 WON! REGAINED BET!` : `🎉 WON! REGAINED BET + WON ${formatPrice(currentWinValue)}`;
           resultText.style.color = "#a4d007";
           account.diceProfit = (account.diceProfit || 0) + currentWinValue;
+          recordGameHistory(account, "dice", {
+            result: "won",
+            potValue: betValue + currentWinValue,
+            wonItems: removedBetItems.concat(chosen.map(entry => ({
+              name: entry.skin.name,
+              img: getDisplayImage(entry.skin),
+              price: entry.price,
+              rarity: entry.skin.rarity?.name || "Covert"
+            }))),
+            lostItems: []
+          });
 
           // Show NEW ITEM popup for awarded items
           hasShownNewItemPopup = false;
@@ -29338,6 +30336,12 @@ function spinJackpot() {
         // Track gambling loss per account
         account.totalLost = (account.totalLost || 0) + betValue;
         account.diceProfit = (account.diceProfit || 0) - betValue;
+        recordGameHistory(account, "dice", {
+          result: "lost",
+          potValue: betValue,
+          wonItems: [],
+          lostItems: removedBetItems
+        });
       }
       
       jackpotBet = [];
@@ -29706,7 +30710,9 @@ function renderCoinflipPickerItems(query = "") {
   const equippedIds = Array.isArray(account.equippedItemIds) ? account.equippedItemIds : [];
   const pool = account.items.filter(it => {
     // Protection: Blacklist equipped items from gambling deposit systems
-    if (equippedIds.includes(it.id) || hasWearInName(it.name)) return false;
+    if (it.isDefaultItem || equippedIds.includes(it.id) || hasWearInName(it.name)) return false;
+    const isFav = Array.isArray(state.favoriteItemIds) && state.favoriteItemIds.includes(it.id);
+    if (isFav) return false; // Hide favorites
 
     const n = it.name.toLowerCase();
     const t = (it.type || it.category?.name || "").toLowerCase();
@@ -30028,7 +31034,13 @@ function showCoinflipResult(flip, userWon) {
   }
 
   if (userWon) {
-    allItems.forEach(it => {
+    const account = getActiveAccount();
+    flip.userItems.forEach(it => {
+      if (account && !account.items.some(ai => ai.id === it.id)) {
+        account.items.push(it);
+      }
+    });
+    flip.botItems.forEach(it => {
       const winningItem = {
         ...it,
         source: "Coinflip Win",
@@ -30036,7 +31048,7 @@ function showCoinflipResult(flip, userWon) {
         steamPhaseImage: it.steamPhaseImage || null,
         dopplerPhase: it.dopplerPhase || null
       };
-      addItemToAccount(winningItem, { skipPriceFix: true });
+      addItemToAccount(winningItem, { skipPriceFix: true, preserveExactItem: true });
     });
     try { playAwardSound("Gold"); } catch(e){}
     setTimeout(() => { showGroupedPurchaseResult(); }, 100);
