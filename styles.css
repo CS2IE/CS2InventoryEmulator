@@ -1571,35 +1571,36 @@ option {
   overflow-y: auto;
   padding: 15px;
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); /* Normalized column width */
-  gap: 14px; /* Balanced spacing */
+  grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)); /* Tightened to prevent overlap */
+  gap: 8px; /* Reduced gap */
   background: #0f172a;
   align-content: start;
 }
 
 /* Make inventory item boxes inside trade grids smaller with centered metadata */
 .trade-items-grid .storage-item-mini {
-  aspect-ratio: 1.46 / 1; /* Match inventory item aspect ratio exactly */
-  min-height: 90px;
-  padding: 10px;
+  aspect-ratio: 1.46 / 1;
+  min-height: 80px;
+  padding: 4px;
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
   gap: 0;
   box-sizing: border-box;
+  overflow: hidden;
 }
 
 .trade-items-grid .inv-sticker-mini {
-  width: 14px !important; /* Scaled down for trading/gambling grids to prevent 'huge' appearance */
-  height: 14px !important;
-  min-width: 14px;
-  min-height: 14px;
+  width: 6px !important; /* Tiny icons to prevent overlap */
+  height: 6px !important;
+  min-width: 6px;
+  min-height: 6px;
 }
 
 .trade-items-grid .storage-item-mini img {
-  width: 50px !important;
-  height: 40px !important;
+  width: 80% !important;
+  height: auto !important;
   flex-shrink: 0;
 }
 
@@ -3318,7 +3319,7 @@ option {
     #eb9b34 38%, #eb9b34 45%, /* Orange - WW */
     #eb4b4b 45%, #eb4b4b 100% /* Red - BS */
   );
-  box-shadow: inset 0 1px 3px rgba(0,0,0,0.5);
+  box-shadow: none; /* Removed grey and black line (inset shadow) */
 }
 
 .float-technical-label {
@@ -3618,7 +3619,14 @@ option {
 }
 
 .case-opening-bg-blur {
-  display: none !important; /* NO CASE BACKGROUND ON UNLOCKED POPUP */
+  position: absolute;
+  inset: 0;
+  background-size: cover;
+  background-position: center;
+  filter: blur(60px) brightness(0.5);
+  z-index: 10;
+  opacity: 0.85;
+  pointer-events: none;
 }
 
 .unboxing-actions-bar {
@@ -3654,6 +3662,12 @@ option {
 .multi-spinner-track > div img {
   filter: none !important;
   box-shadow: none !important;
+  max-width: 82% !important; /* Smaller case image in animation */
+}
+
+/* Blur during case animation */
+.case-opening-animating .multi-spinner-track {
+  filter: blur(1px);
 }
 
 /* Trade Up reveal: make the unlocked reveal area larger and scale the image so it fills nicely */
@@ -3778,17 +3792,27 @@ option {
 }
 
 #inspectModal.modal-overlay {
-  background: transparent !important;
-  backdrop-filter: blur(30px) !important; /* No dark color, just blur */
-  -webkit-backdrop-filter: blur(30px) !important;
+  background: rgba(0, 0, 0, 0.15) !important;
+  backdrop-filter: blur(12px) !important;
+  -webkit-backdrop-filter: blur(12px) !important;
   z-index: 2147483647 !important;
   background-image: none !important;
 }
 
 #inspectModal .user-snippet-modal,
+#caseOpeningModal .user-snippet-modal,
 #caseOpeningModal #caseOpeningResult,
 #caseOpeningModal .unlocked-3d-container {
   background-color: transparent !important;
+  background: transparent !important;
+  border: none !important;
+  box-shadow: none !important;
+}
+
+#caseOpeningModal.modal-overlay {
+  background: rgba(0, 0, 0, 0.1) !important;
+  backdrop-filter: blur(18px) !important;
+  -webkit-backdrop-filter: blur(18px) !important;
 }
 
 .case-confirm-header {
@@ -3989,37 +4013,25 @@ option {
   cursor: default;
   padding: 10px;
   transition: transform 0.2s;
-  background: transparent;
-  border: 1px solid transparent;
+  background: transparent !important;
+  border: none !important;
   border-radius: 4px;
-}
-
-.info-icon-wrapper:hover {
-  background: rgba(255,255,255,0.1);
-  border-color: rgba(255,255,255,0.2);
 }
 
 .info-icon-wrapper .info-share-btn {
   opacity: 1 !important;
   transition: background 0.2s;
-  background: transparent;
-  border: 1px solid transparent;
+  background: transparent !important;
+  border: none !important;
   padding: 4px;
   border-radius: 4px;
-  cursor: pointer !important; /* Force pointer */
+  cursor: pointer !important;
   pointer-events: auto !important;
 }
 
 .info-share-btn:hover {
-  background: rgba(255,255,255,0.1) !important;
-  border-color: rgba(255,255,255,0.2) !important;
+  background: transparent !important;
   transform: scale(1.1);
-}
-
-.info-icon-wrapper {
-  background: rgba(255,255,255,0.05);
-  border-color: rgba(255,255,255,0.1);
-  border-radius: 4px;
 }
 
 /* Inspect modal: anchor the info icon moved to the left side for the inspect popup */
@@ -4712,7 +4724,7 @@ body.cs2-bg-active, body.cs2-bg-active #app {
 #inspectStickers, #unlockedStickers, #purchaseResultStickers {
   position: absolute;
   left: 50%;
-  bottom: 165px; 
+  bottom: 80px; /* Moved further down to prevent 3D overlap */
   transform: translateX(-50%);
   display: flex;
   gap: 45px; 
