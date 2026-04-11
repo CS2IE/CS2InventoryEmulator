@@ -838,7 +838,8 @@
         <input type="text" id="nametagInput" maxlength="32" style="width: 100%; padding: 10px; border-radius: 6px; border: none; background: #1e293b; color: white;">
       </div>
       <div style="display:flex; gap:10px; margin-top:10px;">
-        <button id="saveNametagBtn" class="steam-btn highlight" style="flex:1;">Save</button>
+        <button id="saveNametagBtn" class="steam-btn highlight" style="flex:2;">Save</button>
+        <button id="sellFromNametagBtn" class="steam-btn danger" style="flex:1; margin-top:0;">Sell Item</button>
         <button id="cancelNametagBtn" class="steam-btn grey" style="flex:1;">Cancel</button>
       </div>
     </div>
@@ -1410,7 +1411,7 @@
           <input id="showViewContextToggle" type="checkbox" />
         </div>
         <div class="settings-row">
-          <label for="hideMockMetaToggle">Hide Price/Qty on Selection Cards</label>
+          <label for="hideMockMetaToggle">Hide Price, Qty and Stickers on Inventory Cards</label>
           <input id="hideMockMetaToggle" type="checkbox" />
         </div>
       </div>
@@ -1436,6 +1437,10 @@
         <div class="settings-row">
           <label for="pinEquippedToggle">Pin equipped items to top</label>
           <input id="pinEquippedToggle" type="checkbox" checked />
+        </div>
+        <div class="settings-row">
+          <label for="disableInspectBlurToggle">Full Transparency Mode (No Blur on Popups)</label>
+          <input id="disableInspectBlurToggle" type="checkbox" />
         </div>
       </div>
 
@@ -1925,6 +1930,22 @@
       <div style="margin-bottom:12px;">
           <div style="font-size:13px; color:#94a3b8; margin-bottom:6px;">Specific Pattern Image URL (Optional)</div>
           <input id="editMarketPatternImg" type="text" class="steam-input" style="width:100%;" placeholder="Apply to this specific pattern only..." />
+      </div>
+
+      <div style="margin-bottom:12px;">
+          <div style="font-size:13px; color:#94a3b8; margin-bottom:6px;">Nametag History</div>
+          <input id="editMarketNametagHistory" type="text" class="steam-input" style="width:100%;" placeholder="Separate entries with commas" />
+      </div>
+
+      <div style="margin-bottom: 12px; text-align: left;">
+          <div style="font-size:13px; color:#94a3b8; margin-bottom:8px;">Stickers & Charm (Click slot to change)</div>
+          <div style="display:flex; gap:8px; justify-content:center; align-items:center;">
+             <div id="editMarketStickers" style="display:flex; gap:6px;">
+                ${[0,1,2,3,4].map(i => `<div class="sticker-slot empty" style="width:48px; height:48px;" data-index="${i}"></div>`).join('')}
+             </div>
+             <div style="width:1px; height:40px; background:rgba(255,255,255,0.1); margin:0 5px;"></div>
+             <div id="editMarketCharm" class="sticker-slot empty" style="width:48px; height:48px; border-color:#66c0f4;"></div>
+          </div>
       </div>
 
       <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:12px;">
